@@ -75,18 +75,39 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     val plan = native.queryExecution.executedPlan
     val hasDeltaScan = plan.collect { case s: CometDeltaNativeScanExec => s }.nonEmpty
     assert(hasDeltaScan, s"expected CometDeltaNativeScanExec in plan, got:\n$plan")
-    val nativeRows = native.collect().toSeq.map(_.toSeq)
+    val nativeRows = native.collect().toSeq.map(normalizeRow)
 
     withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
       val vanillaRows = query(spark.read.format("delta").load(tablePath))
         .collect()
         .toSeq
-        .map(_.toSeq)
+        .map(normalizeRow)
       assert(
         nativeRows.sortBy(_.mkString("|")) == vanillaRows.sortBy(_.mkString("|")),
         s"native result did not match vanilla Spark result\n" +
           s"native=${nativeRows}\nvanilla=${vanillaRows}")
     }
+  }
+
+  /**
+   * Deep-normalize a Spark `Row` into a Seq[Any] where every Array / WrappedArray / Array[Byte]
+   * is turned into a `List`. Scala's default `==` on `Array[Byte]` is reference-equality, which
+   * makes byte-for-byte equal binary columns compare unequal. Normalizing to `List` gives value
+   * equality all the way down.
+   */
+  private def normalizeRow(row: Row): Seq[Any] =
+    row.toSeq.map(normalizeValue)
+
+  private def normalizeValue(v: Any): Any = v match {
+    case null => null
+    case arr: Array[_] => arr.toList.map(normalizeValue)
+    case seq: scala.collection.Seq[_] => seq.toList.map(normalizeValue)
+    case m: scala.collection.Map[_, _] =>
+      m.toList
+        .map { case (k, vv) => (normalizeValue(k), normalizeValue(vv)) }
+        .sortBy(_._1.toString)
+    case r: Row => normalizeRow(r).toList
+    case other => other
   }
 
   // ───────────────────────────────────────── tests ─────────────────────────────────────────
@@ -186,6 +207,116 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
       }
       rows
         .toDF("id", "tags", "props", "nested")
+        .repartition(1)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, identity)
+    }
+  }
+
+  test("predicate variety: eq, lt, gt, is null, in, and/or") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("predicates") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      // Mixed with some nulls in `name` so IS NULL / IS NOT NULL have real targets.
+      val rows = (0 until 20).map { i =>
+        val name: String = if (i % 5 == 0) null else s"name_$i"
+        (i.toLong, name, i * 1.5)
+      }
+      rows
+        .toDF("id", "name", "score")
+        .repartition(1)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, _.where("id = 7"))
+      assertDeltaNativeMatches(tablePath, _.where("id < 5"))
+      assertDeltaNativeMatches(tablePath, _.where("id > 15"))
+      assertDeltaNativeMatches(tablePath, _.where("id <= 3 OR id >= 17"))
+      assertDeltaNativeMatches(tablePath, _.where("id IN (2, 4, 6, 8)"))
+      assertDeltaNativeMatches(tablePath, _.where("name IS NULL"))
+      assertDeltaNativeMatches(tablePath, _.where("name IS NOT NULL AND score > 10.0"))
+      assertDeltaNativeMatches(tablePath, _.where("NOT (id = 5)"))
+    }
+  }
+
+  test("empty delta table") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("empty") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      // Zero-row DataFrame still materializes the table schema + metadata commit,
+      // producing a valid Delta table with zero add actions.
+      Seq
+        .empty[(Long, String)]
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, identity)
+    }
+  }
+
+  test("schema evolution: new column added in later commit") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("schema_evolution") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+
+      // Commit 1: two-column schema.
+      (0 until 5)
+        .map(i => (i.toLong, s"name_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      // Commit 2: append with a third column. Requires mergeSchema so Delta
+      // accepts the wider schema.
+      (5 until 10)
+        .map(i => (i.toLong, s"name_$i", i * 1.5))
+        .toDF("id", "name", "score")
+        .write
+        .format("delta")
+        .mode("append")
+        .option("mergeSchema", "true")
+        .save(tablePath)
+
+      // Reading back the evolved schema: rows from commit 1 should return null
+      // for `score`; rows from commit 2 should have real values.
+      assertDeltaNativeMatches(tablePath, identity)
+    }
+  }
+
+  test("wider primitive type coverage") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("primitives") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+
+      val rows = (0 until 8).map { i =>
+        (
+          i % 2 == 0, // boolean
+          i.toByte, // byte
+          i.toShort, // short
+          i, // int
+          i.toLong, // long
+          i.toFloat * 0.5f, // float
+          i.toDouble * 0.25, // double
+          s"str_$i", // string
+          Array[Byte](i.toByte, (i + 1).toByte), // binary
+          java.sql.Date.valueOf(f"2024-01-${(i % 28) + 1}%02d"), // date
+          new java.sql.Timestamp(1700000000000L + i * 1000L), // timestamp
+          BigDecimal(i) + BigDecimal("0.125") // decimal
+        )
+      }
+      rows
+        .toDF("b", "i8", "i16", "i32", "i64", "f32", "f64", "s", "bin", "d", "ts", "dec")
         .repartition(1)
         .write
         .format("delta")
