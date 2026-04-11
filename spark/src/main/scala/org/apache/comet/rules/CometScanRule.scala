@@ -45,11 +45,12 @@ import org.apache.comet.{CometConf, CometNativeException, DataTypeSupport}
 import org.apache.comet.CometConf._
 import org.apache.comet.CometSparkSessionExtensions.{isCometLoaded, withInfo, withInfos}
 import org.apache.comet.DataTypeSupport.isComplexType
+import org.apache.comet.delta.DeltaReflection
 import org.apache.comet.iceberg.{CometIcebergNativeScanMetadata, IcebergReflection}
 import org.apache.comet.objectstore.NativeConfig
 import org.apache.comet.parquet.CometParquetUtils.{encryptionEnabled, isEncryptionConfigSupported}
 import org.apache.comet.parquet.Native
-import org.apache.comet.serde.operator.{CometIcebergNativeScan, CometNativeScan}
+import org.apache.comet.serde.operator.{CometDeltaNativeScan, CometIcebergNativeScan, CometNativeScan}
 import org.apache.comet.shims.{CometTypeShim, ShimFileFormat, ShimSubqueryBroadcast}
 
 /**
@@ -146,6 +147,13 @@ case class CometScanRule(session: SparkSession)
 
     scanExec.relation match {
       case r: HadoopFsRelation =>
+        // Delta Lake (V1 path) — detect before the `isFileFormatSupported` check, which
+        // only accepts the exact `ParquetFileFormat` class and otherwise rejects Delta's
+        // `DeltaParquetFileFormat` subclass.
+        if (DeltaReflection.isDeltaFileFormat(r.fileFormat)) {
+          return nativeDeltaScan(session, scanExec, r, hadoopConfOrNull = null)
+            .getOrElse(scanExec)
+        }
         if (!CometScanExec.isFileFormatSupported(r.fileFormat)) {
           return withInfo(scanExec, s"Unsupported file format ${r.fileFormat}")
         }
@@ -243,6 +251,42 @@ case class CometScanRule(session: SparkSession)
       return None
     }
     Some(CometScanExec(scanExec, session, SCAN_NATIVE_ICEBERG_COMPAT))
+  }
+
+  /**
+   * Delta Lake native scan path (V1 relations). Gated on
+   * [[CometConf.COMET_DELTA_NATIVE_ENABLED]]; returns None when the feature flag is off so the
+   * caller's `.getOrElse(scanExec)` falls back to Spark's Delta reader.
+   *
+   * Schema / type validation reuses the native Iceberg checker since both paths converge on
+   * Comet's ParquetSource under the hood.
+   */
+  private def nativeDeltaScan(
+      session: SparkSession,
+      scanExec: FileSourceScanExec,
+      r: HadoopFsRelation,
+      hadoopConfOrNull: Configuration): Option[SparkPlan] = {
+    if (!CometConf.COMET_DELTA_NATIVE_ENABLED.get()) {
+      withInfo(
+        scanExec,
+        s"Native Delta scan disabled because ${CometConf.COMET_DELTA_NATIVE_ENABLED.key} " +
+          "is not enabled")
+      return None
+    }
+    if (!COMET_EXEC_ENABLED.get()) {
+      withInfo(scanExec, s"Native Delta scan requires ${COMET_EXEC_ENABLED.key} to be enabled")
+      return None
+    }
+    val hadoopConf = Option(hadoopConfOrNull).getOrElse(
+      r.sparkSession.sessionState.newHadoopConfWithOptions(r.options))
+    if (encryptionEnabled(hadoopConf) && !isEncryptionConfigSupported(hadoopConf)) {
+      withInfo(scanExec, s"Native Delta scan does not support encryption")
+      return None
+    }
+    if (!isSchemaSupported(scanExec, SCAN_NATIVE_DELTA_COMPAT, r)) {
+      return None
+    }
+    Some(CometScanExec(scanExec, session, SCAN_NATIVE_DELTA_COMPAT))
   }
 
   private def transformV2Scan(scanExec: BatchScanExec): SparkPlan = {

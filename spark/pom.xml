@@ -246,6 +246,25 @@ under the License.
           <version>9.4.53.v20231009</version>
           <scope>test</scope>
         </dependency>
+        <!-- Delta Lake, for writing test tables in CometDeltaNativeSuite. -->
+        <!-- Delta 3.3.x targets Spark 3.5.x. Exclusions keep Comet's pinned -->
+        <!-- Spark/Hadoop jars in charge of the actual runtime versions. -->
+        <dependency>
+          <groupId>io.delta</groupId>
+          <artifactId>delta-spark_${scala.binary.version}</artifactId>
+          <version>3.3.2</version>
+          <scope>test</scope>
+          <exclusions>
+            <exclusion>
+              <groupId>org.apache.spark</groupId>
+              <artifactId>*</artifactId>
+            </exclusion>
+            <exclusion>
+              <groupId>org.apache.hadoop</groupId>
+              <artifactId>*</artifactId>
+            </exclusion>
+          </exclusions>
+        </dependency>
       </dependencies>
     </profile>
 

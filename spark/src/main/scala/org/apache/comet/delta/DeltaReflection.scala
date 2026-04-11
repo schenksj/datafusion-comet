@@ -1,0 +1,106 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.comet.delta
+
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.connector.read.{Scan => V2Scan}
+import org.apache.spark.sql.execution.datasources.{FileFormat, HadoopFsRelation}
+
+/**
+ * Class-name-based probes for Delta Lake plan nodes.
+ *
+ * We deliberately avoid a compile-time dependency on `spark-delta` - the Scala API surface churns
+ * across Delta versions (2.x / 3.x / 4.x) and we want Comet's Delta detection to keep working
+ * against whichever Delta version the user has on their classpath. All detection is therefore
+ * done via fully-qualified class names and standard Spark APIs (HadoopFsRelation, V2Scan), which
+ * have been stable for years.
+ *
+ * What this object provides:
+ *   - `isDeltaFileFormat(fileFormat)`: true for `DeltaParquetFileFormat` and any subclass exposed
+ *     by the delta-spark package.
+ *   - `isDeltaV2Scan(scan)`: true for the V2 `DeltaScan` / `DeltaTableV2`-backed scan.
+ *   - `extractTableRoot(relation)`: pulls the table root URI out of a `HadoopFsRelation`. Works
+ *     for both path-based reads (`format("delta").load("/tmp/t")`) and table-based reads
+ *     (`spark.table("delta_tbl")`).
+ */
+object DeltaReflection extends Logging {
+
+  /** Fully-qualified class names we match on. */
+  object ClassNames {
+    val DELTA_PARQUET_FILE_FORMAT = "org.apache.spark.sql.delta.DeltaParquetFileFormat"
+    val DELTA_V2_SCAN_PACKAGE_PREFIX = "org.apache.spark.sql.delta."
+    val DELTA_V2_SCAN_SIMPLE_NAME = "DeltaScan"
+  }
+
+  /**
+   * Returns true if `fileFormat` is Delta's parquet-backed `FileFormat`. Checks the exact class
+   * plus any subclass, so variants like `DeletionVectorBoundFileFormat` (some Delta versions)
+   * also match.
+   */
+  def isDeltaFileFormat(fileFormat: FileFormat): Boolean = {
+    val cls = fileFormat.getClass
+    isDeltaClassName(cls.getName) || isDeltaParquetSubclass(cls)
+  }
+
+  /** Walks the class hierarchy looking for DeltaParquetFileFormat. */
+  private def isDeltaParquetSubclass(cls: Class[_]): Boolean = {
+    var current: Class[_] = cls
+    while (current != null) {
+      if (current.getName == ClassNames.DELTA_PARQUET_FILE_FORMAT) return true
+      current = current.getSuperclass
+    }
+    false
+  }
+
+  private def isDeltaClassName(name: String): Boolean =
+    name == ClassNames.DELTA_PARQUET_FILE_FORMAT ||
+      (name.startsWith(ClassNames.DELTA_V2_SCAN_PACKAGE_PREFIX) &&
+        name.endsWith("ParquetFileFormat"))
+
+  /**
+   * Returns true if `scan` is the V2 scan implementation Delta produces for a
+   * `DeltaTableV2`-backed read. Delta ships this as `org.apache.spark.sql.delta.DeltaScan` (inner
+   * case class of `DeltaScanBuilder` or similar) - the enclosing class name varies by version, so
+   * we match on the simple name + package prefix rather than an exact FQN.
+   */
+  def isDeltaV2Scan(scan: V2Scan): Boolean = {
+    val name = scan.getClass.getName
+    name.startsWith(ClassNames.DELTA_V2_SCAN_PACKAGE_PREFIX) &&
+    name.contains(ClassNames.DELTA_V2_SCAN_SIMPLE_NAME)
+  }
+
+  /**
+   * Extract the Delta table root from a V1 `HadoopFsRelation`. For Delta tables this is always a
+   * single path - Delta does not support multi-root relations.
+   *
+   * Returns the absolute URI as a string, with whatever scheme the relation was opened with
+   * (`file://`, `s3://`, etc.).
+   */
+  def extractTableRoot(relation: HadoopFsRelation): Option[String] = {
+    try {
+      val roots = relation.location.rootPaths
+      roots.headOption.map(_.toUri.toString)
+    } catch {
+      case e: Exception =>
+        logWarning(s"Failed to extract Delta table root path: ${e.getMessage}")
+        None
+    }
+  }
+}

@@ -1,0 +1,204 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either success or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Driver-side JNI entry point for Delta log replay.
+//!
+//! Exposes `Java_org_apache_comet_Native_planDeltaScan`. The Scala driver
+//! calls this once per query to ask kernel for the active file list at a
+//! given snapshot version, then distributes the returned tasks across
+//! Spark executors via Comet's usual split-mode serialization.
+
+use jni::{
+    objects::{JClass, JMap, JObject, JString},
+    sys::{jbyteArray, jlong},
+    Env, EnvUnowned,
+};
+use prost::Message;
+
+use crate::delta::{list_delta_files, DeltaStorageConfig};
+use crate::errors::{try_unwrap_or_throw, CometError, CometResult};
+use datafusion_comet_proto::spark_operator::{
+    DeltaPartitionValue, DeltaScanTask, DeltaScanTaskList,
+};
+
+/// `Java_org_apache_comet_Native_planDeltaScan`.
+///
+/// # Arguments (JNI wire order)
+/// 1. `table_url` — absolute URL or bare path of the Delta table root
+/// 2. `snapshot_version` — `-1` for latest, otherwise the exact version
+/// 3. `storage_options` — a `java.util.Map<String, String>` of cloud
+///    credentials. **Phase 1 currently only consumes a small subset** (the
+///    AWS / Azure keys listed in `DeltaStorageConfig`); unknown keys are
+///    silently ignored. Full options-map plumbing lands with Phase 2.
+///
+/// # Returns
+/// A Java `byte[]` containing a prost-encoded [`DeltaScanTaskList`]
+/// message, or `null` on error (with a `CometNativeException` thrown on
+/// the JVM side via `try_unwrap_or_throw`).
+///
+/// # Safety
+/// Inherently unsafe because it dereferences raw JNI pointers.
+#[no_mangle]
+pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
+    e: EnvUnowned,
+    _class: JClass,
+    table_url: JString,
+    snapshot_version: jlong,
+    storage_options: JObject,
+) -> jbyteArray {
+    try_unwrap_or_throw(&e, |env| {
+        let url_str: String = table_url.try_to_string(env)?;
+        let version = if snapshot_version < 0 {
+            None
+        } else {
+            Some(snapshot_version as u64)
+        };
+        let config = if storage_options.is_null() {
+            DeltaStorageConfig::default()
+        } else {
+            let jmap: JMap<'_> = env.cast_local::<JMap>(storage_options)?;
+            extract_storage_config(env, &jmap)?
+        };
+
+        let (entries, actual_version) =
+            list_delta_files(&url_str, &config, version).map_err(|e| {
+                CometError::Internal(format!("delta_kernel log replay failed: {e}"))
+            })?;
+
+        let tasks: Vec<DeltaScanTask> = entries
+            .into_iter()
+            .map(|entry| DeltaScanTask {
+                file_path: resolve_file_path(&url_str, &entry.path),
+                file_size: entry.size as u64,
+                record_count: entry.num_records,
+                // Partition values are produced by kernel as an
+                // unordered `HashMap<String, String>` per file, and we
+                // keep that representation on the wire — the native side
+                // resorts them against `partition_schema` in
+                // `build_delta_partitioned_files`.
+                partition_values: entry
+                    .partition_values
+                    .into_iter()
+                    .map(|(name, value)| DeltaPartitionValue {
+                        name,
+                        value: Some(value),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let msg = DeltaScanTaskList {
+            snapshot_version: actual_version,
+            table_root: url_str,
+            tasks,
+        };
+
+        let bytes = msg.encode_to_vec();
+        let result = env.byte_array_from_slice(&bytes)?;
+        Ok(result.into_raw())
+    })
+}
+
+/// Join `entry.path` (Delta add-action path, usually relative to the
+/// table root) with `table_root` to yield an absolute URL the native-side
+/// `build_delta_partitioned_files` can feed straight into
+/// `object_store::path::Path::from_url_path`.
+fn resolve_file_path(table_root: &str, relative: &str) -> String {
+    // Fully-qualified paths (kernel surfaces these for some tables, e.g.
+    // after MERGE or REPLACE operations) pass through untouched.
+    if relative.contains("://") {
+        return relative.to_string();
+    }
+
+    if table_root.ends_with('/') {
+        format!("{table_root}{relative}")
+    } else {
+        format!("{table_root}/{relative}")
+    }
+}
+
+/// Walk a `java.util.Map<String, String>` of storage options into a
+/// [`DeltaStorageConfig`]. Unknown keys are silently ignored — kernel only
+/// understands the subset in the config struct today.
+///
+/// Caller is responsible for null-checking and casting the raw JObject
+/// to a `JMap` (jni 0.22 requires `cast_local`, which takes ownership
+/// and is cheaper to do once at the JNI boundary).
+fn extract_storage_config(
+    env: &mut Env,
+    jmap: &JMap<'_>,
+) -> CometResult<DeltaStorageConfig> {
+    Ok(DeltaStorageConfig {
+        aws_access_key: map_get_string(env, jmap, "aws_access_key_id")?,
+        aws_secret_key: map_get_string(env, jmap, "aws_secret_access_key")?,
+        aws_session_token: map_get_string(env, jmap, "aws_session_token")?,
+        aws_region: map_get_string(env, jmap, "aws_region")?,
+        aws_endpoint: map_get_string(env, jmap, "aws_endpoint")?,
+        aws_force_path_style: map_get_string(env, jmap, "aws_force_path_style")?
+            .map(|s| s == "true")
+            .unwrap_or(false),
+        azure_account_name: map_get_string(env, jmap, "azure_account_name")?,
+        azure_access_key: map_get_string(env, jmap, "azure_access_key")?,
+        azure_bearer_token: map_get_string(env, jmap, "azure_bearer_token")?,
+    })
+}
+
+/// `map.get(key)` for a `java.util.Map<String, String>` surfaced as a
+/// `JMap`. Returns `None` if the key is absent or the value is `null`.
+fn map_get_string(
+    env: &mut Env,
+    jmap: &JMap<'_>,
+    key: &str,
+) -> CometResult<Option<String>> {
+    let key_obj = env.new_string(key)?;
+    let key_jobj: JObject = key_obj.into();
+    match jmap.get(env, &key_jobj)? {
+        None => Ok(None),
+        Some(value) => {
+            // Safe: `Map<String, String>::get` only ever returns a String.
+            let jstr = unsafe { JString::from_raw(env, value.into_raw()) };
+            Ok(Some(jstr.try_to_string(env)?))
+        }
+    }
+}
+
+// Re-export the test helpers so the integration_tests module can verify
+// `resolve_file_path` without exposing it in the public API surface.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_file_path_joins_with_slash() {
+        assert_eq!(
+            resolve_file_path("file:///tmp/t/", "part-0.parquet"),
+            "file:///tmp/t/part-0.parquet"
+        );
+        assert_eq!(
+            resolve_file_path("file:///tmp/t", "part-0.parquet"),
+            "file:///tmp/t/part-0.parquet"
+        );
+    }
+
+    #[test]
+    fn resolve_file_path_passes_through_absolute() {
+        assert_eq!(
+            resolve_file_path("file:///tmp/t/", "s3://bucket/data/part-0.parquet"),
+            "s3://bucket/data/part-0.parquet"
+        );
+    }
+}

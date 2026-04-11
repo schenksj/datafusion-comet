@@ -1347,6 +1347,97 @@ impl PhysicalPlanner {
                     )),
                 ))
             }
+            OpStruct::DeltaScan(scan) => {
+                // Phase 1: read-only happy path. Per-file DVs, residual predicates,
+                // and column mapping land in later phases (see plan §Phasing).
+                //
+                // Unlike IcebergScan we don't build a bespoke operator — we go
+                // straight to Comet's `init_datasource_exec` (same path NativeScan
+                // uses), which gives us ParquetSource with all its I/O, caching,
+                // predicate-pushdown, and schema-adapter optimizations for free.
+                let common = scan
+                    .common
+                    .as_ref()
+                    .ok_or_else(|| GeneralError("DeltaScan missing common data".into()))?;
+
+                let required_schema: SchemaRef =
+                    convert_spark_types_to_arrow_schema(common.required_schema.as_slice());
+                let data_schema: SchemaRef =
+                    convert_spark_types_to_arrow_schema(common.data_schema.as_slice());
+                let partition_schema: SchemaRef =
+                    convert_spark_types_to_arrow_schema(common.partition_schema.as_slice());
+                let projection_vector: Vec<usize> = common
+                    .projection_vector
+                    .iter()
+                    .map(|offset| *offset as usize)
+                    .collect();
+
+                // Empty-partition fast path (same as NativeScan)
+                if scan.tasks.is_empty() {
+                    let empty_exec = Arc::new(EmptyExec::new(required_schema));
+                    return Ok((
+                        vec![],
+                        vec![],
+                        Arc::new(SparkPlan::new(spark_plan.plan_id, empty_exec, vec![])),
+                    ));
+                }
+
+                let data_filters: Result<Vec<Arc<dyn PhysicalExpr>>, ExecutionError> = common
+                    .data_filters
+                    .iter()
+                    .map(|expr| self.create_expr(expr, Arc::clone(&required_schema)))
+                    .collect();
+
+                let object_store_options: HashMap<String, String> = common
+                    .object_store_options
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                // Build PartitionedFiles from our DeltaScanTasks. Kernel has already
+                // resolved each file path to an absolute URL on the driver, so we
+                // can thread them straight through.
+                let files = build_delta_partitioned_files(
+                    &scan.tasks,
+                    partition_schema.as_ref(),
+                )?;
+
+                // Pick any one file to register the object store (they all share
+                // the same root)
+                let one_file = scan
+                    .tasks
+                    .first()
+                    .map(|t| t.file_path.clone())
+                    .expect("at least one task after empty check");
+                let (object_store_url, _) = prepare_object_store_with_configs(
+                    self.session_ctx.runtime_env(),
+                    one_file,
+                    &object_store_options,
+                )?;
+
+                let file_groups: Vec<Vec<PartitionedFile>> = vec![files];
+
+                let delta_exec = init_datasource_exec(
+                    required_schema,
+                    Some(data_schema),
+                    Some(partition_schema),
+                    object_store_url,
+                    file_groups,
+                    Some(projection_vector),
+                    Some(data_filters?),
+                    None, // default_values: Phase 4 (column mapping)
+                    common.session_timezone.as_str(),
+                    common.case_sensitive,
+                    self.session_ctx(),
+                    false, // encryption_enabled: Phase beyond 1
+                )?;
+
+                Ok((
+                    vec![],
+                    vec![],
+                    Arc::new(SparkPlan::new(spark_plan.plan_id, delta_exec, vec![])),
+                ))
+            }
             OpStruct::ShuffleWriter(writer) => {
                 assert_eq!(children.len(), 1);
                 let (scans, shuffle_scans, child) =
@@ -2911,6 +3002,68 @@ fn convert_spark_types_to_arrow_schema(
         .collect_vec();
     let arrow_schema: SchemaRef = Arc::new(Schema::new(arrow_fields));
     arrow_schema
+}
+
+/// Convert a list of `DeltaScanTask` protobuf messages into DataFusion
+/// `PartitionedFile`s ready for `init_datasource_exec`.
+///
+/// Delta stores partition values as strings inside add actions, so each
+/// task's `partition_values` list is parsed against `partition_schema`
+/// into typed `ScalarValue`s in the order declared by the schema. Missing
+/// or null values become `ScalarValue::Null` of the target type.
+fn build_delta_partitioned_files(
+    tasks: &[spark_operator::DeltaScanTask],
+    partition_schema: &Schema,
+) -> Result<Vec<PartitionedFile>, ExecutionError> {
+    let mut files = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        // Delta's add.path is an absolute URL once kernel has resolved it
+        // on the driver. Parse it the same way NativeScan does.
+        let url = Url::parse(task.file_path.as_ref())
+            .map_err(|e| GeneralError(format!("Invalid Delta file URL: {e}")))?;
+        let path =
+            Path::from_url_path(url.path()).map_err(|e| GeneralError(e.to_string()))?;
+
+        let mut partitioned_file = PartitionedFile::new(
+            // placeholder — overwritten below by object_meta.location
+            String::new(),
+            task.file_size,
+        );
+        partitioned_file.object_meta.location = path;
+
+        let mut partition_values: Vec<ScalarValue> =
+            Vec::with_capacity(partition_schema.fields().len());
+        for field in partition_schema.fields() {
+            // Delta's add action carries partition values as an unordered
+            // string map, so match by name.
+            let proto_value = task
+                .partition_values
+                .iter()
+                .find(|p| p.name == *field.name());
+
+            let scalar = match proto_value.and_then(|p| p.value.clone()) {
+                Some(s) => {
+                    ScalarValue::try_from_string(s, field.data_type()).map_err(|e| {
+                        GeneralError(format!(
+                            "Failed to parse Delta partition value for column '{}': {e}",
+                            field.name()
+                        ))
+                    })?
+                }
+                None => ScalarValue::try_from(field.data_type()).map_err(|e| {
+                    GeneralError(format!(
+                        "Failed to build null partition value for column '{}': {e}",
+                        field.name()
+                    ))
+                })?,
+            };
+            partition_values.push(scalar);
+        }
+        partitioned_file.partition_values = partition_values;
+
+        files.push(partitioned_file);
+    }
+    Ok(files)
 }
 
 /// Converts a protobuf PartitionValue to an iceberg Literal.

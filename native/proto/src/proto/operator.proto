@@ -53,6 +53,7 @@ message Operator {
     Explode explode = 114;
     CsvScan csv_scan = 115;
     ShuffleScan shuffle_scan = 116;
+    DeltaScan delta_scan = 117;
   }
 }
 
@@ -249,6 +250,83 @@ message IcebergDeleteFile {
 
   // // Total file size from the manifest entry, used to skip stat/HEAD calls
   uint64 file_size_in_bytes = 5;
+}
+
+// Common data shared by all partitions in split mode for a Delta native scan
+// (sent once at planning time). Mirrors NativeScanCommon/IcebergScanCommon so
+// the same downstream ParquetSource wiring can be reused.
+message DeltaScanCommon {
+  // Required schema (projection applied to data schema)
+  repeated SparkStructField required_schema = 1;
+  // Full data schema of the table
+  repeated SparkStructField data_schema = 2;
+  // Partition columns (stored in add actions, not in file paths)
+  repeated SparkStructField partition_schema = 3;
+  // Pushed-down data filters (translated from Catalyst)
+  repeated spark.spark_expression.Expr data_filters = 4;
+  // Column projection indices into data_schema
+  repeated int64 projection_vector = 5;
+  // Session-level options
+  string session_timezone = 6;
+  bool case_sensitive = 7;
+  // Cloud storage credentials / options, keyed identically to NativeScanCommon
+  map<string, string> object_store_options = 8;
+  // Root path of the Delta table (file:// or s3://…)
+  string table_root = 9;
+  // Optional snapshot version; unset = latest
+  optional uint64 snapshot_version = 10;
+  // Per-file parallelism knob within a single Spark task
+  uint32 data_file_concurrency_limit = 11;
+  // Informational label for debug output
+  string source = 12;
+}
+
+// Per-partition Delta scan: references common data plus the subset of file
+// tasks assigned to this Spark partition.
+message DeltaScan {
+  DeltaScanCommon common = 1;
+  repeated DeltaScanTask tasks = 2;
+}
+
+// A single file to read from a Delta table. Phase 1 is minimal — no DV,
+// residual, or column-mapping fields yet; those arrive with their respective
+// phases without breaking wire compat (field numbers left sparse on purpose).
+message DeltaScanTask {
+  // Absolute parquet file path (kernel resolves relative paths against table_root
+  // on the driver before serialization)
+  string file_path = 1;
+  uint64 file_size = 2;
+  optional uint64 record_count = 3;
+  // Partition column values from the add action, in the same order as
+  // DeltaScanCommon.partition_schema
+  repeated DeltaPartitionValue partition_values = 4;
+  // Reserved for future phases:
+  //   5: deletion_vector (Phase 3)
+  //   6: residual_predicate_idx (Phase 5)
+  //   7: physical_schema_idx (Phase 4 — column mapping)
+}
+
+// Partition column value extracted from a Delta add action. Delta represents
+// all partition values as strings on the wire; we parse into the correct
+// logical type native-side, driven by partition_schema.
+message DeltaPartitionValue {
+  // Column name (matches a field in partition_schema)
+  string name = 1;
+  // String-encoded value, or unset if the partition value is NULL
+  optional string value = 2;
+}
+
+// Return value of the driver-side planDeltaScan JNI call. Wraps a list of
+// DeltaScanTasks the caller pins to a snapshot version. The Scala side
+// receives one of these per query, partitions the tasks across Spark
+// executors, then wraps each partition's slice in a DeltaScan message
+// alongside a common block.
+message DeltaScanTaskList {
+  uint64 snapshot_version = 1;
+  // Root URL of the table, normalized with a trailing slash (what kernel used).
+  // Individual task file paths are absolute URLs under this root.
+  string table_root = 2;
+  repeated DeltaScanTask tasks = 3;
 }
 
 message Projection {
