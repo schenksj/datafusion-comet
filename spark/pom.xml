@@ -265,6 +265,15 @@ under the License.
             </exclusion>
           </exclusions>
         </dependency>
+        <!-- delta-spark's Guava transitively needs `failureaccess` as a  -->
+        <!-- companion artifact. Spark pins an older Guava that doesn't    -->
+        <!-- ship it, so we have to provide it explicitly for Delta tests. -->
+        <dependency>
+          <groupId>com.google.guava</groupId>
+          <artifactId>failureaccess</artifactId>
+          <version>1.0.2</version>
+          <scope>test</scope>
+        </dependency>
       </dependencies>
     </profile>
 

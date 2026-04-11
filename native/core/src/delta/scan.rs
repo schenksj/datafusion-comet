@@ -109,7 +109,29 @@ pub fn list_delta_files(
 
 /// Normalize a table URL so kernel's `table_root.join("_delta_log/")`
 /// appends rather than replaces. Bare paths become `file://` URLs.
+///
+/// Accepts three shapes:
+///   1. `s3://`, `s3a://`, `az://`, `azure://`, `abfs://`, `abfss://`,
+///      `file://` — already-formed URLs, parsed directly.
+///   2. `file:/Users/...` — Hadoop's `Path.toUri.toString` output, which
+///      uses a *single* slash and is NOT a valid `Url::parse` input. We
+///      rewrite this to `file://` before parsing.
+///   3. Bare local paths — canonicalized and turned into `file://` via
+///      `Url::from_directory_path`.
 pub(crate) fn normalize_url(url_str: &str) -> DeltaResult<Url> {
+    // Hadoop's java.net.URI.toString emits `file:/path/to/t` (one slash)
+    // for local files. Rewrite into the `file:///path` form that
+    // `Url::parse` understands.
+    if url_str.starts_with("file:/") && !url_str.starts_with("file://") {
+        let rewritten = format!("file://{}", &url_str["file:".len()..]);
+        let mut url = Url::parse(&rewritten).map_err(|e| DeltaError::InvalidUrl {
+            url: url_str.to_string(),
+            source: e,
+        })?;
+        ensure_trailing_slash(&mut url);
+        return Ok(url);
+    }
+
     if url_str.starts_with("s3://")
         || url_str.starts_with("s3a://")
         || url_str.starts_with("az://")
@@ -160,6 +182,17 @@ mod tests {
 
         let url = normalize_url("s3://bucket/path/to/table").unwrap();
         assert!(url.path().ends_with('/'), "URL should end with /: {url}");
+    }
+
+    #[test]
+    fn test_normalize_url_hadoop_single_slash_form() {
+        // Hadoop's Path.toUri.toString produces `file:/path` (single slash),
+        // not `file:///path`. Must be normalized to a Url::parse-able form.
+        let url = normalize_url("file:/Users/alice/tmp/t").unwrap();
+        assert_eq!(url.as_str(), "file:///Users/alice/tmp/t/");
+
+        let url = normalize_url("file:/tmp/t/").unwrap();
+        assert_eq!(url.as_str(), "file:///tmp/t/");
     }
 
     #[test]

@@ -65,21 +65,25 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     val relation = scan.relation
     val tableRoot = DeltaReflection.extractTableRoot(relation).getOrElse {
       logWarning(
-        s"CometDeltaNativeScan: unable to extract table root from relation ${relation.location}; " +
-          "falling back to Spark's Delta reader.")
+        s"CometDeltaNativeScan: unable to extract table root from relation " +
+          s"${relation.location}; falling back to Spark's Delta reader.")
       return None
     }
 
     // Cloud storage options, keyed identically to NativeScan. Kernel's DefaultEngine picks
     // up aws_* / azure_* keys; anything else is ignored on the native side (for now).
+    //
+    // We key off the table root URI rather than `inputFiles.head` because data file names
+    // can contain characters that aren't URI-safe when Spark's test harness injects
+    // prefixes like `test%file%prefix-` (breaks `java.net.URI.create`). The table root
+    // string comes straight from `HadoopFsRelation.location.rootPaths.head.toUri` inside
+    // `DeltaReflection.extractTableRoot`, so it's already properly encoded. Storage options
+    // are bucket-level anyway - any file under the same root resolves to the same config.
     val hadoopConf =
       relation.sparkSession.sessionState.newHadoopConfWithOptions(relation.options)
-    val firstFileUri =
-      relation.location.inputFiles.headOption.map(java.net.URI.create).getOrElse {
-        java.net.URI.create(tableRoot)
-      }
+    val tableRootUri = java.net.URI.create(tableRoot)
     val storageOptions: java.util.Map[String, String] =
-      NativeConfig.extractObjectStoreOptions(hadoopConf, firstFileUri).asJava
+      NativeConfig.extractObjectStoreOptions(hadoopConf, tableRootUri).asJava
 
     // --- 1. Ask kernel for the active file list ---
     val taskListBytes =
