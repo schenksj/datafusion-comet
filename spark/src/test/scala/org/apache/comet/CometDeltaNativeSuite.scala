@@ -22,21 +22,19 @@ package org.apache.comet
 import java.nio.file.Files
 
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.CometTestBase
 import org.apache.spark.sql.comet.CometDeltaNativeScanExec
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 
 /**
- * Phase 1 smoke test for the native Delta Lake scan path.
+ * Phase 1 suite for the native Delta Lake scan path. Each test:
+ *   1. Writes a Delta table via delta-spark's DataFrame API. 2. Reads it back through Comet's
+ *      native scan. 3. Asserts `CometDeltaNativeScanExec` appears in the physical plan. 4.
+ *      Asserts the native result matches vanilla Spark+Delta row-for-row.
  *
- * Exercises the full pipeline end-to-end through Spark:
- *   1. Enables `spark.comet.scan.deltaNative.enabled`. 2. Registers delta-spark's session
- *      extension + catalog so `df.write.format("delta")` is available in tests. 3. Writes a tiny
- *      Delta table to a tempdir. 4. Reads it back through Comet, asserting the plan contains
- *      `CometDeltaNativeScanExec` and the row contents match vanilla Spark+Delta.
- *
- * Skipped automatically if `delta-spark` is not on the test classpath (guards against running in
- * profiles where we haven't added the test dep yet).
+ * Auto-skips when delta-spark is not on the classpath so the suite is a no-op on Spark profiles
+ * where we haven't added the test dep yet.
  */
 class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
 
@@ -56,45 +54,144 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     conf
   }
 
-  test("read a tiny unpartitioned delta table via the native scan") {
-    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
-
-    val tempDir = Files.createTempDirectory("comet-delta-smoke").toFile
+  /** Run `body` with a fresh Delta table tempdir, cleaning up afterwards. */
+  private def withDeltaTable(testName: String)(body: String => Unit): Unit = {
+    val tempDir = Files.createTempDirectory(s"comet-delta-$testName").toFile
     try {
       val tablePath = new java.io.File(tempDir, "t").getAbsolutePath
+      body(tablePath)
+    } finally {
+      deleteRecursively(tempDir)
+    }
+  }
+
+  /**
+   * Run `query` against the Delta table at `tablePath`, assert that `CometDeltaNativeScanExec` is
+   * in the physical plan, and assert the returned rows match what vanilla Spark+Delta would
+   * return.
+   */
+  private def assertDeltaNativeMatches(tablePath: String, query: DataFrame => DataFrame): Unit = {
+    val native = query(spark.read.format("delta").load(tablePath))
+    val plan = native.queryExecution.executedPlan
+    val hasDeltaScan = plan.collect { case s: CometDeltaNativeScanExec => s }.nonEmpty
+    assert(hasDeltaScan, s"expected CometDeltaNativeScanExec in plan, got:\n$plan")
+    val nativeRows = native.collect().toSeq.map(_.toSeq)
+
+    withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
+      val vanillaRows = query(spark.read.format("delta").load(tablePath))
+        .collect()
+        .toSeq
+        .map(_.toSeq)
+      assert(
+        nativeRows.sortBy(_.mkString("|")) == vanillaRows.sortBy(_.mkString("|")),
+        s"native result did not match vanilla Spark result\n" +
+          s"native=${nativeRows}\nvanilla=${vanillaRows}")
+    }
+  }
+
+  // ───────────────────────────────────────── tests ─────────────────────────────────────────
+
+  test("read a tiny unpartitioned delta table via the native scan") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("smoke") { tablePath =>
       val ss = spark
       import ss.implicits._
-
-      // --- Write via delta-spark ---
-      val rows = (0 until 10).map(i => (i.toLong, s"name_$i", i * 1.5))
-      rows
+      (0 until 10)
+        .map(i => (i.toLong, s"name_$i", i * 1.5))
         .toDF("id", "name", "score")
         .repartition(1)
         .write
         .format("delta")
         .save(tablePath)
 
-      // --- Read via Comet (native Delta path) ---
-      val df = spark.read.format("delta").load(tablePath)
-      val executed = df.queryExecution.executedPlan
+      assertDeltaNativeMatches(tablePath, identity)
+    }
+  }
 
-      // Plan must contain the native Delta scan exec.
-      val hasDeltaScan = executed.collect { case s: CometDeltaNativeScanExec =>
-        s
-      }.nonEmpty
-      assert(hasDeltaScan, s"expected CometDeltaNativeScanExec in plan, got:\n$executed")
+  test("multi-file delta table") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("multifile") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 30)
+        .map(i => (i.toLong, s"name_$i"))
+        .toDF("id", "name")
+        .repartition(3)
+        .write
+        .format("delta")
+        .save(tablePath)
 
-      // Row contents must match the vanilla Spark+Delta read.
-      withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
-        val vanilla = spark.read.format("delta").load(tablePath).collect().toSeq
-        val native = df.collect().toSeq
-        assert(
-          native.sortBy(_.getLong(0)) == vanilla.sortBy(_.getLong(0)),
-          s"native result did not match vanilla Spark result\n" +
-            s"native=$native\nvanilla=$vanilla")
+      assertDeltaNativeMatches(tablePath, identity)
+    }
+  }
+
+  test("projection pushdown reads only selected columns") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("projection") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 10)
+        .map(i => (i.toLong, s"name_$i", i * 1.5, i % 2 == 0))
+        .toDF("id", "name", "score", "active")
+        .repartition(1)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, _.select("id", "score"))
+    }
+  }
+
+  test("partitioned delta table surfaces partition column values") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("partitioned") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 12)
+        .map(i => (i.toLong, s"name_$i", if (i < 6) "a" else "b"))
+        .toDF("id", "name", "category")
+        .write
+        .partitionBy("category")
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, identity)
+    }
+  }
+
+  test("filter pushdown returns correct rows") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("filter") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 20)
+        .map(i => (i.toLong, s"name_$i", i * 1.5))
+        .toDF("id", "name", "score")
+        .repartition(1)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, _.where("id >= 5 AND id < 15"))
+    }
+  }
+
+  test("complex types: array, map, and struct") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("complex") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      val rows = (0 until 5).map { i =>
+        (i.toLong, Seq(i, i + 1, i + 2), Map(s"k$i" -> s"v$i"), (s"inner_$i", i.toDouble))
       }
-    } finally {
-      deleteRecursively(tempDir)
+      rows
+        .toDF("id", "tags", "props", "nested")
+        .repartition(1)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, identity)
     }
   }
 

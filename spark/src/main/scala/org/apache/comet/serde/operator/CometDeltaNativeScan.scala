@@ -106,33 +106,35 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     commonBuilder.setDataFileConcurrencyLimit(
       CometConf.COMET_DELTA_DATA_FILE_CONCURRENCY_LIMIT.get())
 
-    // Schemas - Delta stores partition values in add actions, so partitionSchema is just the
-    // declared Delta partition columns on the relation side.
-    val dataSchema = schema2Proto(relation.dataSchema.fields)
+    // Schemas. Delta is different from vanilla Parquet: `relation.dataSchema` on a Delta
+    // table INCLUDES partition columns, but the physical parquet files on disk do NOT.
+    // So we compute the actual file schema by subtracting the partition columns from
+    // `relation.dataSchema`. Mirrors what delta-kernel itself reports as the scan schema.
+    val partitionNames =
+      relation.partitionSchema.fields.map(_.name.toLowerCase(Locale.ROOT)).toSet
+    val fileDataSchemaFields =
+      relation.dataSchema.fields.filterNot(f =>
+        partitionNames.contains(f.name.toLowerCase(Locale.ROOT)))
+
+    val dataSchema = schema2Proto(fileDataSchemaFields)
     val requiredSchema = schema2Proto(scan.requiredSchema.fields)
     val partitionSchema = schema2Proto(relation.partitionSchema.fields)
     commonBuilder.addAllDataSchema(dataSchema.toIterable.asJava)
     commonBuilder.addAllRequiredSchema(requiredSchema.toIterable.asJava)
     commonBuilder.addAllPartitionSchema(partitionSchema.toIterable.asJava)
 
-    // Projection vector: required-schema field index -> (dataSchema ++ partitionSchema) index.
-    // Same convention as CometNativeScan.
+    // Projection vector maps output-schema positions to (file_data_schema ++
+    // partition_schema) indices. Same convention as CometNativeScan.convert: first the
+    // data-column indexes in file schema order, then ALL partition columns appended.
     val dataSchemaIndexes = scan.requiredSchema.fields.map { field =>
       val nameLower = field.name.toLowerCase(Locale.ROOT)
-      val idx =
-        relation.dataSchema.fields.indexWhere(_.name.toLowerCase(Locale.ROOT) == nameLower)
-      if (idx >= 0) {
-        idx
-      } else {
-        // Required field is in the partition schema - locate it and offset into the
-        // combined data+partition index space.
-        val pidx =
-          relation.partitionSchema.fields.indexWhere(_.name.toLowerCase(Locale.ROOT) == nameLower)
-        relation.dataSchema.fields.length + pidx
-      }
+      fileDataSchemaFields.indexWhere(_.name.toLowerCase(Locale.ROOT) == nameLower)
     }
+    val partitionSchemaIndexes =
+      (0 until relation.partitionSchema.fields.length).map(i => fileDataSchemaFields.length + i)
+    val projectionVector = dataSchemaIndexes ++ partitionSchemaIndexes
     commonBuilder.addAllProjectionVector(
-      dataSchemaIndexes.map(idx => idx.toLong.asInstanceOf[java.lang.Long]).toIterable.asJava)
+      projectionVector.map(idx => idx.toLong.asInstanceOf[java.lang.Long]).toIterable.asJava)
 
     // Pushed-down data filters. Gated by Spark's parquet filter pushdown config, same as
     // CometNativeScan, so we behave consistently across scan implementations.
