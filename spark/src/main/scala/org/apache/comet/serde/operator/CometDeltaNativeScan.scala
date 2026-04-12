@@ -330,16 +330,20 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
 
     // Build an `InterpretedPredicate` that expects a row whose schema matches
     // `partitionSchema`. Rewrite attribute references to `BoundReference`s keyed by
-    // partition-schema column name so it can evaluate against a row we assemble below.
-    val partitionAttrsByName =
-      staticFilters.flatMap(_.references).groupBy(_.name.toLowerCase(Locale.ROOT))
+    // partition-schema field index, respecting case sensitivity.
+    val caseSensitive = scan.conf.getConf[Boolean](SQLConf.CASE_SENSITIVE)
     val combined = staticFilters.reduce(And)
     val bound = combined.transform {
       case a: org.apache.spark.sql.catalyst.expressions.AttributeReference =>
-        val idx = partitionSchema.fieldIndex(a.name)
+        val idx = if (caseSensitive) {
+          partitionSchema.fieldIndex(a.name)
+        } else {
+          partitionSchema.fields.indexWhere(
+            _.name.toLowerCase(Locale.ROOT) == a.name.toLowerCase(Locale.ROOT))
+        }
+        if (idx < 0) return tasks // Can't resolve; skip pruning
         BoundReference(idx, partitionSchema(idx).dataType, partitionSchema(idx).nullable)
     }
-    val _ = partitionAttrsByName
     val predicate = InterpretedPredicate(bound)
     predicate.initialize(0)
 

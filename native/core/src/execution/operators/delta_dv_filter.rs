@@ -252,12 +252,11 @@ impl DeltaDvFilterStream {
             if d >= batch_end {
                 break;
             }
-            // Invariant: d >= batch_start (otherwise it would have been
-            // consumed by a previous batch). Assert defensively.
-            debug_assert!(
-                d >= batch_start,
-                "deletion vector index {d} predates batch start {batch_start}"
-            );
+            if d < batch_start {
+                return Err(DataFusionError::Internal(format!(
+                    "DV index {d} predates batch start {batch_start}"
+                )));
+            }
             let local = (d - batch_start) as usize;
             if local < mask_buf.len() && mask_buf[local] {
                 mask_buf[local] = false;

@@ -33,8 +33,8 @@ pub fn catalyst_to_kernel_predicate_with_names(
     translate_predicate(expr, column_names)
 }
 
-/// Try to translate a Catalyst-proto `Expr` into a kernel `Predicate`.
-#[allow(dead_code)]
+/// Try to translate a Catalyst-proto `Expr` into a kernel `Predicate`
+/// (without column name resolution — BoundReferences become Unknown).
 pub fn catalyst_to_kernel_predicate(expr: &Expr) -> Predicate {
     translate_predicate(expr, &[])
 }

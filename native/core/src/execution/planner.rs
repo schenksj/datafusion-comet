@@ -1459,7 +1459,7 @@ impl PhysicalPlanner {
                     .tasks
                     .first()
                     .map(|t| t.file_path.clone())
-                    .expect("at least one task after empty check");
+                    .ok_or_else(|| GeneralError("DeltaScan has no tasks".into()))?;
                 let (object_store_url, _) = prepare_object_store_with_configs(
                     self.session_ctx.runtime_env(),
                     one_file,
@@ -1526,19 +1526,21 @@ impl PhysicalPlanner {
                         .map(|(l, p)| (p.clone(), l.clone()))
                         .collect();
                     let input_schema = final_exec.schema();
-                    let rename_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = input_schema
+                    let rename_exprs: Result<Vec<(Arc<dyn PhysicalExpr>, String)>, ExecutionError> = input_schema
                         .fields()
                         .iter()
-                        .map(|f| {
+                        .enumerate()
+                        .map(|(idx, f)| {
                             let col: Arc<dyn PhysicalExpr> =
-                                Arc::new(Column::new(f.name(), input_schema.index_of(f.name()).unwrap()));
+                                Arc::new(Column::new(f.name(), idx));
                             let logical = physical_to_logical
                                 .get(f.name())
                                 .cloned()
                                 .unwrap_or_else(|| f.name().clone());
-                            (col, logical)
+                            Ok((col, logical))
                         })
                         .collect();
+                    let rename_exprs = rename_exprs?;
                     Arc::new(ProjectionExec::try_new(rename_exprs, final_exec)?) as Arc<dyn ExecutionPlan>
                 } else {
                     final_exec
