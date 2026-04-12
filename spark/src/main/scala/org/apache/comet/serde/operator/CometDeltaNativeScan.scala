@@ -320,12 +320,20 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       partitionSchema: StructType): Seq[OperatorOuterClass.DeltaScanTask] = {
     if (scan.partitionFilters.isEmpty || partitionSchema.isEmpty) return tasks
 
+    // Phase 5b: filter out DPP expressions (DynamicPruningExpression wrapping
+    // InSubqueryExec) because they aren't resolved at planning time. Spark
+    // applies them post-scan at runtime. Static partition filters are still
+    // evaluated here for file-level pruning.
+    val staticFilters = scan.partitionFilters.filterNot(
+      _.exists(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.PlanExpression[_]]))
+    if (staticFilters.isEmpty) return tasks
+
     // Build an `InterpretedPredicate` that expects a row whose schema matches
     // `partitionSchema`. Rewrite attribute references to `BoundReference`s keyed by
     // partition-schema column name so it can evaluate against a row we assemble below.
     val partitionAttrsByName =
-      scan.partitionFilters.flatMap(_.references).groupBy(_.name.toLowerCase(Locale.ROOT))
-    val combined = scan.partitionFilters.reduce(And)
+      staticFilters.flatMap(_.references).groupBy(_.name.toLowerCase(Locale.ROOT))
+    val combined = staticFilters.reduce(And)
     val bound = combined.transform {
       case a: org.apache.spark.sql.catalyst.expressions.AttributeReference =>
         val idx = partitionSchema.fieldIndex(a.name)

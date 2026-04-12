@@ -1137,6 +1137,63 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     }
   }
 
+  test("dynamic partition pruning through join") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("dpp") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+
+      val factPath = new java.io.File(tablePath, "fact").getAbsolutePath
+      val dimPath = new java.io.File(tablePath, "dim").getAbsolutePath
+
+      // Fact table: partitioned by region, many rows.
+      (0 until 100)
+        .map(i => (i.toLong, s"item_$i", Seq("us", "eu", "ap")(i % 3)))
+        .toDF("id", "item", "region")
+        .write
+        .partitionBy("region")
+        .format("delta")
+        .save(factPath)
+
+      // Dimension table: small, filters the fact via join.
+      Seq(("us", "United States"))
+        .toDF("region", "region_name")
+        .write
+        .format("delta")
+        .save(dimPath)
+
+      // Star-schema join: DPP should push the dim.region='us' filter into the
+      // fact scan as a dynamic partition filter, pruning eu and ap partitions.
+      val query = s"""
+        SELECT f.id, f.item, d.region_name
+        FROM delta.`$factPath` f
+        JOIN delta.`$dimPath` d ON f.region = d.region
+      """
+      val df = spark.sql(query)
+      val plan = df.queryExecution.executedPlan
+      val scans = collect(plan) { case s: CometDeltaNativeScanExec => s }
+
+      // The fact scan should be a native Delta scan (DPP doesn't prevent it).
+      assert(scans.nonEmpty, s"expected CometDeltaNativeScanExec in DPP plan, got:\n$plan")
+
+      // Correctness: result should only contain 'us' region rows.
+      val rows = df.collect()
+      assert(
+        rows.forall(_.getString(2) == "United States"),
+        s"expected all rows to have region_name='United States'")
+      // ~34 rows (100/3 rounding)
+      assert(rows.length > 30 && rows.length < 40, s"expected ~34 rows, got ${rows.length}")
+
+      // Compare with vanilla for row-for-row correctness.
+      withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
+        val vanilla = spark.sql(query).collect()
+        assert(
+          rows.map(_.toSeq).toSet == vanilla.map(_.toSeq).toSet,
+          s"DPP result differs from vanilla")
+      }
+    }
+  }
+
   test("wider primitive type coverage") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("primitives") { tablePath =>

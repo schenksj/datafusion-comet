@@ -246,19 +246,21 @@ case class CometScanRule(session: SparkSession)
 
   private def transformV1Scan(plan: SparkPlan, scanExec: FileSourceScanExec): SparkPlan = {
 
-    if (COMET_DPP_FALLBACK_ENABLED.get() &&
-      scanExec.partitionFilters.exists(isDynamicPruningFilter)) {
-      return withInfo(scanExec, "Dynamic Partition Pruning is not supported")
-    }
-
     scanExec.relation match {
       case r: HadoopFsRelation =>
-        // Delta Lake (V1 path) — detect before the `isFileFormatSupported` check, which
-        // only accepts the exact `ParquetFileFormat` class and otherwise rejects Delta's
-        // `DeltaParquetFileFormat` subclass.
+        // Delta Lake (V1 path): detect BEFORE the DPP fallback check below,
+        // because Delta's native path handles DPP through partition pruning
+        // at execution time (DPP expressions are filtered out of the
+        // planning-time InterpretedPredicate and applied by Spark post-scan).
         if (DeltaReflection.isDeltaFileFormat(r.fileFormat)) {
           return nativeDeltaScan(session, scanExec, r, hadoopConfOrNull = null)
             .getOrElse(scanExec)
+        }
+        // DPP fallback for non-Delta scans (DataFusion/Iceberg-compat paths
+        // don't support DPP natively).
+        if (COMET_DPP_FALLBACK_ENABLED.get() &&
+          scanExec.partitionFilters.exists(isDynamicPruningFilter)) {
+          return withInfo(scanExec, "Dynamic Partition Pruning is not supported")
         }
         if (!CometScanExec.isFileFormatSupported(r.fileFormat)) {
           return withInfo(scanExec, s"Unsupported file format ${r.fileFormat}")
