@@ -200,23 +200,30 @@ fn resolve_file_path(table_root: &str, relative: &str) -> String {
 }
 
 /// Walk a `java.util.Map<String, String>` of storage options into a
-/// [`DeltaStorageConfig`]. Unknown keys are silently ignored — kernel only
-/// understands the subset in the config struct today.
-///
-/// Caller is responsible for null-checking and casting the raw JObject
-/// to a `JMap` (jni 0.22 requires `cast_local`, which takes ownership
-/// and is cheaper to do once at the JNI boundary).
+/// [`DeltaStorageConfig`]. Checks both kernel-style keys (`aws_access_key_id`)
+/// and Hadoop-style keys (`fs.s3a.access.key`) since Comet's
+/// `NativeConfig.extractObjectStoreOptions` passes the latter.
 fn extract_storage_config(
     env: &mut Env,
     jmap: &JMap<'_>,
 ) -> CometResult<DeltaStorageConfig> {
+    // Helper: try kernel key first, fall back to Hadoop key.
+    let get = |env: &mut Env, k1: &str, k2: &str| -> CometResult<Option<String>> {
+        let v = map_get_string(env, jmap, k1)?;
+        if v.is_some() {
+            return Ok(v);
+        }
+        map_get_string(env, jmap, k2)
+    };
+
     Ok(DeltaStorageConfig {
-        aws_access_key: map_get_string(env, jmap, "aws_access_key_id")?,
-        aws_secret_key: map_get_string(env, jmap, "aws_secret_access_key")?,
-        aws_session_token: map_get_string(env, jmap, "aws_session_token")?,
-        aws_region: map_get_string(env, jmap, "aws_region")?,
-        aws_endpoint: map_get_string(env, jmap, "aws_endpoint")?,
-        aws_force_path_style: map_get_string(env, jmap, "aws_force_path_style")?
+        aws_access_key: get(env, "aws_access_key_id", "fs.s3a.access.key")?,
+        aws_secret_key: get(env, "aws_secret_access_key", "fs.s3a.secret.key")?,
+        aws_session_token: get(env, "aws_session_token", "fs.s3a.session.token")?,
+        aws_region: get(env, "aws_region", "fs.s3a.endpoint.region")?
+            .or(map_get_string(env, jmap, "fs.s3a.region")?),
+        aws_endpoint: get(env, "aws_endpoint", "fs.s3a.endpoint")?,
+        aws_force_path_style: get(env, "aws_force_path_style", "fs.s3a.path.style.access")?
             .map(|s| s == "true")
             .unwrap_or(false),
         azure_account_name: map_get_string(env, jmap, "azure_account_name")?,

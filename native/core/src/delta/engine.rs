@@ -92,6 +92,10 @@ pub fn create_object_store(
             if config.aws_force_path_style {
                 builder = builder.with_virtual_hosted_style_request(false);
             }
+            // Allow HTTP endpoints (MinIO, LocalStack, custom S3-compat)
+            if config.aws_endpoint.as_ref().map_or(false, |e| e.starts_with("http://")) {
+                builder = builder.with_allow_http(true);
+            }
 
             Arc::new(builder.build()?)
         }
