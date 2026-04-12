@@ -82,11 +82,8 @@ private[comet] trait PlanDataInjector {
 private[comet] object PlanDataInjector {
 
   // Registry of injectors for different operator types
-  private val injectors: Seq[PlanDataInjector] = Seq(
-    IcebergPlanDataInjector,
-    NativeScanPlanDataInjector
-    // Future: DeltaPlanDataInjector, HudiPlanDataInjector, etc.
-  )
+  private val injectors: Seq[PlanDataInjector] =
+    Seq(IcebergPlanDataInjector, NativeScanPlanDataInjector, DeltaPlanDataInjector)
 
   /**
    * Injects planning data into an Operator tree by finding nodes that need injection and applying
@@ -230,6 +227,34 @@ private[comet] object NativeScanPlanDataInjector extends PlanDataInjector {
     scanBuilder.setFilePartition(partitionOnly.getFilePartition)
 
     op.toBuilder.setNativeScan(scanBuilder).build()
+  }
+}
+
+/**
+ * Injector for DeltaScan operators (Phase 5 split-mode serialization).
+ */
+private[comet] object DeltaPlanDataInjector extends PlanDataInjector {
+
+  override def canInject(op: Operator): Boolean =
+    op.hasDeltaScan &&
+      op.getDeltaScan.getTasksCount == 0 &&
+      op.getDeltaScan.hasCommon
+
+  override def getKey(op: Operator): Option[String] =
+    Some(op.getDeltaScan.getCommon.getTableRoot)
+
+  override def inject(
+      op: Operator,
+      commonBytes: Array[Byte],
+      partitionBytes: Array[Byte]): Operator = {
+    val common = OperatorOuterClass.DeltaScanCommon.parseFrom(commonBytes)
+    val tasksOnly = OperatorOuterClass.DeltaScan.parseFrom(partitionBytes)
+
+    val scanBuilder = op.getDeltaScan.toBuilder
+    scanBuilder.setCommon(common)
+    scanBuilder.addAllTasks(tasksOnly.getTasksList)
+
+    op.toBuilder.setDeltaScan(scanBuilder).build()
   }
 }
 
@@ -676,6 +701,13 @@ abstract class CometNativeExec extends CometExec {
         (
           Map(nativeScan.sourceKey -> nativeScan.commonData),
           Map(nativeScan.sourceKey -> nativeScan.perPartitionData))
+
+      // Found a Delta scan with planning data
+      case deltaScan: CometDeltaNativeScanExec
+          if deltaScan.commonData != null && deltaScan.perPartitionData != null =>
+        (
+          Map(deltaScan.tableRoot -> deltaScan.commonData),
+          Map(deltaScan.tableRoot -> deltaScan.perPartitionData))
 
       // Broadcast stages are boundaries - don't collect per-partition data from inside them.
       // After DPP filtering, broadcast scans may have different partition counts than the

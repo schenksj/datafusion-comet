@@ -28,44 +28,70 @@ import org.apache.spark.sql.execution.FileSourceScanExec
 
 import com.google.common.base.Objects
 
+import org.apache.comet.serde.OperatorOuterClass
 import org.apache.comet.serde.OperatorOuterClass.Operator
 
 /**
- * Native Delta Lake scan operator.
+ * Native Delta Lake scan operator with Phase 5 split-mode serialization.
  *
- * Leaf exec that wraps a pre-built `DeltaScan` protobuf operator. The Scala side builds the
- * operator once during plan conversion (in `CometDeltaNativeScan.convert`), which calls
- * `Native.planDeltaScan` on the driver to replay the Delta transaction log via `delta-kernel-rs`
- * and materialize the file list. The resulting native plan is executed via the standard
- * `CometExecRDD` machinery inherited from `CometNativeExec`.
+ * Common scan metadata (schemas, filters, projections, storage options, column mappings) is
+ * serialized once at planning time in `nativeOp`. Per-partition file lists are materialized
+ * lazily in `serializedPartitionData` at execution time so each Spark task receives only its own
+ * slice of the file list, reducing driver memory.
  *
- * Phase 1 scope:
- *   - Single Spark partition (all file tasks in one task). Split-mode serialization and
- *     per-partition parallelism arrive with Phase 5.
- *   - No Dynamic Partition Pruning. Phase 5.
- *   - No deletion vectors. Phase 3.
- *   - No per-task residual predicates. Phase 5.
- *
- * Shape is intentionally tiny compared with `CometIcebergNativeScanExec` because everything
- * DPP-adjacent is deferred. When those features land we'll grow this class to mirror the Iceberg
- * exec more closely (lazy `serializedPartitionData`, `doPrepare` DPP hook, etc.).
+ * The `PlanDataInjector` machinery (via `DeltaPlanDataInjector`) merges common + per-partition
+ * data at runtime on each executor before the native plan is executed.
  */
 case class CometDeltaNativeScanExec(
     override val nativeOp: Operator,
     override val output: Seq[Attribute],
     override val serializedPlanOpt: SerializedPlan,
     @transient originalPlan: FileSourceScanExec,
-    tableRoot: String)
+    tableRoot: String,
+    @transient taskListBytes: Array[Byte])
     extends CometLeafExec {
 
   override val supportsColumnar: Boolean = true
 
   override val nodeName: String = s"CometDeltaNativeScan $tableRoot"
 
-  // Single-partition output for Phase 1 - we execute all Delta file tasks on one Spark task.
-  // Phase 5 introduces per-file task parallelism via split-mode serialization, at which
-  // point this becomes `UnknownPartitioning(numDeltaPartitions)`.
-  override lazy val outputPartitioning: Partitioning = UnknownPartitioning(1)
+  /**
+   * Lazy split-mode partition serialization. Each element of `perPartitionData` contains a
+   * serialized `DeltaScan` message with ONLY the tasks for that partition (no common block).
+   * `commonData` contains the serialized `DeltaScanCommon`.
+   */
+  @transient private lazy val serializedPartitionData: (Array[Byte], Array[Array[Byte]]) = {
+    val commonBytes = nativeOp.getDeltaScan.getCommon.toByteArray
+
+    // Parse the full task list returned by planDeltaScan on the driver.
+    val taskList = OperatorOuterClass.DeltaScanTaskList.parseFrom(taskListBytes)
+
+    // Each file becomes its own Spark partition for maximum parallelism.
+    // Future optimization: merge small files into larger partitions using
+    // Spark's maxSplitBytes-based logic.
+    val allTasks = taskList.getTasksList.asScala.toSeq
+    val perPartitionBytes = if (allTasks.isEmpty) {
+      Array.empty[Array[Byte]]
+    } else {
+      allTasks.map { task =>
+        val partScan = OperatorOuterClass.DeltaScan
+          .newBuilder()
+          .addTasks(task)
+          .build()
+        partScan.toByteArray
+      }.toArray
+    }
+
+    (commonBytes, perPartitionBytes)
+  }
+
+  def commonData: Array[Byte] = serializedPartitionData._1
+  def perPartitionData: Array[Array[Byte]] = serializedPartitionData._2
+
+  def numPartitions: Int = perPartitionData.length
+
+  override lazy val outputPartitioning: Partitioning =
+    UnknownPartitioning(math.max(1, numPartitions))
 
   override lazy val outputOrdering: Seq[SortOrder] = Nil
 
@@ -83,7 +109,8 @@ case class CometDeltaNativeScanExec(
     copy(
       output = output.map(QueryPlan.normalizeExpressions(_, output)),
       serializedPlanOpt = SerializedPlan(None),
-      originalPlan = null)
+      originalPlan = null,
+      taskListBytes = null)
   }
 
   override def stringArgs: Iterator[Any] = Iterator(output, tableRoot)

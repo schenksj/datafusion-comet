@@ -55,6 +55,11 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
   /** Private lazy handle to the native library - one instance per JVM. */
   private lazy val nativeLib = new Native()
 
+  // Phase 5: stash the raw task-list bytes between convert() and createExec()
+  // so the exec can do per-partition splitting at execution time. Single-threaded
+  // during planning so a simple ThreadLocal is safe.
+  private val lastTaskListBytes = new ThreadLocal[Array[Byte]]()
+
   override def enabledConfig: Option[ConfigEntry[Boolean]] = Some(
     CometConf.COMET_DELTA_NATIVE_ENABLED)
 
@@ -274,10 +279,26 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
           .build())
     }
 
-    // --- 3. Pack everything into a DeltaScan ---
+    // --- 3. Pack into a DeltaScan with COMMON ONLY (split-mode, Phase 5).
+    // Tasks are NOT included in the proto at planning time. They'll be
+    // serialized per-partition in CometDeltaNativeScanExec.serializedPartitionData
+    // at execution time, and merged via DeltaPlanDataInjector.
     val deltaScanBuilder = DeltaScan.newBuilder()
     deltaScanBuilder.setCommon(commonBuilder.build())
-    deltaScanBuilder.addAllTasks(filteredTasks.asJava)
+    // No addAllTasks: tasks stay in taskListBytes for the exec's lazy split.
+
+    // Stash the full task-list bytes for createExec to retrieve. The ThreadLocal
+    // bridges the convert() -> createExec() gap in CometExecRule.convertToComet.
+    // Build a modified taskList with ONLY the filtered tasks (partition-pruned).
+    val filteredTaskList = OperatorOuterClass.DeltaScanTaskList
+      .newBuilder()
+      .setSnapshotVersion(taskList.getSnapshotVersion)
+      .setTableRoot(taskList.getTableRoot)
+      .addAllTasks(filteredTasks.asJava)
+      .addAllColumnMappings(taskList.getColumnMappingsList)
+      .addAllUnsupportedFeatures(taskList.getUnsupportedFeaturesList)
+      .build()
+    lastTaskListBytes.set(filteredTaskList.toByteArray)
 
     builder.clearChildren()
     Some(builder.setDeltaScan(deltaScanBuilder.build()).build())
@@ -358,11 +379,14 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
 
   override def createExec(nativeOp: Operator, op: CometScanExec): CometNativeExec = {
     val tableRoot = DeltaReflection.extractTableRoot(op.relation).getOrElse("unknown")
+    val tlBytes = Option(lastTaskListBytes.get()).getOrElse(Array.emptyByteArray)
+    lastTaskListBytes.remove() // clean up
     CometDeltaNativeScanExec(
       nativeOp,
       op.output,
       org.apache.spark.sql.comet.SerializedPlan(None),
       op.wrapped,
-      tableRoot)
+      tableRoot,
+      tlBytes)
   }
 }
