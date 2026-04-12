@@ -113,6 +113,32 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       }
     val taskList = DeltaScanTaskList.parseFrom(taskListBytes)
 
+    // Phase 6 reader-feature gate. Kernel reports any Delta reader features that
+    // are currently in use in this snapshot and that Comet's native path does NOT
+    // correctly handle. Falling back is mandatory for correctness: reading through
+    // the native path would silently produce wrong results (e.g. returning rows
+    // that a deletion vector should have hidden). The gate becomes obsolete feature
+    // by feature as later phases ship:
+    //   deletionVectors -> Phase 3
+    //   columnMapping   -> Phase 4
+    //   typeWidening    -> future phase
+    //   rowTracking     -> future phase
+    val unsupportedFeatures = taskList.getUnsupportedFeaturesList.asScala.toSeq
+    if (unsupportedFeatures.nonEmpty &&
+      CometConf.COMET_DELTA_FALLBACK_ON_UNSUPPORTED_FEATURE.get(scan.conf)) {
+      logInfo(
+        s"CometDeltaNativeScan: falling back for table $tableRoot " +
+          s"due to unsupported reader features: ${unsupportedFeatures.mkString(", ")}")
+      import org.apache.comet.CometSparkSessionExtensions.withInfo
+      withInfo(
+        scan,
+        s"Native Delta scan does not yet support these features in use on this " +
+          s"snapshot: ${unsupportedFeatures.mkString(", ")}. Falling back to Spark's " +
+          s"Delta reader. Set ${CometConf.COMET_DELTA_FALLBACK_ON_UNSUPPORTED_FEATURE.key}=false " +
+          s"to bypass this check (NOT recommended - may produce incorrect results).")
+      return None
+    }
+
     // Apply Spark's partition filters to the task list so that queries like
     // `WHERE partition_col = X` don't drag in files from other partitions. Kernel
     // itself is given the whole snapshot (no predicate yet - that lands in Phase 2),

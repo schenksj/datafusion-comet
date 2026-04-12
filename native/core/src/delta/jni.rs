@@ -29,7 +29,7 @@ use jni::{
 };
 use prost::Message;
 
-use crate::delta::{list_delta_files, DeltaStorageConfig};
+use crate::delta::{plan_delta_scan, DeltaStorageConfig};
 use crate::errors::{try_unwrap_or_throw, CometError, CometResult};
 use datafusion_comet_proto::spark_operator::{
     DeltaPartitionValue, DeltaScanTask, DeltaScanTaskList,
@@ -74,12 +74,12 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
             extract_storage_config(env, &jmap)?
         };
 
-        let (entries, actual_version) =
-            list_delta_files(&url_str, &config, version).map_err(|e| {
-                CometError::Internal(format!("delta_kernel log replay failed: {e}"))
-            })?;
+        let plan = plan_delta_scan(&url_str, &config, version).map_err(|e| {
+            CometError::Internal(format!("delta_kernel log replay failed: {e}"))
+        })?;
 
-        let tasks: Vec<DeltaScanTask> = entries
+        let tasks: Vec<DeltaScanTask> = plan
+            .entries
             .into_iter()
             .map(|entry| DeltaScanTask {
                 file_path: resolve_file_path(&url_str, &entry.path),
@@ -102,9 +102,10 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
             .collect();
 
         let msg = DeltaScanTaskList {
-            snapshot_version: actual_version,
+            snapshot_version: plan.version,
             table_root: url_str,
             tasks,
+            unsupported_features: plan.unsupported_features,
         };
 
         let bytes = msg.encode_to_vec();

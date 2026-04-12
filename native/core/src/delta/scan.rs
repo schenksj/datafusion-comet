@@ -61,16 +61,55 @@ pub struct DeltaFileEntry {
     pub has_deletion_vector: bool,
 }
 
+/// Result of planning a Delta scan: the active file list plus the pinned
+/// snapshot version plus a list of reader features that Comet's native path
+/// doesn't yet handle. The Scala side uses the feature list to decide
+/// whether to fall back to Spark's vanilla Delta reader.
+#[derive(Debug, Clone)]
+pub struct DeltaScanPlan {
+    pub entries: Vec<DeltaFileEntry>,
+    pub version: u64,
+    pub unsupported_features: Vec<String>,
+}
+
 /// List every active parquet file in a Delta table at the given version.
 ///
 /// Returns `(entries, actual_version)` where `actual_version` is the
 /// snapshot version that was actually read — equal to `version` when
 /// specified, or the latest version otherwise.
+///
+/// Thin wrapper around [`plan_delta_scan`] that drops the feature list.
+/// New code should call `plan_delta_scan` directly so it can honor the
+/// unsupported-feature gate.
 pub fn list_delta_files(
     url_str: &str,
     config: &DeltaStorageConfig,
     version: Option<u64>,
 ) -> DeltaResult<(Vec<DeltaFileEntry>, u64)> {
+    let plan = plan_delta_scan(url_str, config, version)?;
+    Ok((plan.entries, plan.version))
+}
+
+/// Plan a Delta scan against the given URL + optional snapshot version.
+///
+/// This is the full-fat variant of [`list_delta_files`]: it also reports
+/// which reader features are *in use* for this snapshot and NOT yet
+/// supported by Comet's native path.
+///
+/// Feature detection blends two signals:
+///   1. [`delta_kernel::snapshot::Snapshot::table_properties`] — the
+///      protocol-level flags (`column_mapping_mode`, `enable_type_widening`,
+///      `enable_row_tracking`).
+///   2. The per-file `ScanFile::dv_info.has_vector()` flag — set to true
+///      only when the specific file actually has a deletion vector attached.
+///      This is tighter than the `enable_deletion_vectors` table property
+///      because a DV-enabled table with no deletes yet is still safe for
+///      Comet to read natively.
+pub fn plan_delta_scan(
+    url_str: &str,
+    config: &DeltaStorageConfig,
+    version: Option<u64>,
+) -> DeltaResult<DeltaScanPlan> {
     let url = normalize_url(url_str)?;
     let engine = create_engine(&url, config)?;
 
@@ -82,6 +121,25 @@ pub fn list_delta_files(
         builder.build(&engine)?
     };
     let actual_version = snapshot.version();
+
+    // Protocol-level feature gate. Collect the names of features we don't
+    // yet handle so the Scala side can decide to fall back. Note that we
+    // explicitly do NOT treat the following as fallback-worthy:
+    //   - `change_data_feed`: only affects CDF queries, not regular reads
+    //   - `in_commit_timestamps`: regular reads work fine
+    //   - `iceberg_compat_v1/v2`: doesn't change Delta read correctness
+    //   - `append_only`: write-side constraint, reads are unaffected
+    let mut unsupported_features: Vec<String> = Vec::new();
+    let props = snapshot.table_properties();
+    if props.column_mapping_mode.is_some() {
+        unsupported_features.push("columnMapping".to_string());
+    }
+    if props.enable_type_widening == Some(true) {
+        unsupported_features.push("typeWidening".to_string());
+    }
+    if props.enable_row_tracking == Some(true) {
+        unsupported_features.push("rowTracking".to_string());
+    }
 
     let scan = snapshot.scan_builder().build()?;
 
@@ -104,7 +162,20 @@ pub fn list_delta_files(
         })?;
     }
 
-    Ok((entries, actual_version))
+    // Per-file deletion-vector check. Any single file with a DV attached
+    // means this snapshot has rows that must be hidden from the reader, and
+    // Comet's Phase 1 native path doesn't apply deletion vectors yet.
+    if entries.iter().any(|e| e.has_deletion_vector)
+        && !unsupported_features.iter().any(|f| f == "deletionVectors")
+    {
+        unsupported_features.push("deletionVectors".to_string());
+    }
+
+    Ok(DeltaScanPlan {
+        entries,
+        version: actual_version,
+        unsupported_features,
+    })
 }
 
 /// Normalize a table URL so kernel's `table_root.join("_delta_log/")`

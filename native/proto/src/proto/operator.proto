@@ -327,6 +327,17 @@ message DeltaScanTaskList {
   // Individual task file paths are absolute URLs under this root.
   string table_root = 2;
   repeated DeltaScanTask tasks = 3;
+
+  // Reader-facing Delta features that are in use in this snapshot and that
+  // Comet's native path does not yet correctly handle. When this list is
+  // non-empty, the Scala side MUST fall back to Spark's vanilla Delta reader
+  // to avoid silent wrong-result bugs (e.g. reading rows that a DELETE
+  // should have hidden via a deletion vector).
+  //
+  // Populated by the Rust side using `Snapshot::table_properties()` plus a
+  // per-file `DvInfo::has_vector()` scan. Empty means "native scan is safe
+  // for this snapshot".
+  repeated string unsupported_features = 4;
 }
 
 message Projection {

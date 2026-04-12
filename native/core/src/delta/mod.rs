@@ -44,4 +44,4 @@ mod integration_tests;
 
 pub use engine::{create_engine, create_object_store, DeltaStorageConfig};
 pub use error::{DeltaError, DeltaResult};
-pub use scan::{list_delta_files, DeltaFileEntry};
+pub use scan::{list_delta_files, plan_delta_scan, DeltaFileEntry, DeltaScanPlan};

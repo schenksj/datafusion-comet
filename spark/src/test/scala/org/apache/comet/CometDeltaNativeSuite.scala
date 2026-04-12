@@ -983,6 +983,65 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     }
   }
 
+  test("deletion vectors: falls back correctly when DVs are in use") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("dv_fallback") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+
+      // Create a DV-capable table: requires protocol >= reader 3 / writer 7 and
+      // the `delta.enableDeletionVectors` table property.
+      (0 until 20)
+        .map(i => (i.toLong, s"name_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .option("delta.enableDeletionVectors", "true")
+        .option("delta.minReaderVersion", "3")
+        .option("delta.minWriterVersion", "7")
+        .save(tablePath)
+
+      // Before any DELETE: the table has the feature declared but no file has a DV
+      // attached. Comet should STILL accelerate this, because our per-file DV check
+      // only fires when at least one scan file actually has a vector in use.
+      assertDeltaNativeMatches(tablePath, identity)
+
+      // Now issue a DELETE. Delta writes a DV for the affected file instead of
+      // rewriting the parquet file. Spark executes the DELETE via vanilla Delta
+      // (Comet doesn't accelerate writes, matching Iceberg behavior).
+      spark.sql(s"DELETE FROM delta.`$tablePath` WHERE id % 3 = 0")
+
+      // After the DELETE, reading the table MUST fall back: the base parquet file
+      // still contains the id%3==0 rows, and Comet's Phase 1 native path does not
+      // apply DVs yet. Without the Phase 6 gate, Comet would silently return those
+      // rows. With the gate, Spark's vanilla reader handles it and returns the
+      // correct post-DELETE row count.
+      val df = spark.read.format("delta").load(tablePath)
+      val plan = df.queryExecution.executedPlan
+      val deltaScans = collect(plan) { case s: CometDeltaNativeScanExec => s }
+      assert(
+        deltaScans.isEmpty,
+        s"expected Comet to fall back for a DV-in-use table, but plan has " +
+          s"${deltaScans.size} CometDeltaNativeScanExec nodes:\n$plan")
+
+      // Sanity-check correctness against vanilla.
+      val nativeRows = df.collect().toSeq.map(normalizeRow)
+      withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
+        val vanillaRows = spark.read
+          .format("delta")
+          .load(tablePath)
+          .collect()
+          .toSeq
+          .map(normalizeRow)
+        assert(
+          nativeRows.sortBy(_.mkString("|")) == vanillaRows.sortBy(_.mkString("|")),
+          s"native (fallback)=$nativeRows\nvanilla=$vanillaRows")
+      }
+      // Rows with id in {0,3,6,9,12,15,18} are deleted -> 13 rows remain.
+      assert(nativeRows.size == 13, s"expected 13 rows after DELETE, got ${nativeRows.size}")
+    }
+  }
+
   test("wider primitive type coverage") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("primitives") { tablePath =>
