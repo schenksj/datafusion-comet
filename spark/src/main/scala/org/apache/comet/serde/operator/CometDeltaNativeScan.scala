@@ -85,10 +85,22 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     val storageOptions: java.util.Map[String, String] =
       NativeConfig.extractObjectStoreOptions(hadoopConf, tableRootUri).asJava
 
+    // Honor Delta's time-travel options (versionAsOf / timestampAsOf) via the Delta-
+    // resolved snapshot version sitting on the FileIndex. Delta's analysis phase pins
+    // the exact snapshot before we ever see the plan, so by the time `CometScanExec` is
+    // built, `relation.location` is a `PreparedDeltaFileIndex` whose toString looks like
+    // `Delta[version=0, file:/...]`. We parse the version out via
+    // `DeltaReflection.extractSnapshotVersion` and pass it through to kernel.
+    //
+    // When no version can be extracted (non-Delta file index, parser miss, etc.) we pass
+    // -1 which asks kernel for the current latest snapshot.
+    val snapshotVersion: Long =
+      DeltaReflection.extractSnapshotVersion(relation).getOrElse(-1L)
+
     // --- 1. Ask kernel for the active file list ---
     val taskListBytes =
       try {
-        nativeLib.planDeltaScan(tableRoot, -1L, storageOptions)
+        nativeLib.planDeltaScan(tableRoot, snapshotVersion, storageOptions)
       } catch {
         case e: Throwable =>
           logWarning(s"CometDeltaNativeScan: delta-kernel-rs log replay failed for $tableRoot", e)

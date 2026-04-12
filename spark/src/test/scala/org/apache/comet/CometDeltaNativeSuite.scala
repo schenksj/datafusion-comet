@@ -293,6 +293,56 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     }
   }
 
+  test("time travel by version reads the older snapshot") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("time_travel") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+
+      // Commit 0: initial 5 rows.
+      (0 until 5)
+        .map(i => (i.toLong, s"v1_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      // Commit 1: overwrite with 3 different rows. This makes the old files
+      // still exist on disk but no longer in the latest snapshot's add actions.
+      (100 until 103)
+        .map(i => (i.toLong, s"v2_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .save(tablePath)
+
+      // Reading with versionAsOf=0 must return the ORIGINAL 5 rows, not the
+      // 3 rows from the latest snapshot.
+      val native = spark.read.format("delta").option("versionAsOf", "0").load(tablePath)
+      val plan = native.queryExecution.executedPlan
+      val hasDeltaScan = plan.collect { case s: CometDeltaNativeScanExec => s }.nonEmpty
+      assert(hasDeltaScan, s"expected CometDeltaNativeScanExec in plan, got:\n$plan")
+
+      val nativeRows = native.collect().toSeq.map(normalizeRow)
+      withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
+        val vanillaRows = spark.read
+          .format("delta")
+          .option("versionAsOf", "0")
+          .load(tablePath)
+          .collect()
+          .toSeq
+          .map(normalizeRow)
+        assert(
+          nativeRows.sortBy(_.mkString("|")) == vanillaRows.sortBy(_.mkString("|")),
+          s"native time-travel result did not match vanilla\n" +
+            s"native=$nativeRows\nvanilla=$vanillaRows")
+      }
+      // Extra sanity: we should have read 5 rows (commit 0), not 3 (commit 1).
+      assert(nativeRows.size == 5, s"expected 5 rows from versionAsOf=0, got ${nativeRows.size}")
+    }
+  }
+
   test("wider primitive type coverage") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("primitives") { tablePath =>

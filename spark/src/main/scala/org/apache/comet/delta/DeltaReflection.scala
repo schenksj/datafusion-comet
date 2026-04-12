@@ -103,4 +103,28 @@ object DeltaReflection extends Logging {
         None
     }
   }
+
+  /**
+   * Extract the resolved snapshot version from Delta's `FileIndex`. Delta's file index is a
+   * `TahoeLogFileIndex` / `PreparedDeltaFileIndex` which has already pinned a specific snapshot
+   * by the time we see it, including when the user supplied `versionAsOf` or `timestampAsOf`.
+   *
+   * The toString format is stable: `Delta[version=<N>, <path>]`. We parse that rather than
+   * reaching into Delta's internals because the actual field names differ across Delta versions
+   * (snapshotAtAnalysis vs tahoeFileIndex.snapshot vs etc.). Regex is a single point of failure
+   * that's easy to update if the format ever changes.
+   *
+   * Returns the version as a `Long`, or `None` if parsing fails / the file index isn't a Delta
+   * one (callers should fall back to `-1` = latest).
+   */
+  private val DeltaFileIndexVersionRegex = """^Delta\[version=(-?\d+),""".r
+
+  def extractSnapshotVersion(relation: HadoopFsRelation): Option[Long] = {
+    try {
+      val desc = relation.location.toString
+      DeltaFileIndexVersionRegex.findFirstMatchIn(desc).map(_.group(1).toLong)
+    } catch {
+      case _: Exception => None
+    }
+  }
 }
