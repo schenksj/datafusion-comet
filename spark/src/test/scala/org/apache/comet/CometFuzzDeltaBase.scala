@@ -78,11 +78,7 @@ class CometFuzzDeltaBase extends CometTestBase with AdaptiveSparkPlanHelper {
         SchemaGenOptions(
           generateArray = true,
           generateStruct = true,
-          primitiveTypes = SchemaGenOptions.defaultPrimitiveTypes.filterNot {
-            // Match Iceberg fuzz: exclude DecimalType to avoid known Comet shuffle
-            // hash-function edge cases with high-precision decimals.
-            _.isInstanceOf[DecimalType]
-          }))
+          primitiveTypes = SchemaGenOptions.defaultPrimitiveTypes))
 
       val options =
         DataGenOptions(
