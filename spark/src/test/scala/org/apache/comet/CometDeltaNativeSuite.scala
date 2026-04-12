@@ -62,15 +62,9 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     // Explicitly clear the prefixes so production-shaped filenames are used.
     conf.set("spark.databricks.delta.testOnly.dataFileNamePrefix", "")
     conf.set("spark.databricks.delta.testOnly.dvFileNamePrefix", "")
-    // Delta 3.x's default `useMetadataRowIndex=true` strategy rewrites DV-in-use
-    // scans to read the parquet file with `_metadata.row_index` + other metadata
-    // columns, and applies the DV *inside* `DeletionVectorBoundFileFormat` at read
-    // time - no Filter is inserted in the plan. That makes the DV completely
-    // opaque to any physical-plan rewrite: there's nothing to detect.
-    // Setting this to false falls Delta back to its older strategy that DOES
-    // insert `Project -> Filter(__delta_internal_is_row_deleted = 0) -> scan`,
-    // which our `stripDeltaDvWrappers` rewrite can recognize and unwind.
-    conf.set("spark.databricks.delta.deletionVectors.useMetadataRowIndex", "false")
+    // useMetadataRowIndex is now set automatically by CometDeltaDvConfigRule
+    // (injected via CometSparkSessionExtensions.injectOptimizerRule) when
+    // COMET_DELTA_NATIVE_ENABLED=true. No manual config needed.
     conf
   }
 
