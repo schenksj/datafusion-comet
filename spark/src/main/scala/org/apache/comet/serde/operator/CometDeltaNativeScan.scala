@@ -25,8 +25,13 @@ import scala.collection.mutable.ListBuffer
 import scala.jdk.CollectionConverters._
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{And, BoundReference, InterpretedPredicate}
+import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.comet.{CometDeltaNativeScanExec, CometNativeExec, CometScanExec}
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.UTF8String
 
 import org.apache.comet.{CometConf, ConfigEntry, Native}
 import org.apache.comet.delta.DeltaReflection
@@ -108,6 +113,15 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       }
     val taskList = DeltaScanTaskList.parseFrom(taskListBytes)
 
+    // Apply Spark's partition filters to the task list so that queries like
+    // `WHERE partition_col = X` don't drag in files from other partitions. Kernel
+    // itself is given the whole snapshot (no predicate yet - that lands in Phase 2),
+    // so we do the pruning in Scala by evaluating each task's partition-value map
+    // against Spark's `partitionFilters`. This is a single driver-side loop; filtered
+    // tasks never go over the wire to executors.
+    val filteredTasks =
+      prunePartitions(taskList.getTasksList.asScala.toSeq, scan, relation.partitionSchema)
+
     // --- 2. Build the common block ---
     val commonBuilder = DeltaScanCommon.newBuilder()
     commonBuilder.setSource(scan.simpleStringWithNodeId())
@@ -169,10 +183,83 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // --- 3. Pack everything into a DeltaScan ---
     val deltaScanBuilder = DeltaScan.newBuilder()
     deltaScanBuilder.setCommon(commonBuilder.build())
-    deltaScanBuilder.addAllTasks(taskList.getTasksList)
+    deltaScanBuilder.addAllTasks(filteredTasks.asJava)
 
     builder.clearChildren()
     Some(builder.setDeltaScan(deltaScanBuilder.build()).build())
+  }
+
+  /**
+   * Filter `tasks` down to the subset whose partition values satisfy Spark's
+   * `scan.partitionFilters`. Returns the original list unchanged when the scan has no partition
+   * filters.
+   *
+   * Delta stores partition values as strings inside add actions, so we parse each value into the
+   * correct Catalyst type using `castPartitionString` below before feeding it to an
+   * `InterpretedPredicate`. Only values for fields actually referenced by the predicate need
+   * parsing, but we do the full row for simplicity.
+   */
+  private def prunePartitions(
+      tasks: Seq[OperatorOuterClass.DeltaScanTask],
+      scan: CometScanExec,
+      partitionSchema: StructType): Seq[OperatorOuterClass.DeltaScanTask] = {
+    if (scan.partitionFilters.isEmpty || partitionSchema.isEmpty) return tasks
+
+    // Build an `InterpretedPredicate` that expects a row whose schema matches
+    // `partitionSchema`. Rewrite attribute references to `BoundReference`s keyed by
+    // partition-schema column name so it can evaluate against a row we assemble below.
+    val partitionAttrsByName =
+      scan.partitionFilters.flatMap(_.references).groupBy(_.name.toLowerCase(Locale.ROOT))
+    val combined = scan.partitionFilters.reduce(And)
+    val bound = combined.transform {
+      case a: org.apache.spark.sql.catalyst.expressions.AttributeReference =>
+        val idx = partitionSchema.fieldIndex(a.name)
+        BoundReference(idx, partitionSchema(idx).dataType, partitionSchema(idx).nullable)
+    }
+    val _ = partitionAttrsByName
+    val predicate = InterpretedPredicate(bound)
+    predicate.initialize(0)
+
+    tasks.filter { task =>
+      val row = InternalRow.fromSeq(partitionSchema.fields.toSeq.map { field =>
+        val proto = task.getPartitionValuesList.asScala.find(_.getName == field.name)
+        val strValue =
+          if (proto.exists(_.hasValue)) Some(proto.get.getValue) else None
+        castPartitionString(strValue, field.dataType)
+      })
+      predicate.eval(row)
+    }
+  }
+
+  /**
+   * Convert a Delta partition value (always a string, always stored in the add action) into a
+   * Catalyst-internal representation for the given data type. Returns `null` for null/unset
+   * values. Handles the subset of primitive types Delta supports for partition columns: string,
+   * int, long, short, byte, float, double, boolean, date, timestamp, and decimal. Other types
+   * fall back to a string representation.
+   */
+  private def castPartitionString(str: Option[String], dt: DataType): Any = str match {
+    case None => null
+    case Some(s) if s == null => null
+    case Some(s) =>
+      dt match {
+        case StringType => UTF8String.fromString(s)
+        case IntegerType => s.toInt
+        case LongType => s.toLong
+        case ShortType => s.toShort
+        case ByteType => s.toByte
+        case FloatType => s.toFloat
+        case DoubleType => s.toDouble
+        case BooleanType => s.toBoolean
+        case DateType => DateTimeUtils.stringToDate(UTF8String.fromString(s)).get
+        case _: TimestampType =>
+          DateTimeUtils.stringToTimestamp(UTF8String.fromString(s), java.time.ZoneOffset.UTC).get
+        case d: DecimalType =>
+          val dec = org.apache.spark.sql.types.Decimal(new java.math.BigDecimal(s))
+          dec.changePrecision(d.precision, d.scale)
+          dec
+        case _ => UTF8String.fromString(s)
+      }
   }
 
   override def createExec(nativeOp: Operator, op: CometScanExec): CometNativeExec = {

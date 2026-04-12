@@ -69,12 +69,15 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
    * Run `query` against the Delta table at `tablePath`, assert that `CometDeltaNativeScanExec` is
    * in the physical plan, and assert the returned rows match what vanilla Spark+Delta would
    * return.
+   *
+   * `collectDeltaScans` uses `AdaptiveSparkPlanHelper.collect` so AQE nodes
+   * (`AdaptiveSparkPlanExec`) don't hide the inner scan from the match.
    */
   private def assertDeltaNativeMatches(tablePath: String, query: DataFrame => DataFrame): Unit = {
     val native = query(spark.read.format("delta").load(tablePath))
     val plan = native.queryExecution.executedPlan
-    val hasDeltaScan = plan.collect { case s: CometDeltaNativeScanExec => s }.nonEmpty
-    assert(hasDeltaScan, s"expected CometDeltaNativeScanExec in plan, got:\n$plan")
+    val deltaScans = collect(plan) { case s: CometDeltaNativeScanExec => s }
+    assert(deltaScans.nonEmpty, s"expected CometDeltaNativeScanExec in plan, got:\n$plan")
     val nativeRows = native.collect().toSeq.map(normalizeRow)
 
     withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
@@ -321,7 +324,7 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
       // 3 rows from the latest snapshot.
       val native = spark.read.format("delta").option("versionAsOf", "0").load(tablePath)
       val plan = native.queryExecution.executedPlan
-      val hasDeltaScan = plan.collect { case s: CometDeltaNativeScanExec => s }.nonEmpty
+      val hasDeltaScan = collect(plan) { case s: CometDeltaNativeScanExec => s }.nonEmpty
       assert(hasDeltaScan, s"expected CometDeltaNativeScanExec in plan, got:\n$plan")
 
       val nativeRows = native.collect().toSeq.map(normalizeRow)
@@ -340,6 +343,196 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
       }
       // Extra sanity: we should have read 5 rows (commit 0), not 3 (commit 1).
       assert(nativeRows.size == 5, s"expected 5 rows from versionAsOf=0, got ${nativeRows.size}")
+    }
+  }
+
+  test("time travel by timestamp reads the older snapshot") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("timestamp_travel") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+
+      // Commit 0.
+      (0 until 5)
+        .map(i => (i.toLong, s"v1_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      // Capture commit 0's log file mtime with millisecond precision, then add a
+      // half-second so we land strictly AFTER commit 0 and strictly BEFORE commit 1.
+      // Delta's history resolution requires the requested timestamp to be >= the
+      // earliest commit file mtime.
+      val logFile = new java.io.File(tablePath, "_delta_log/00000000000000000000.json")
+      val t0 = logFile.lastModified()
+      val targetTs = t0 + 500L
+      Thread.sleep(1100) // ensure commit 1 lands at least a second later
+
+      // Commit 1: overwrite.
+      (100 until 102)
+        .map(i => (i.toLong, s"v2_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .save(tablePath)
+
+      val fmt = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS")
+      val tsString = fmt.format(new java.util.Date(targetTs))
+      assertDeltaNativeMatches(
+        tablePath,
+        _ => spark.read.format("delta").option("timestampAsOf", tsString).load(tablePath))
+    }
+  }
+
+  test("multi-column partitioning") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("multipart") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      val rows = for {
+        region <- Seq("us", "eu", "ap")
+        tier <- Seq("free", "pro")
+        i <- 0 until 4
+      } yield (i.toLong, s"name_$region${tier}_$i", region, tier)
+
+      rows
+        .toDF("id", "name", "region", "tier")
+        .write
+        .partitionBy("region", "tier")
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, identity)
+      assertDeltaNativeMatches(tablePath, _.where("region = 'us'"))
+      assertDeltaNativeMatches(tablePath, _.where("region = 'eu' AND tier = 'pro'"))
+    }
+  }
+
+  test("typed partition columns: int, long, date") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("typed_partitions") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      val rows = (0 until 8).map { i =>
+        (
+          i.toLong,
+          s"name_$i",
+          i % 3, // int partition
+          (1000L + i), // long partition
+          java.sql.Date.valueOf(f"2024-01-${(i % 5) + 1}%02d") // date partition
+        )
+      }
+      rows
+        .toDF("id", "name", "p_int", "p_long", "p_date")
+        .write
+        .partitionBy("p_int", "p_long", "p_date")
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, identity)
+      assertDeltaNativeMatches(tablePath, _.where("p_int = 1"))
+      assertDeltaNativeMatches(tablePath, _.where("p_date >= DATE'2024-01-03'"))
+    }
+  }
+
+  test("aggregation and join over delta inputs") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("agg_join") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+
+      val leftPath = new java.io.File(tablePath, "left").getAbsolutePath
+      val rightPath = new java.io.File(tablePath, "right").getAbsolutePath
+
+      (0 until 12)
+        .map(i => (i.toLong, s"name_$i", (i % 3).toLong))
+        .toDF("id", "name", "grp")
+        .write
+        .format("delta")
+        .save(leftPath)
+
+      (0 until 3)
+        .map(i => (i.toLong, s"group_$i"))
+        .toDF("grp_id", "grp_label")
+        .write
+        .format("delta")
+        .save(rightPath)
+
+      // COUNT(*) + GROUP BY over the left table.
+      val grouped =
+        spark.sql(s"SELECT grp, COUNT(*) AS n, SUM(id) AS s FROM delta.`$leftPath` GROUP BY grp")
+      val groupedPlan = grouped.queryExecution.executedPlan
+      val hasLeftDeltaScan =
+        collect(groupedPlan) { case s: CometDeltaNativeScanExec => s }.nonEmpty
+      assert(hasLeftDeltaScan, s"expected CometDeltaNativeScanExec in plan, got:\n$groupedPlan")
+
+      val nativeGrouped = grouped.collect().toSeq.map(normalizeRow)
+      withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
+        val vanilla = spark
+          .sql(s"SELECT grp, COUNT(*) AS n, SUM(id) AS s FROM delta.`$leftPath` GROUP BY grp")
+          .collect()
+          .toSeq
+          .map(normalizeRow)
+        assert(
+          nativeGrouped.sortBy(_.mkString("|")) == vanilla.sortBy(_.mkString("|")),
+          s"native=$nativeGrouped\nvanilla=$vanilla")
+      }
+
+      // Inner join between two Delta tables.
+      val joined = spark.sql(s"""
+           |SELECT l.id, l.name, r.grp_label
+           |FROM delta.`$leftPath` l
+           |JOIN delta.`$rightPath` r ON l.grp = r.grp_id
+           |""".stripMargin)
+      val joinPlan = joined.queryExecution.executedPlan
+      val deltaScanCount =
+        collect(joinPlan) { case s: CometDeltaNativeScanExec => s }.size
+      assert(
+        deltaScanCount == 2,
+        s"expected 2 CometDeltaNativeScanExec in join plan, got $deltaScanCount:\n$joinPlan")
+
+      val nativeJoined = joined.collect().toSeq.map(normalizeRow)
+      withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
+        val vanilla = spark
+          .sql(s"""
+                  |SELECT l.id, l.name, r.grp_label
+                  |FROM delta.`$leftPath` l
+                  |JOIN delta.`$rightPath` r ON l.grp = r.grp_id
+                  |""".stripMargin)
+          .collect()
+          .toSeq
+          .map(normalizeRow)
+        assert(
+          nativeJoined.sortBy(_.mkString("|")) == vanilla.sortBy(_.mkString("|")),
+          s"native=$nativeJoined\nvanilla=$vanilla")
+      }
+    }
+  }
+
+  test("multiple appends produce many files, native scan reads them all") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("multi_append") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+
+      // Five append commits, each a single file of 4 rows. Comet's native scan
+      // must enumerate tasks across all of them.
+      (0 until 5).foreach { commit =>
+        (0 until 4)
+          .map(i => ((commit * 10 + i).toLong, s"c${commit}_r$i"))
+          .toDF("id", "name")
+          .repartition(1)
+          .write
+          .format("delta")
+          .mode(if (commit == 0) "overwrite" else "append")
+          .save(tablePath)
+      }
+
+      val df = spark.read.format("delta").load(tablePath)
+      assertDeltaNativeMatches(tablePath, identity)
+      assert(df.count() == 20, s"expected 20 rows, got ${df.count()}")
     }
   }
 
