@@ -264,6 +264,16 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       commonBuilder.putObjectStoreOptions(key, value)
     }
 
+    // Phase 4: pass column mapping from kernel through to the native planner.
+    taskList.getColumnMappingsList.asScala.foreach { cm =>
+      commonBuilder.addColumnMappings(
+        OperatorOuterClass.DeltaColumnMapping
+          .newBuilder()
+          .setLogicalName(cm.getLogicalName)
+          .setPhysicalName(cm.getPhysicalName)
+          .build())
+    }
+
     // --- 3. Pack everything into a DeltaScan ---
     val deltaScanBuilder = DeltaScan.newBuilder()
     deltaScanBuilder.setCommon(commonBuilder.build())

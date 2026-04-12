@@ -78,6 +78,9 @@ pub struct DeltaScanPlan {
     pub entries: Vec<DeltaFileEntry>,
     pub version: u64,
     pub unsupported_features: Vec<String>,
+    /// Logical→physical column name mapping for column-mapped tables.
+    /// Empty when column_mapping_mode is None.
+    pub column_mappings: Vec<(String, String)>,
 }
 
 /// List every active parquet file in a Delta table at the given version.
@@ -148,15 +151,38 @@ pub fn plan_delta_scan_with_predicate(
     //   - `append_only`: write-side constraint, reads are unaffected
     let mut unsupported_features: Vec<String> = Vec::new();
     let props = snapshot.table_properties();
-    if props.column_mapping_mode.is_some() {
-        unsupported_features.push("columnMapping".to_string());
-    }
+    // columnMapping is now handled by Phase 4 — no longer a fallback trigger.
     if props.enable_type_widening == Some(true) {
         unsupported_features.push("typeWidening".to_string());
     }
     if props.enable_row_tracking == Some(true) {
         unsupported_features.push("rowTracking".to_string());
     }
+
+    // Phase 4: extract logical→physical column name mapping from schema metadata.
+    // For column_mapping_mode = id or name, each StructField carries a
+    // `delta.columnMapping.physicalName` metadata entry that tells us what the
+    // parquet file's column name actually is.
+    let column_mappings: Vec<(String, String)> = if props.column_mapping_mode.is_some() {
+        snapshot
+            .schema()
+            .fields()
+            .filter_map(|field| {
+                use delta_kernel::schema::{ColumnMetadataKey, MetadataValue};
+                field
+                    .metadata
+                    .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+                    .and_then(|v| match v {
+                        MetadataValue::String(phys) => {
+                            Some((field.name().clone(), phys.clone()))
+                        }
+                        _ => None,
+                    })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // `Snapshot::build()` returns `Arc<Snapshot>`, and `scan_builder` consumes
     // it. Clone the Arc so we can still reach `table_root()` after building
@@ -231,6 +257,7 @@ pub fn plan_delta_scan_with_predicate(
         entries,
         version: actual_version,
         unsupported_features,
+        column_mappings,
     })
 }
 

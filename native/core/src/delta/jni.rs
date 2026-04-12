@@ -154,11 +154,25 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
             })
             .collect();
 
+        let column_mappings: Vec<
+            datafusion_comet_proto::spark_operator::DeltaColumnMapping,
+        > = plan
+            .column_mappings
+            .into_iter()
+            .map(|(logical, physical)| {
+                datafusion_comet_proto::spark_operator::DeltaColumnMapping {
+                    logical_name: logical,
+                    physical_name: physical,
+                }
+            })
+            .collect();
+
         let msg = DeltaScanTaskList {
             snapshot_version: plan.version,
             table_root: url_str,
             tasks,
             unsupported_features: plan.unsupported_features,
+            column_mappings,
         };
 
         let bytes = msg.encode_to_vec();

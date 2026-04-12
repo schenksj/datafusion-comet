@@ -279,6 +279,9 @@ message DeltaScanCommon {
   uint32 data_file_concurrency_limit = 11;
   // Informational label for debug output
   string source = 12;
+  // Phase 4: logical-to-physical column name mapping from kernel's schema
+  // metadata. Empty when column_mapping_mode is None.
+  repeated DeltaColumnMapping column_mappings = 13;
 }
 
 // Per-partition Delta scan: references common data plus the subset of file
@@ -332,6 +335,10 @@ message DeltaScanTaskList {
   string table_root = 2;
   repeated DeltaScanTask tasks = 3;
 
+  // Phase 4: logical-to-physical column name mapping for tables with
+  // column_mapping_mode = id or name. Empty when mode = none.
+  repeated DeltaColumnMapping column_mappings = 5;
+
   // Reader-facing Delta features that are in use in this snapshot and that
   // Comet's native path does not yet correctly handle. When this list is
   // non-empty, the Scala side MUST fall back to Spark's vanilla Delta reader
@@ -342,6 +349,13 @@ message DeltaScanTaskList {
   // per-file `DvInfo::has_vector()` scan. Empty means "native scan is safe
   // for this snapshot".
   repeated string unsupported_features = 4;
+}
+
+// Maps a Delta logical column name to the physical column name in parquet
+// files for tables using column mapping mode `id` or `name`.
+message DeltaColumnMapping {
+  string logical_name = 1;
+  string physical_name = 2;
 }
 
 message Projection {

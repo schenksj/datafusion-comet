@@ -1362,10 +1362,40 @@ impl PhysicalPlanner {
 
                 let required_schema: SchemaRef =
                     convert_spark_types_to_arrow_schema(common.required_schema.as_slice());
-                let data_schema: SchemaRef =
+                let mut data_schema: SchemaRef =
                     convert_spark_types_to_arrow_schema(common.data_schema.as_slice());
                 let partition_schema: SchemaRef =
                     convert_spark_types_to_arrow_schema(common.partition_schema.as_slice());
+
+                // Phase 4: Column mapping. When the table uses column_mapping_mode=id
+                // or =name, the parquet files have PHYSICAL column names that differ
+                // from the LOGICAL names in data_schema. Substitute physical names into
+                // data_schema so ParquetSource projects by the names actually in the
+                // parquet file. We'll add a rename projection on top later.
+                let logical_to_physical: HashMap<String, String> = common
+                    .column_mappings
+                    .iter()
+                    .map(|cm| (cm.logical_name.clone(), cm.physical_name.clone()))
+                    .collect();
+                let has_column_mapping = !logical_to_physical.is_empty();
+                if has_column_mapping {
+                    let new_fields: Vec<_> = data_schema
+                        .fields()
+                        .iter()
+                        .map(|f| {
+                            if let Some(physical) = logical_to_physical.get(f.name()) {
+                                Arc::new(Field::new(
+                                    physical,
+                                    f.data_type().clone(),
+                                    f.is_nullable(),
+                                ))
+                            } else {
+                                Arc::clone(f)
+                            }
+                        })
+                        .collect();
+                    data_schema = Arc::new(Schema::new(new_fields));
+                }
                 let projection_vector: Vec<usize> = common
                     .projection_vector
                     .iter()
@@ -1436,8 +1466,32 @@ impl PhysicalPlanner {
                     &object_store_options,
                 )?;
 
+                // When column mapping is active, required_schema also needs physical
+                // names so init_datasource_exec's name-matching logic works against the
+                // physical data_schema.
+                let read_required_schema = if has_column_mapping {
+                    let new_fields: Vec<_> = required_schema
+                        .fields()
+                        .iter()
+                        .map(|f| {
+                            if let Some(physical) = logical_to_physical.get(f.name()) {
+                                Arc::new(Field::new(
+                                    physical,
+                                    f.data_type().clone(),
+                                    f.is_nullable(),
+                                ))
+                            } else {
+                                Arc::clone(f)
+                            }
+                        })
+                        .collect();
+                    Arc::new(Schema::new(new_fields))
+                } else {
+                    Arc::clone(&required_schema)
+                };
+
                 let delta_exec = init_datasource_exec(
-                    required_schema,
+                    read_required_schema,
                     Some(data_schema),
                     Some(partition_schema),
                     object_store_url,
@@ -1463,6 +1517,32 @@ impl PhysicalPlanner {
                     } else {
                         delta_exec
                     };
+
+                // Phase 4: when column mapping is active, the output has PHYSICAL
+                // column names. Add a ProjectionExec to rename back to logical.
+                let final_exec = if has_column_mapping {
+                    let physical_to_logical: HashMap<String, String> = logical_to_physical
+                        .iter()
+                        .map(|(l, p)| (p.clone(), l.clone()))
+                        .collect();
+                    let input_schema = final_exec.schema();
+                    let rename_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = input_schema
+                        .fields()
+                        .iter()
+                        .map(|f| {
+                            let col: Arc<dyn PhysicalExpr> =
+                                Arc::new(Column::new(f.name(), input_schema.index_of(f.name()).unwrap()));
+                            let logical = physical_to_logical
+                                .get(f.name())
+                                .cloned()
+                                .unwrap_or_else(|| f.name().clone());
+                            (col, logical)
+                        })
+                        .collect();
+                    Arc::new(ProjectionExec::try_new(rename_exprs, final_exec)?) as Arc<dyn ExecutionPlan>
+                } else {
+                    final_exec
+                };
 
                 Ok((
                     vec![],

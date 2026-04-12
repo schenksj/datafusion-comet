@@ -1091,6 +1091,58 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     }
   }
 
+  test("column mapping: name mode read after rename") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("col_mapping_name") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+
+      // Create with column mapping mode = name (requires protocol v2 features).
+      (0 until 8)
+        .map(i => (i.toLong, s"name_$i", i * 1.5))
+        .toDF("id", "name", "score")
+        .write
+        .format("delta")
+        .option("delta.columnMapping.mode", "name")
+        .option("delta.minReaderVersion", "2")
+        .option("delta.minWriterVersion", "5")
+        .save(tablePath)
+
+      // Read: should accelerate normally.
+      assertDeltaNativeMatches(tablePath, identity)
+
+      // Rename a column via ALTER TABLE (column mapping makes this a metadata-only
+      // operation; the parquet file still has the OLD physical name internally).
+      spark.sql(s"ALTER TABLE delta.`$tablePath` RENAME COLUMN name TO full_name")
+
+      // Read after rename: Comet must use the physical-to-logical mapping to read
+      // the old physical name and emit the new logical name.
+      assertDeltaNativeMatches(tablePath, identity)
+      assertDeltaNativeMatches(tablePath, _.select("id", "full_name"))
+    }
+  }
+
+  test("column mapping: id mode") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("col_mapping_id") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+
+      (0 until 6)
+        .map(i => (i.toLong, s"name_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .option("delta.columnMapping.mode", "id")
+        .option("delta.minReaderVersion", "2")
+        .option("delta.minWriterVersion", "5")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, identity)
+      assertDeltaNativeMatches(tablePath, _.where("id > 2"))
+    }
+  }
+
   test("wider primitive type coverage") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("primitives") { tablePath =>
