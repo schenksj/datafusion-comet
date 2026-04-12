@@ -183,14 +183,16 @@ case class CometScanRule(session: SparkSession)
   }
 
   /** Matches `__delta_internal_is_row_deleted = 0` (the filter Delta injects). */
-  private def isDeltaDvFilterPattern(cond: Expression): Boolean = cond match {
-    case EqualTo(attr: AttributeReference, lit: Literal)
-        if attr.name == DeltaReflection.IsRowDeletedColumnName =>
-      lit.value != null && lit.value.toString == "0"
-    case EqualTo(lit: Literal, attr: AttributeReference)
-        if attr.name == DeltaReflection.IsRowDeletedColumnName =>
-      lit.value != null && lit.value.toString == "0"
-    case _ => false
+  private def isDeltaDvFilterPattern(cond: Expression): Boolean = {
+    def isRowDeletedRef(name: String): Boolean =
+      name.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName)
+    cond match {
+      case EqualTo(attr: AttributeReference, lit: Literal) if isRowDeletedRef(attr.name) =>
+        lit.value != null && lit.value.toString == "0"
+      case EqualTo(lit: Literal, attr: AttributeReference) if isRowDeletedRef(attr.name) =>
+        lit.value != null && lit.value.toString == "0"
+      case _ => false
+    }
   }
 
   /**
@@ -204,7 +206,7 @@ case class CometScanRule(session: SparkSession)
       userOutput: Seq[Attribute]): Option[SparkPlan] = plan match {
     case scan: FileSourceScanExec
         if DeltaReflection.isDeltaFileFormat(scan.relation.fileFormat) &&
-          scan.output.exists(_.name == DeltaReflection.IsRowDeletedColumnName) =>
+          scan.output.exists(_.name.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName)) =>
       Some(rebuildDeltaScanWithoutDvColumn(scan, userOutput))
     case other if other.children.size == 1 =>
       // Single-child wrappers (Project, ColumnarToRow, etc.) Delta may insert between

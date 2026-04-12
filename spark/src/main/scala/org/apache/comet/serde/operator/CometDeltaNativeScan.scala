@@ -385,7 +385,11 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
           val dec = org.apache.spark.sql.types.Decimal(new java.math.BigDecimal(s))
           dec.changePrecision(d.precision, d.scale)
           dec
-        case _ => UTF8String.fromString(s)
+        case other =>
+          throw new IllegalArgumentException(
+            s"Unsupported Delta partition column type $other for value '$s'. " +
+              "Supported types: string, int, long, short, byte, float, double, " +
+              "boolean, date, timestamp, decimal.")
       }
   }
 

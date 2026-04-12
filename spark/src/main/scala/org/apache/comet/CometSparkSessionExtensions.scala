@@ -64,19 +64,25 @@ class CometSparkSessionExtensions
     extensions.injectOptimizerRule { session =>
       new org.apache.spark.sql.catalyst.rules.Rule[
         org.apache.spark.sql.catalyst.plans.logical.LogicalPlan] {
+        private val configLock = new Object()
         @volatile private var configured = false
         override def apply(plan: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan)
             : org.apache.spark.sql.catalyst.plans.logical.LogicalPlan = {
           if (!configured) {
-            try {
-              if (CometConf.COMET_DELTA_NATIVE_ENABLED.get(session.sessionState.conf)) {
-                session.conf
-                  .set("spark.databricks.delta.deletionVectors.useMetadataRowIndex", "false")
+            configLock.synchronized {
+              if (!configured) {
+                try {
+                  if (CometConf.COMET_DELTA_NATIVE_ENABLED.get(session.sessionState.conf)) {
+                    session.conf.set(
+                      "spark.databricks.delta.deletionVectors.useMetadataRowIndex",
+                      "false")
+                  }
+                } catch {
+                  case _: Throwable => // delta-spark not on classpath; ignore
+                }
+                configured = true
               }
-            } catch {
-              case _: Throwable => // delta-spark not on classpath; ignore
             }
-            configured = true
           }
           plan
         }

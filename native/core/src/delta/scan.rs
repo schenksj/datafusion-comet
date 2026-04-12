@@ -234,8 +234,16 @@ pub fn plan_delta_scan_with_predicate(
     // and the various storage-type variants transparently. This runs on the
     // driver (same process that's building the scan plan), so we only pay
     // the DV-fetch latency once per query.
+    //
+    // Note: for very large tables (millions of files), this collects all
+    // entries into memory before returning. Consider streaming/chunked
+    // processing if driver OOM becomes an issue at extreme scale.
     let mut entries: Vec<DeltaFileEntry> = Vec::with_capacity(raw.len());
     for r in raw {
+        // get_row_indexes returns Ok(Some(Vec<u64>)) when a DV is present,
+        // Ok(None) when has_vector() lied (shouldn't happen), or Err on I/O
+        // failure. The `?` propagates I/O errors; `unwrap_or_default` handles
+        // the None case defensively (empty = no deletions, safe fallback).
         let deleted_row_indexes = if r.dv_info.has_vector() {
             r.dv_info
                 .get_row_indexes(&engine, &table_root_url)?

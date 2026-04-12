@@ -80,18 +80,12 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
         };
 
         // Phase 2: read column names for BoundReference resolution.
-        let col_names: Vec<String> = if column_names.is_null() {
-            Vec::new()
-        } else {
-            let len = column_names.len(env)?;
-            let mut names = Vec::with_capacity(len);
-            for i in 0..len {
-                let obj = column_names.get_element(env, i)?;
-                let jstr = unsafe { JString::from_raw(env, obj.into_raw()) };
-                names.push(jstr.try_to_string(env)?);
-            }
-            names
-        };
+        // storageOptions map carries Hadoop-style keys (fs.s3a.access.key,
+        // fs.s3a.secret.key, fs.s3a.endpoint, fs.s3a.path.style.access,
+        // fs.s3a.endpoint.region, fs.s3a.session.token) extracted by
+        // NativeConfig.extractObjectStoreOptions on the Scala side.
+        // extract_storage_config below maps these to kernel's DeltaStorageConfig.
+        let col_names = read_string_array(env, &column_names)?;
 
         // Phase 2: deserialize the Catalyst predicate (if provided) for
         // kernel's stats-based file pruning. Empty bytes = no predicate.
@@ -230,6 +224,24 @@ fn extract_storage_config(
         azure_access_key: map_get_string(env, jmap, "azure_access_key")?,
         azure_bearer_token: map_get_string(env, jmap, "azure_bearer_token")?,
     })
+}
+
+/// Read a Java `String[]` into a `Vec<String>`. Returns empty vec for null arrays.
+fn read_string_array(
+    env: &mut Env,
+    arr: &jni::objects::JObjectArray,
+) -> CometResult<Vec<String>> {
+    if arr.is_null() {
+        return Ok(Vec::new());
+    }
+    let len = arr.len(env)?;
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let obj = arr.get_element(env, i)?;
+        let jstr = unsafe { JString::from_raw(env, obj.into_raw()) };
+        result.push(jstr.try_to_string(env)?);
+    }
+    Ok(result)
 }
 
 /// `map.get(key)` for a `java.util.Map<String, String>` surfaced as a

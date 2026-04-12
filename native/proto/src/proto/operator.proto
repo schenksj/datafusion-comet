@@ -255,6 +255,10 @@ message IcebergDeleteFile {
 // Common data shared by all partitions in split mode for a Delta native scan
 // (sent once at planning time). Mirrors NativeScanCommon/IcebergScanCommon so
 // the same downstream ParquetSource wiring can be reused.
+//
+// Field numbering note: fields are grouped by concern, not sequential.
+// New fields should use the next available number at the END of the
+// message to maintain wire compatibility with existing serialized data.
 message DeltaScanCommon {
   // Required schema (projection applied to data schema)
   repeated SparkStructField required_schema = 1;
@@ -308,9 +312,9 @@ message DeltaScanTask {
   // Empty means the file has no DV in use. Row indexes are 0-based into the file's
   // physical parquet row space (same semantics as `DvInfo::get_row_indexes`).
   repeated uint64 deleted_row_indexes = 5;
-  // Reserved for future phases:
-  //   6: residual_predicate_idx (Phase 5)
-  //   7: physical_schema_idx (Phase 4 — column mapping)
+  // Reserved for future use:
+  //   6: per-task residual predicate index (predicates kernel couldn't fully evaluate)
+  //   7: per-task physical schema index (for per-file schema evolution)
 }
 
 // Partition column value extracted from a Delta add action. Delta represents
