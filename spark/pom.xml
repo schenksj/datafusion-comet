@@ -218,6 +218,29 @@ under the License.
           <version>9.4.53.v20231009</version>
           <scope>test</scope>
         </dependency>
+        <!-- Delta 2.4.x targets Spark 3.4.x -->
+        <dependency>
+          <groupId>io.delta</groupId>
+          <artifactId>delta-spark_${scala.binary.version}</artifactId>
+          <version>2.4.0</version>
+          <scope>test</scope>
+          <exclusions>
+            <exclusion>
+              <groupId>org.apache.spark</groupId>
+              <artifactId>*</artifactId>
+            </exclusion>
+            <exclusion>
+              <groupId>org.apache.hadoop</groupId>
+              <artifactId>*</artifactId>
+            </exclusion>
+          </exclusions>
+        </dependency>
+        <dependency>
+          <groupId>com.google.guava</groupId>
+          <artifactId>failureaccess</artifactId>
+          <version>1.0.2</version>
+          <scope>test</scope>
+        </dependency>
       </dependencies>
     </profile>
 
@@ -297,6 +320,29 @@ under the License.
           <groupId>org.eclipse.jetty</groupId>
           <artifactId>jetty-servlet</artifactId>
           <version>11.0.24</version>
+          <scope>test</scope>
+        </dependency>
+        <!-- Delta 4.0.x targets Spark 4.0.x -->
+        <dependency>
+          <groupId>io.delta</groupId>
+          <artifactId>delta-spark_${scala.binary.version}</artifactId>
+          <version>4.0.0</version>
+          <scope>test</scope>
+          <exclusions>
+            <exclusion>
+              <groupId>org.apache.spark</groupId>
+              <artifactId>*</artifactId>
+            </exclusion>
+            <exclusion>
+              <groupId>org.apache.hadoop</groupId>
+              <artifactId>*</artifactId>
+            </exclusion>
+          </exclusions>
+        </dependency>
+        <dependency>
+          <groupId>com.google.guava</groupId>
+          <artifactId>failureaccess</artifactId>
+          <version>1.0.2</version>
           <scope>test</scope>
         </dependency>
       </dependencies>

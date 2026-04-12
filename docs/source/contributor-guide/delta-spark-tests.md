@@ -102,3 +102,24 @@ python benchmarks/tpc/tpcbench.py \
 
 Engine configs are in `benchmarks/tpc/engines/comet-delta.toml` and
 `benchmarks/tpc/engines/comet-delta-hashjoin.toml`.
+
+## TPC-DS Plan Stability Fixtures
+
+To generate the `q*.native_delta_compat/` plan stability golden files:
+
+1. Add `CometConf.SCAN_NATIVE_DELTA_COMPAT` to the `scanImpls` list in
+   `CometPlanStabilitySuite.scala` (line 66).
+
+2. Ensure TPC-DS data exists as Delta tables (see `create-delta-tables.py`
+   in the Benchmarks section above).
+
+3. Generate golden files:
+
+```bash
+SPARK_GENERATE_GOLDEN_FILES=1 ./mvnw -pl spark \
+    -Dsuites=org.apache.spark.sql.comet.CometTPCDSV1_4_PlanStabilitySuite \
+    test -Pspark-3.5 -Dmaven.gitcommitid.skip
+```
+
+4. Commit the generated `q*.native_delta_compat/extended.txt` files under
+   `spark/src/test/resources/tpcds-plan-stability/approved-plans-*`.

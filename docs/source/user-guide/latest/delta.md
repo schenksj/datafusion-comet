@@ -126,4 +126,5 @@ The following scenarios will fall back to Spark's native Delta reader:
 - Tables with `rowTracking` enabled
 - Change Data Feed (`readChangeFeed`) queries
 - The `_metadata.row_index` virtual column
-- Spark 3.4 and 4.0 (currently tested on Spark 3.5 only)
+- Spark 3.4 uses Delta 2.4.x (DVs not supported in Delta 2.x; simpler feature set)
+- Spark 4.0 uses Delta 4.0.x (experimental)
