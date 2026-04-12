@@ -1348,13 +1348,13 @@ impl PhysicalPlanner {
                 ))
             }
             OpStruct::DeltaScan(scan) => {
-                // Phase 1: read-only happy path. Per-file DVs, residual predicates,
-                // and column mapping land in later phases (see plan §Phasing).
-                //
-                // Unlike IcebergScan we don't build a bespoke operator — we go
-                // straight to Comet's `init_datasource_exec` (same path NativeScan
-                // uses), which gives us ParquetSource with all its I/O, caching,
-                // predicate-pushdown, and schema-adapter optimizations for free.
+                // Delta scan implementation. Most of the work mirrors NativeScan —
+                // we feed files into `init_datasource_exec` so the actual parquet
+                // reads go through Comet's tuned ParquetSource. Phase 3 adds
+                // deletion-vector support: files with DVs attached each become
+                // their own FileGroup (= one partition per DV'd file), and a
+                // DeltaDvFilterExec wraps the child ExecutionPlan to drop the
+                // deleted rows batch-by-batch.
                 let common = scan
                     .common
                     .as_ref()
@@ -1402,6 +1402,27 @@ impl PhysicalPlanner {
                     partition_schema.as_ref(),
                 )?;
 
+                // Split files by DV presence. Each DV'd file becomes its own
+                // FileGroup so the DeltaDvFilterExec's per-partition mapping is
+                // 1:1 with one physical parquet file. All non-DV files go in a
+                // single combined group (fast path — matches the pre-Phase-3
+                // Phase 1 behavior for tables without DVs in use).
+                let mut file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
+                let mut deleted_indexes_per_group: Vec<Vec<u64>> = Vec::new();
+                let mut non_dv_files: Vec<PartitionedFile> = Vec::new();
+                for (file, task) in files.into_iter().zip(scan.tasks.iter()) {
+                    if task.deleted_row_indexes.is_empty() {
+                        non_dv_files.push(file);
+                    } else {
+                        file_groups.push(vec![file]);
+                        deleted_indexes_per_group.push(task.deleted_row_indexes.clone());
+                    }
+                }
+                if !non_dv_files.is_empty() {
+                    file_groups.push(non_dv_files);
+                    deleted_indexes_per_group.push(Vec::new());
+                }
+
                 // Pick any one file to register the object store (they all share
                 // the same root)
                 let one_file = scan
@@ -1414,8 +1435,6 @@ impl PhysicalPlanner {
                     one_file,
                     &object_store_options,
                 )?;
-
-                let file_groups: Vec<Vec<PartitionedFile>> = vec![files];
 
                 let delta_exec = init_datasource_exec(
                     required_schema,
@@ -1432,10 +1451,23 @@ impl PhysicalPlanner {
                     false, // encryption_enabled: Phase beyond 1
                 )?;
 
+                // Wrap in a DV filter whenever any partition has a DV. When none
+                // do, skip the wrapper entirely to avoid the per-batch pass-through
+                // cost for the common "no DVs in use" case.
+                let final_exec: Arc<dyn ExecutionPlan> =
+                    if deleted_indexes_per_group.iter().any(|v| !v.is_empty()) {
+                        Arc::new(crate::execution::operators::DeltaDvFilterExec::new(
+                            delta_exec,
+                            deleted_indexes_per_group,
+                        )?)
+                    } else {
+                        delta_exec
+                    };
+
                 Ok((
                     vec![],
                     vec![],
-                    Arc::new(SparkPlan::new(spark_plan.plan_id, delta_exec, vec![])),
+                    Arc::new(SparkPlan::new(spark_plan.plan_id, final_exec, vec![])),
                 ))
             }
             OpStruct::ShuffleWriter(writer) => {

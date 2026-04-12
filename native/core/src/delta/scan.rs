@@ -30,6 +30,7 @@
 //! `normalize_url` always appends a trailing slash.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use url::Url;
 
 use delta_kernel::snapshot::Snapshot;
@@ -54,11 +55,18 @@ pub struct DeltaFileEntry {
     pub num_records: Option<u64>,
     /// Partition column → value mapping from the add action.
     pub partition_values: HashMap<String, String>,
-    /// True if this file has an associated deletion vector.
-    ///
-    /// The actual DV bytes + offset are fetched lazily by the executor
-    /// via a separate API once Phase 3 lands.
-    pub has_deletion_vector: bool,
+    /// Deleted row indexes materialized from the file's deletion vector by
+    /// kernel on the driver. Empty vector means the file has no DV in use.
+    /// Sorted ascending; indexes are 0-based into the file's physical parquet
+    /// row space, matching `DvInfo::get_row_indexes` semantics.
+    pub deleted_row_indexes: Vec<u64>,
+}
+
+impl DeltaFileEntry {
+    /// True if this entry has a deletion vector in use.
+    pub fn has_deletion_vector(&self) -> bool {
+        !self.deleted_row_indexes.is_empty()
+    }
 }
 
 /// Result of planning a Delta scan: the active file list plus the pinned
@@ -141,34 +149,69 @@ pub fn plan_delta_scan(
         unsupported_features.push("rowTracking".to_string());
     }
 
-    let scan = snapshot.scan_builder().build()?;
+    // `Snapshot::build()` returns `Arc<Snapshot>`, and `scan_builder` consumes
+    // it. Clone the Arc so we can still reach `table_root()` after building
+    // the scan — we need the URL to materialize DVs below.
+    let snapshot_arc: Arc<_> = snapshot;
+    let table_root_url = snapshot_arc.table_root().clone();
+    let scan = Arc::clone(&snapshot_arc).scan_builder().build()?;
 
-    let mut entries: Vec<DeltaFileEntry> = Vec::new();
+    // Temporary collection that keeps the raw kernel `DvInfo` alongside the
+    // rest of the metadata. We need the `DvInfo` to materialize the deleted
+    // row indexes below; it doesn't escape this function.
+    struct RawEntry {
+        path: String,
+        size: i64,
+        modification_time: i64,
+        num_records: Option<u64>,
+        partition_values: HashMap<String, String>,
+        dv_info: delta_kernel::scan::state::DvInfo,
+    }
+
+    let mut raw: Vec<RawEntry> = Vec::new();
     let scan_metadata = scan.scan_metadata(&engine)?;
 
     for meta_result in scan_metadata {
-        let meta = meta_result?;
-        entries = meta.visit_scan_files(entries, |acc, scan_file| {
-            let num_records = scan_file.stats.as_ref().map(|s| s.num_records);
-            let has_dv = scan_file.dv_info.has_vector();
-            acc.push(DeltaFileEntry {
-                path: scan_file.path,
-                size: scan_file.size,
-                modification_time: scan_file.modification_time,
-                num_records,
-                partition_values: scan_file.partition_values,
-                has_deletion_vector: has_dv,
-            });
-        })?;
+        let meta: delta_kernel::scan::ScanMetadata = meta_result?;
+        raw = meta.visit_scan_files(
+            raw,
+            |acc: &mut Vec<RawEntry>,
+             scan_file: delta_kernel::scan::state::ScanFile| {
+                let num_records = scan_file.stats.as_ref().map(|s| s.num_records);
+                acc.push(RawEntry {
+                    path: scan_file.path,
+                    size: scan_file.size,
+                    modification_time: scan_file.modification_time,
+                    num_records,
+                    partition_values: scan_file.partition_values,
+                    dv_info: scan_file.dv_info,
+                });
+            },
+        )?;
     }
 
-    // Per-file deletion-vector check. Any single file with a DV attached
-    // means this snapshot has rows that must be hidden from the reader, and
-    // Comet's Phase 1 native path doesn't apply deletion vectors yet.
-    if entries.iter().any(|e| e.has_deletion_vector)
-        && !unsupported_features.iter().any(|f| f == "deletionVectors")
-    {
-        unsupported_features.push("deletionVectors".to_string());
+    // For each file that has a DV attached, ask kernel to materialize the
+    // deleted row indexes. Kernel handles inline bitmaps, on-disk DV files,
+    // and the various storage-type variants transparently. This runs on the
+    // driver (same process that's building the scan plan), so we only pay
+    // the DV-fetch latency once per query.
+    let mut entries: Vec<DeltaFileEntry> = Vec::with_capacity(raw.len());
+    for r in raw {
+        let deleted_row_indexes = if r.dv_info.has_vector() {
+            r.dv_info
+                .get_row_indexes(&engine, &table_root_url)?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        entries.push(DeltaFileEntry {
+            path: r.path,
+            size: r.size,
+            modification_time: r.modification_time,
+            num_records: r.num_records,
+            partition_values: r.partition_values,
+            deleted_row_indexes,
+        });
     }
 
     Ok(DeltaScanPlan {
@@ -303,6 +346,6 @@ mod tests {
         assert_eq!(entries[0].path, "part-00000.parquet");
         assert_eq!(entries[0].size, 5000);
         assert_eq!(entries[0].num_records, Some(50));
-        assert!(!entries[0].has_deletion_vector);
+        assert!(!entries[0].has_deletion_vector());
     }
 }

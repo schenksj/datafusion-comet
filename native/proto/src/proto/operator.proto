@@ -300,8 +300,12 @@ message DeltaScanTask {
   // Partition column values from the add action, in the same order as
   // DeltaScanCommon.partition_schema
   repeated DeltaPartitionValue partition_values = 4;
+  // Phase 3: deletion vector applied to this file, materialized by kernel on the
+  // driver into a sorted list of row indexes that must be hidden from the reader.
+  // Empty means the file has no DV in use. Row indexes are 0-based into the file's
+  // physical parquet row space (same semantics as `DvInfo::get_row_indexes`).
+  repeated uint64 deleted_row_indexes = 5;
   // Reserved for future phases:
-  //   5: deletion_vector (Phase 3)
   //   6: residual_predicate_idx (Phase 5)
   //   7: physical_schema_idx (Phase 4 — column mapping)
 }

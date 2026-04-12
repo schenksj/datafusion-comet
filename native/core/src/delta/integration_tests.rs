@@ -115,7 +115,7 @@ async fn delta_end_to_end_read_unpartitioned() {
     assert_eq!(entries[0].path, data_file_name);
     assert_eq!(entries[0].size as u64, size);
     assert_eq!(entries[0].num_records, Some(batch.num_rows() as u64));
-    assert!(!entries[0].has_deletion_vector);
+    assert!(!entries[0].has_deletion_vector());
 
     // --- 3. Comet-side read: build PartitionedFile and go through
     // init_datasource_exec (the same path the planner match arm uses) ---

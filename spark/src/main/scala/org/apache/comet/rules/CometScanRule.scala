@@ -28,12 +28,12 @@ import scala.jdk.CollectionConverters._
 import org.apache.hadoop.conf.Configuration
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.expressions.{Attribute, DynamicPruningExpression, Expression, GenericInternalRow, InputFileBlockLength, InputFileBlockStart, InputFileName, PlanExpression}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, DynamicPruningExpression, EqualTo, Expression, GenericInternalRow, InputFileBlockLength, InputFileBlockStart, InputFileName, Literal, PlanExpression}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.util.{sideBySide, ArrayBasedMapData, GenericArrayData, MetadataColumnHelper}
 import org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.getExistenceDefaultValues
 import org.apache.spark.sql.comet.{CometBatchScanExec, CometScanExec}
-import org.apache.spark.sql.execution.{FileSourceScanExec, InSubqueryExec, SparkPlan, SubqueryAdaptiveBroadcastExec}
+import org.apache.spark.sql.execution.{FileSourceScanExec, FilterExec, InSubqueryExec, ProjectExec, SparkPlan, SubqueryAdaptiveBroadcastExec}
 import org.apache.spark.sql.execution.datasources.HadoopFsRelation
 import org.apache.spark.sql.execution.datasources.parquet.ParquetUtils
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
@@ -76,6 +76,29 @@ case class CometScanRule(session: SparkSession)
 
   private def _apply(plan: SparkPlan): SparkPlan = {
     if (!isCometLoaded(conf)) return plan
+
+    // Phase 3 pre-pass: undo Delta's PreprocessTableWithDVs plan rewrite for
+    // DV-in-use scans so the scan reaches our normal Delta native path. Delta's
+    // rule wraps a DV-bearing scan in:
+    //   ProjectExec(userOutput,
+    //     FilterExec(__delta_internal_is_row_deleted = 0,
+    //       ProjectExec([...userCols, is_row_deleted, _metadata_structs...],
+    //         FileSourceScanExec(has is_row_deleted in output))))
+    // We strip the wrappers, returning a FileSourceScanExec whose output is the
+    // original userOutput and whose required/data schemas no longer carry the
+    // synthetic column. CometScanRule's scan-level transform below then picks
+    // up the clean scan and routes it through nativeDeltaScan, at which point
+    // kernel's per-file `deleted_row_indexes` feed into our DeltaDvFilterExec
+    // wrapper on the native side.
+    //
+    // Gated on COMET_DELTA_NATIVE_ENABLED: if the user has turned off Comet's
+    // Delta path, we must leave Delta's own plan rewrite intact so vanilla
+    // Spark+Delta applies the DV via DeltaParquetFileFormat at read time.
+    val stripped = if (CometConf.COMET_DELTA_NATIVE_ENABLED.get(conf)) {
+      stripDeltaDvWrappers(plan)
+    } else {
+      plan
+    }
 
     def isSupportedScanNode(plan: SparkPlan): Boolean = plan match {
       case _: FileSourceScanExec => true
@@ -133,9 +156,92 @@ case class CometScanRule(session: SparkSession)
         }
     }
 
-    plan.transform {
+    stripped.transform {
       case scan if isSupportedScanNode(scan) => transformScan(scan)
     }
+  }
+
+  /**
+   * Plan-tree rewrite that undoes Delta's `PreprocessTableWithDVs` Catalyst Strategy for
+   * DV-bearing reads. Delta's strategy runs at logical-to-physical conversion and wraps every
+   * DV-in-use Delta scan in an outer Project + Filter subtree that references a synthetic
+   * `__delta_internal_is_row_deleted` column produced by `DeltaParquetFileFormat`'s runtime
+   * reader. Since Comet reads via its own tuned parquet path (not Delta's file format), that
+   * synthetic column never gets produced, and the downstream Filter silently drops everything.
+   *
+   * We detect the pattern and replace it with a clean `FileSourceScanExec` whose required schema
+   * + output no longer mention the synthetic column. Kernel provides the actual DV row indexes on
+   * the driver side, and `DeltaDvFilterExec` applies them at execution time.
+   */
+  private def stripDeltaDvWrappers(plan: SparkPlan): SparkPlan = {
+    plan.transformUp {
+      case proj @ ProjectExec(projectList, FilterExec(cond, inner))
+          if isDeltaDvFilterPattern(cond) =>
+        val userOutput = projectList.map(_.toAttribute)
+        findAndStripDeltaScanBelow(inner, userOutput).getOrElse(proj)
+    }
+  }
+
+  /** Matches `__delta_internal_is_row_deleted = 0` (the filter Delta injects). */
+  private def isDeltaDvFilterPattern(cond: Expression): Boolean = cond match {
+    case EqualTo(attr: AttributeReference, lit: Literal)
+        if attr.name == DeltaReflection.IsRowDeletedColumnName =>
+      lit.value != null && lit.value.toString == "0"
+    case EqualTo(lit: Literal, attr: AttributeReference)
+        if attr.name == DeltaReflection.IsRowDeletedColumnName =>
+      lit.value != null && lit.value.toString == "0"
+    case _ => false
+  }
+
+  /**
+   * Recursively descend through the Filter's child subtree looking for a Delta
+   * `FileSourceScanExec` whose output contains the synthetic is-row-deleted column. On match,
+   * rebuild it without the synthetic column. Returns None if no such scan is found (in which case
+   * we leave the original Project/Filter in place).
+   */
+  private def findAndStripDeltaScanBelow(
+      plan: SparkPlan,
+      userOutput: Seq[Attribute]): Option[SparkPlan] = plan match {
+    case scan: FileSourceScanExec
+        if DeltaReflection.isDeltaFileFormat(scan.relation.fileFormat) &&
+          scan.output.exists(_.name == DeltaReflection.IsRowDeletedColumnName) =>
+      Some(rebuildDeltaScanWithoutDvColumn(scan, userOutput))
+    case other if other.children.size == 1 =>
+      // Single-child wrappers (Project, ColumnarToRow, etc.) Delta may insert between
+      // its Filter and the real scan. Drop the wrapper entirely - the stripped scan
+      // already produces the final user output shape.
+      findAndStripDeltaScanBelow(other.children.head, userOutput)
+    case _ => None
+  }
+
+  /**
+   * Produce a new `FileSourceScanExec` whose `output`, `requiredSchema`, and
+   * `relation.dataSchema` no longer mention `__delta_internal_is_row_deleted`. The outputs are
+   * expected to be a superset of `userOutput` (minus the synthetic column) so we match by exprId;
+   * anything left over is appended untouched.
+   */
+  private def rebuildDeltaScanWithoutDvColumn(
+      scan: FileSourceScanExec,
+      userOutput: Seq[Attribute]): FileSourceScanExec = {
+    val dvName = DeltaReflection.IsRowDeletedColumnName
+    val newOutput = scan.output.filterNot(_.name == dvName)
+    val newRequiredSchema =
+      StructType(scan.requiredSchema.fields.filterNot(_.name == dvName))
+    val newDataSchema =
+      StructType(scan.relation.dataSchema.fields.filterNot(_.name == dvName))
+    val newRelation = scan.relation.copy(dataSchema = newDataSchema)(scan.relation.sparkSession)
+    // Spark's filter pushdown may have moved Delta's injected `is_row_deleted = 0`
+    // predicate into `dataFilters`. The column no longer exists in our rebuilt scan, so
+    // any filter that references it must also be dropped - otherwise downstream code
+    // (e.g. our native Delta serde) sees a predicate it can't translate and falls back.
+    val newDataFilters = scan.dataFilters.filterNot { f =>
+      f.references.exists(_.name == dvName)
+    }
+    scan.copy(
+      relation = newRelation,
+      output = newOutput,
+      requiredSchema = newRequiredSchema,
+      dataFilters = newDataFilters)
   }
 
   private def transformV1Scan(plan: SparkPlan, scanExec: FileSourceScanExec): SparkPlan = {

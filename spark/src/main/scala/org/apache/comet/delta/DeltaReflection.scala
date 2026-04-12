@@ -50,6 +50,16 @@ object DeltaReflection extends Logging {
   }
 
   /**
+   * Synthetic column name that Delta's `PreprocessTableWithDVs` rule injects into a scan's output
+   * schema when the relation has deletion vectors in use. Value `0` means "keep the row", any
+   * other value means "drop it". Used to detect DV-rewritten Delta scans.
+   *
+   * Stable across Delta 2.x / 3.x - defined in
+   * `DeltaParquetFileFormat.IS_ROW_DELETED_COLUMN_NAME`.
+   */
+  val IsRowDeletedColumnName: String = "__delta_internal_is_row_deleted"
+
+  /**
    * Returns true if `fileFormat` is Delta's parquet-backed `FileFormat`. Checks the exact class
    * plus any subclass, so variants like `DeletionVectorBoundFileFormat` (some Delta versions)
    * also match.

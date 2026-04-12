@@ -51,7 +51,51 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     conf.set(CometConf.COMET_DELTA_NATIVE_ENABLED.key, "true")
     conf.set("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
     conf.set("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+    // Explicitly pin local filesystem. See beforeAll for why.
+    conf.set("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem")
+    // When DELTA_TESTING (or similar) is set in the JVM environment, Delta injects
+    // `test%file%prefix-` onto every data-file name and `test%dv%prefix-` onto every
+    // deletion-vector file name. These are test-only knobs meant to catch bugs in
+    // Delta's own test suite. They break Comet's Delta path because delta-kernel-rs
+    // reads the transaction log as-is (without applying the prefix at read time) and
+    // then tries to open files by names that differ from what's actually on disk.
+    // Explicitly clear the prefixes so production-shaped filenames are used.
+    conf.set("spark.databricks.delta.testOnly.dataFileNamePrefix", "")
+    conf.set("spark.databricks.delta.testOnly.dvFileNamePrefix", "")
+    // Delta 3.x's default `useMetadataRowIndex=true` strategy rewrites DV-in-use
+    // scans to read the parquet file with `_metadata.row_index` + other metadata
+    // columns, and applies the DV *inside* `DeletionVectorBoundFileFormat` at read
+    // time - no Filter is inserted in the plan. That makes the DV completely
+    // opaque to any physical-plan rewrite: there's nothing to detect.
+    // Setting this to false falls Delta back to its older strategy that DOES
+    // insert `Project -> Filter(__delta_internal_is_row_deleted = 0) -> scan`,
+    // which our `stripDeltaDvWrappers` rewrite can recognize and unwind.
+    conf.set("spark.databricks.delta.deletionVectors.useMetadataRowIndex", "false")
     conf
+  }
+
+  override protected def beforeAll(): Unit = {
+    super.beforeAll()
+    // CometTestBase installs Spark's DebugFilesystem as the `file://` filesystem
+    // implementation. DebugFilesystem injects a `test%file%prefix-` prefix onto
+    // every created file to detect read-after-close bugs in Spark tests. That
+    // interacts badly with Delta's deletion-vector writes: Delta records the
+    // *unprefixed* DV filename in the transaction log (because it calls
+    // `FileSystem.create(path)` with a clean path and doesn't observe the
+    // prefix the DebugFilesystem adds), so when kernel later fetches the DV by
+    // the log-recorded path, the file doesn't exist under that name.
+    //
+    // Override the filesystem back to the plain local implementation for this
+    // suite only, on both the session state conf (for future reads) AND the
+    // hadoopConfiguration on the running context (for writes that are about to
+    // happen). Production users never hit this because they don't use the
+    // test harness.
+    spark.sparkContext.hadoopConfiguration
+      .set("fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem")
+    spark.sparkContext.hadoopConfiguration
+      .setBoolean("fs.file.impl.disable.cache", true)
+    spark.sessionState.conf
+      .setConfString("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem")
   }
 
   /** Run `body` with a fresh Delta table tempdir, cleaning up afterwards. */
@@ -983,17 +1027,18 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     }
   }
 
-  test("deletion vectors: falls back correctly when DVs are in use") {
+  test("deletion vectors: accelerates DV-in-use tables via native DV filter") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
-    withDeltaTable("dv_fallback") { tablePath =>
+    withDeltaTable("dv_accel") { tablePath =>
       val ss = spark
       import ss.implicits._
 
-      // Create a DV-capable table: requires protocol >= reader 3 / writer 7 and
-      // the `delta.enableDeletionVectors` table property.
+      // DV-capable table: requires protocol >= reader 3 / writer 7 and the
+      // `delta.enableDeletionVectors` table property.
       (0 until 20)
         .map(i => (i.toLong, s"name_$i"))
         .toDF("id", "name")
+        .repartition(1)
         .write
         .format("delta")
         .option("delta.enableDeletionVectors", "true")
@@ -1001,30 +1046,24 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
         .option("delta.minWriterVersion", "7")
         .save(tablePath)
 
-      // Before any DELETE: the table has the feature declared but no file has a DV
-      // attached. Comet should STILL accelerate this, because our per-file DV check
-      // only fires when at least one scan file actually has a vector in use.
+      // Pre-DELETE: no files have DVs, Comet accelerates normally.
       assertDeltaNativeMatches(tablePath, identity)
 
-      // Now issue a DELETE. Delta writes a DV for the affected file instead of
-      // rewriting the parquet file. Spark executes the DELETE via vanilla Delta
-      // (Comet doesn't accelerate writes, matching Iceberg behavior).
+      // DELETE via vanilla Spark+Delta writes a DV for the affected file.
+      // Comet doesn't accelerate writes (matches Iceberg behavior).
       spark.sql(s"DELETE FROM delta.`$tablePath` WHERE id % 3 = 0")
 
-      // After the DELETE, reading the table MUST fall back: the base parquet file
-      // still contains the id%3==0 rows, and Comet's Phase 1 native path does not
-      // apply DVs yet. Without the Phase 6 gate, Comet would silently return those
-      // rows. With the gate, Spark's vanilla reader handles it and returns the
-      // correct post-DELETE row count.
+      // Post-DELETE: Comet's Phase 3 native DV support kicks in. The scan
+      // still goes through Comet (no fallback) and DeltaDvFilterExec drops
+      // the deleted rows on the output stream.
       val df = spark.read.format("delta").load(tablePath)
       val plan = df.queryExecution.executedPlan
       val deltaScans = collect(plan) { case s: CometDeltaNativeScanExec => s }
       assert(
-        deltaScans.isEmpty,
-        s"expected Comet to fall back for a DV-in-use table, but plan has " +
-          s"${deltaScans.size} CometDeltaNativeScanExec nodes:\n$plan")
+        deltaScans.nonEmpty,
+        s"expected Comet to accelerate a DV-in-use table, but plan has no " +
+          s"CometDeltaNativeScanExec:\n$plan")
 
-      // Sanity-check correctness against vanilla.
       val nativeRows = df.collect().toSeq.map(normalizeRow)
       withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
         val vanillaRows = spark.read
@@ -1035,10 +1074,20 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
           .map(normalizeRow)
         assert(
           nativeRows.sortBy(_.mkString("|")) == vanillaRows.sortBy(_.mkString("|")),
-          s"native (fallback)=$nativeRows\nvanilla=$vanillaRows")
+          s"native=$nativeRows\nvanilla=$vanillaRows")
       }
       // Rows with id in {0,3,6,9,12,15,18} are deleted -> 13 rows remain.
       assert(nativeRows.size == 13, s"expected 13 rows after DELETE, got ${nativeRows.size}")
+
+      // Second DELETE exercises DV replacement across commits.
+      spark.sql(s"DELETE FROM delta.`$tablePath` WHERE id >= 18")
+      val df2 = spark.read.format("delta").load(tablePath)
+      val rows2 = df2.collect().toSeq.map(normalizeRow)
+      assert(rows2.size == 12, s"expected 12 rows after second DELETE, got ${rows2.size}")
+      val plan2 = df2.queryExecution.executedPlan
+      assert(
+        collect(plan2) { case s: CometDeltaNativeScanExec => s }.nonEmpty,
+        s"expected Comet to still accelerate after second DELETE, got:\n$plan2")
     }
   }
 

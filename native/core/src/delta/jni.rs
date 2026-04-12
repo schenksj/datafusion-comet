@@ -98,6 +98,10 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
                         value: Some(value),
                     })
                     .collect(),
+                // Phase 3: the DV is already materialized into a sorted
+                // `Vec<u64>` of deleted row indexes by `plan_delta_scan`
+                // (which calls `DvInfo::get_row_indexes` on the driver).
+                deleted_row_indexes: entry.deleted_row_indexes,
             })
             .collect();
 

@@ -75,6 +75,17 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       return None
     }
 
+    // Belt-and-suspenders DV-rewrite gate. The primary gate runs earlier in
+    // CometScanRule so the scan never becomes a CometScanExec in the first place.
+    // This is a defensive check in case a caller constructs a DV-rewritten
+    // CometScanExec by some other path.
+    if (scan.requiredSchema.fieldNames.contains(DeltaReflection.IsRowDeletedColumnName)) {
+      logWarning(
+        "CometDeltaNativeScan: DV-rewritten schema reached serde; this should have " +
+          "been caught in CometScanRule. Falling back.")
+      return None
+    }
+
     // Cloud storage options, keyed identically to NativeScan. Kernel's DefaultEngine picks
     // up aws_* / azure_* keys; anything else is ignored on the native side (for now).
     //
