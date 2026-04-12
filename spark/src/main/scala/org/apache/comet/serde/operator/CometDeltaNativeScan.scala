@@ -171,11 +171,6 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
           columnNames)
       } catch {
         case e: Throwable =>
-          // scalastyle:off println
-          println(
-            s"[S3-DEBUG] planDeltaScan failed for $tableRoot: " +
-              s"${e.getClass.getName}: ${e.getMessage}")
-          // scalastyle:on println
           logWarning(s"CometDeltaNativeScan: delta-kernel-rs log replay failed for $tableRoot", e)
           return None
       }
