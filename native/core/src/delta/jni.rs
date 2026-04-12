@@ -63,6 +63,7 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
     snapshot_version: jlong,
     storage_options: JObject,
     predicate_bytes: JByteArray,
+    column_names: jni::objects::JObjectArray,
 ) -> jbyteArray {
     try_unwrap_or_throw(&e, |env| {
         let url_str: String = table_url.try_to_string(env)?;
@@ -78,6 +79,20 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
             extract_storage_config(env, &jmap)?
         };
 
+        // Phase 2: read column names for BoundReference resolution.
+        let col_names: Vec<String> = if column_names.is_null() {
+            Vec::new()
+        } else {
+            let len = column_names.len(env)?;
+            let mut names = Vec::with_capacity(len);
+            for i in 0..len {
+                let obj = column_names.get_element(env, i)?;
+                let jstr = unsafe { JString::from_raw(env, obj.into_raw()) };
+                names.push(jstr.try_to_string(env)?);
+            }
+            names
+        };
+
         // Phase 2: deserialize the Catalyst predicate (if provided) for
         // kernel's stats-based file pruning. Empty bytes = no predicate.
         let _predicate_proto: Option<Vec<u8>> = if predicate_bytes.is_null() {
@@ -91,13 +106,19 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
             }
         };
 
-        // Phase 2: translate Catalyst predicate proto → kernel Predicate for
-        // stats-based file pruning during log replay.
+        // Phase 2: translate Catalyst predicate proto to kernel Predicate for
+        // stats-based file pruning during log replay. Pass column names for
+        // BoundReference index-to-name resolution.
         let kernel_predicate = _predicate_proto.and_then(|bytes| {
             use prost::Message;
             datafusion_comet_proto::spark_expression::Expr::decode(bytes.as_slice())
                 .ok()
-                .map(|expr| crate::delta::predicate::catalyst_to_kernel_predicate(&expr))
+                .map(|expr| {
+                    crate::delta::predicate::catalyst_to_kernel_predicate_with_names(
+                        &expr,
+                        &col_names,
+                    )
+                })
         });
 
         let plan =

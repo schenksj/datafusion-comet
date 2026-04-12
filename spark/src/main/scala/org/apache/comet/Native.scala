@@ -203,7 +203,8 @@ class Native extends NativeBase {
       tableUrl: String,
       snapshotVersion: Long,
       storageOptions: java.util.Map[String, String],
-      predicateBytes: Array[Byte]): Array[Byte]
+      predicateBytes: Array[Byte],
+      columnNames: Array[String]): Array[Byte]
 
   /**
    * Log the beginning of an event.

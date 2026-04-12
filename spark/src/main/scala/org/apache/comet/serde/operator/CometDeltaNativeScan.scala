@@ -36,7 +36,7 @@ import org.apache.spark.unsafe.types.UTF8String
 import org.apache.comet.{CometConf, ConfigEntry, Native}
 import org.apache.comet.delta.DeltaReflection
 import org.apache.comet.objectstore.NativeConfig
-import org.apache.comet.serde.{CometOperatorSerde, Compatible, OperatorOuterClass, SupportLevel}
+import org.apache.comet.serde.{CometOperatorSerde, Compatible, ExprOuterClass, OperatorOuterClass, SupportLevel}
 import org.apache.comet.serde.ExprOuterClass.Expr
 import org.apache.comet.serde.OperatorOuterClass.{DeltaScan, DeltaScanCommon, DeltaScanTaskList, Operator}
 import org.apache.comet.serde.QueryPlanSerde.exprToProto
@@ -116,6 +116,11 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // Phase 2: serialize the data filters so kernel can apply stats-based file
     // pruning during log replay. The same filters will also be pushed down into
     // ParquetSource for row-group-level pruning - the two layers are additive.
+    //
+    // We combine all supported data filters into a single AND conjunction so
+    // kernel receives one predicate tree. BoundReferences carry the column INDEX
+    // into scan.output; the native side resolves indices to column names using
+    // the columnNames array we pass alongside.
     val predicateBytes: Array[Byte] = {
       val protoFilters = new ListBuffer[Expr]()
       scan.supportedDataFilters.foreach { filter =>
@@ -124,20 +129,41 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
           case _ =>
         }
       }
-      if (protoFilters.nonEmpty) {
-        // Wrap in a single AND conjunction proto so the native side receives one
-        // expression tree. Use a Scan-like wrapper message or just serialize
-        // the first filter (TODO: combine with AND for multiple).
+      if (protoFilters.isEmpty) {
+        Array.emptyByteArray
+      } else if (protoFilters.size == 1) {
         protoFilters.head.toByteArray
       } else {
-        Array.emptyByteArray
+        // Combine multiple filters into AND(f1, AND(f2, ...))
+        val combined = protoFilters.reduceLeft { (acc, f) =>
+          val and = ExprOuterClass.BinaryExpr
+            .newBuilder()
+            .setLeft(acc)
+            .setRight(f)
+            .build()
+          Expr
+            .newBuilder()
+            .setAnd(and)
+            .build()
+        }
+        combined.toByteArray
       }
     }
+
+    // Column name list for resolving BoundReference indices to kernel column
+    // names. Must match the order of scan.output because exprToProto binds
+    // attribute references by position in that schema.
+    val columnNames: Array[String] = scan.output.map(_.name).toArray
 
     // --- 1. Ask kernel for the active file list (with optional predicate for file pruning) ---
     val taskListBytes =
       try {
-        nativeLib.planDeltaScan(tableRoot, snapshotVersion, storageOptions, predicateBytes)
+        nativeLib.planDeltaScan(
+          tableRoot,
+          snapshotVersion,
+          storageOptions,
+          predicateBytes,
+          columnNames)
       } catch {
         case e: Throwable =>
           logWarning(s"CometDeltaNativeScan: delta-kernel-rs log replay failed for $tableRoot", e)
