@@ -536,6 +536,453 @@ class CometDeltaNativeSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     }
   }
 
+  test("column name case insensitivity") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("case_insensitive") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 6)
+        .map(i => (i.toLong, s"name_$i"))
+        .toDF("Id", "Name")
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      // Query with lowercase names against a camel-cased schema. Spark's default
+      // `caseSensitive=false` should make this work, with the native Comet reader
+      // honoring the same setting.
+      assertDeltaNativeMatches(tablePath, df => df.select("id", "name"))
+      assertDeltaNativeMatches(tablePath, df => df.where("id > 2"))
+    }
+  }
+
+  test("reordered and duplicated projections") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("reordered_proj") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 8)
+        .map(i => (i.toLong, s"name_$i", i * 1.5))
+        .toDF("a", "b", "c")
+        .repartition(1)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      // Reordered columns.
+      assertDeltaNativeMatches(tablePath, df => df.select("c", "a", "b"))
+      // Duplicated column.
+      assertDeltaNativeMatches(tablePath, df => df.selectExpr("a", "a AS a2", "b"))
+    }
+  }
+
+  test("deeply nested complex types") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("nested_complex") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      // array<struct<name, score>>, map<string, array<int>>, struct<inner: struct<x, y>>
+      // Using tuples all the way down so the implicit encoder can resolve without
+      // top-level case class declarations.
+      val rows = (0 until 4).map { i =>
+        (
+          i.toLong,
+          Seq((s"a_$i", i * 1.5), (s"b_$i", i * 2.5)),
+          Map(s"k_$i" -> Seq(i, i + 1, i + 2)),
+          ((i, s"inner_$i"), (i * 10).toLong))
+      }
+      rows
+        .toDF("id", "entries", "props", "nested")
+        .repartition(1)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, identity)
+    }
+  }
+
+  test("order by and limit over delta") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("order_limit") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 20)
+        .map(i => (i.toLong, s"name_$i", (19 - i) * 1.5))
+        .toDF("id", "name", "score")
+        .repartition(4)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, df => df.orderBy("score").limit(5))
+      assertDeltaNativeMatches(tablePath, df => df.orderBy(df("id").desc).limit(3))
+    }
+  }
+
+  test("filter that yields an empty result") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("empty_filter") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 10)
+        .map(i => (i.toLong, s"name_$i"))
+        .toDF("id", "name")
+        .repartition(1)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      // No rows have id > 999; the filtered DataFrame is empty.
+      assertDeltaNativeMatches(tablePath, _.where("id > 999"))
+    }
+  }
+
+  test("COUNT(*) over delta") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("count_star") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 25)
+        .map(i => (i.toLong, s"name_$i"))
+        .toDF("id", "name")
+        .repartition(3)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      // Delta short-circuits `SELECT COUNT(*)` via add-action numRecords stats, so
+      // the plan ends up as a `LocalTableScan` with the precomputed value and our
+      // Delta scan never runs at all. That's correct behavior, so we just assert the
+      // count itself. To verify the native scan actually works, issue a COUNT that
+      // requires reading (e.g. with a filter on a non-stats column).
+      val count = spark.sql(s"SELECT COUNT(*) AS n FROM delta.`$tablePath`").collect()
+      assert(count.length == 1 && count(0).getLong(0) == 25L, s"COUNT(*) returned $count")
+
+      // This COUNT needs a predicate Delta can't resolve from the add-action stats,
+      // so it falls through to a real file read via Comet.
+      val filteredCount =
+        spark.sql(s"SELECT COUNT(*) AS n FROM delta.`$tablePath` WHERE name LIKE 'name_1%'")
+      val plan = filteredCount.queryExecution.executedPlan
+      val hasDeltaScan = collect(plan) { case s: CometDeltaNativeScanExec => s }.nonEmpty
+      assert(
+        hasDeltaScan,
+        s"expected CometDeltaNativeScanExec in filtered-count plan, got:\n$plan")
+      val expected = (0 until 25).count(i => s"name_$i".startsWith("name_1"))
+      val actual = filteredCount.collect()(0).getLong(0)
+      assert(actual == expected.toLong, s"expected $expected, got $actual")
+    }
+  }
+
+  test("union of two delta tables") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("union") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      val leftPath = new java.io.File(tablePath, "l").getAbsolutePath
+      val rightPath = new java.io.File(tablePath, "r").getAbsolutePath
+      (0 until 5)
+        .map(i => (i.toLong, s"l_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .save(leftPath)
+      (5 until 10)
+        .map(i => (i.toLong, s"r_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .save(rightPath)
+
+      val df =
+        spark.sql(s"SELECT * FROM delta.`$leftPath` UNION ALL SELECT * FROM delta.`$rightPath`")
+      val plan = df.queryExecution.executedPlan
+      val scans = collect(plan) { case s: CometDeltaNativeScanExec => s }
+      assert(scans.size == 2, s"expected 2 Delta scans, got ${scans.size}:\n$plan")
+
+      val nativeRows = df.collect().toSeq.map(normalizeRow).sortBy(_.mkString("|"))
+      withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
+        val vanilla = spark
+          .sql(s"SELECT * FROM delta.`$leftPath` UNION ALL SELECT * FROM delta.`$rightPath`")
+          .collect()
+          .toSeq
+          .map(normalizeRow)
+          .sortBy(_.mkString("|"))
+        assert(nativeRows == vanilla, s"native=$nativeRows\nvanilla=$vanilla")
+      }
+    }
+  }
+
+  test("self-join on delta table") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("self_join") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 10)
+        .map(i => (i.toLong, (i / 2).toLong, s"name_$i"))
+        .toDF("id", "grp", "name")
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      val df = spark.sql(s"""
+        SELECT a.id, a.name, b.name AS partner
+        FROM delta.`$tablePath` a
+        JOIN delta.`$tablePath` b ON a.grp = b.grp AND a.id < b.id
+      """)
+      val plan = df.queryExecution.executedPlan
+      val scans = collect(plan) { case s: CometDeltaNativeScanExec => s }
+      assert(scans.nonEmpty, s"expected CometDeltaNativeScanExec in plan, got:\n$plan")
+
+      val nativeRows = df.collect().toSeq.map(normalizeRow).sortBy(_.mkString("|"))
+      withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
+        val vanilla = spark
+          .sql(s"""
+            SELECT a.id, a.name, b.name AS partner
+            FROM delta.`$tablePath` a
+            JOIN delta.`$tablePath` b ON a.grp = b.grp AND a.id < b.id
+          """)
+          .collect()
+          .toSeq
+          .map(normalizeRow)
+          .sortBy(_.mkString("|"))
+        assert(nativeRows == vanilla, s"native=$nativeRows\nvanilla=$vanilla")
+      }
+    }
+  }
+
+  test("struct field access and array element in SELECT") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("struct_access") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      val rows = (0 until 6).map { i =>
+        (i.toLong, (s"first_$i", s"last_$i"), Seq(i * 10, i * 20, i * 30))
+      }
+      rows
+        .toDF("id", "name", "values")
+        .repartition(1)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      // struct.field access
+      assertDeltaNativeMatches(
+        tablePath,
+        _.selectExpr("id", "name._1 AS first", "name._2 AS last"))
+      // array element access
+      assertDeltaNativeMatches(
+        tablePath,
+        _.selectExpr("id", "values[0] AS v0", "values[2] AS v2"))
+    }
+  }
+
+  test("distinct and group by having") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("distinct_having") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 30)
+        .map(i => (i.toLong, (i % 5).toLong, s"name_${i % 7}"))
+        .toDF("id", "grp", "name")
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, _.select("grp").distinct())
+      assertDeltaNativeMatches(
+        tablePath,
+        df =>
+          df.groupBy("grp")
+            .count()
+            .where("count > 5"))
+    }
+  }
+
+  test("null values throughout the data") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("nulls") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      val rows = (0 until 12).map { i =>
+        (
+          if (i % 3 == 0) null else Long.box(i.toLong),
+          if (i % 4 == 0) null else s"name_$i",
+          if (i % 5 == 0) null else Double.box(i * 1.5))
+      }
+      rows
+        .toDF("id", "name", "score")
+        .repartition(1)
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      assertDeltaNativeMatches(tablePath, identity)
+      assertDeltaNativeMatches(tablePath, _.where("id IS NULL"))
+      assertDeltaNativeMatches(tablePath, _.where("name IS NOT NULL AND score IS NULL"))
+    }
+  }
+
+  test("window function over delta") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("window") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 20)
+        .map(i => (i.toLong, (i % 4).toLong, i * 1.5))
+        .toDF("id", "grp", "score")
+        .write
+        .format("delta")
+        .save(tablePath)
+
+      val df = spark.sql(s"""
+        SELECT id, grp, score,
+               ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score DESC) AS rn
+        FROM delta.`$tablePath`
+      """)
+      val plan = df.queryExecution.executedPlan
+      val scans = collect(plan) { case s: CometDeltaNativeScanExec => s }
+      assert(scans.nonEmpty, s"expected CometDeltaNativeScanExec in plan, got:\n$plan")
+
+      val nativeRows = df.collect().toSeq.map(normalizeRow).sortBy(_.mkString("|"))
+      withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
+        val vanilla = spark
+          .sql(s"""
+            SELECT id, grp, score,
+                   ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score DESC) AS rn
+            FROM delta.`$tablePath`
+          """)
+          .collect()
+          .toSeq
+          .map(normalizeRow)
+          .sortBy(_.mkString("|"))
+        assert(nativeRows == vanilla, s"native=$nativeRows\nvanilla=$vanilla")
+      }
+    }
+  }
+
+  test("LEFT OUTER JOIN of two delta tables") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("left_join") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      val leftPath = new java.io.File(tablePath, "l").getAbsolutePath
+      val rightPath = new java.io.File(tablePath, "r").getAbsolutePath
+      // Left has 5 rows with ids 0..4; right has 3 rows with ids 0,1,2 — so the join
+      // has 2 rows with NULL right-side columns (for ids 3 and 4).
+      (0 until 5)
+        .map(i => (i.toLong, s"l_$i"))
+        .toDF("id", "lname")
+        .write
+        .format("delta")
+        .save(leftPath)
+      (0 until 3)
+        .map(i => (i.toLong, s"r_$i"))
+        .toDF("id", "rname")
+        .write
+        .format("delta")
+        .save(rightPath)
+
+      val df = spark.sql(s"""
+        SELECT l.id, l.lname, r.rname
+        FROM delta.`$leftPath` l
+        LEFT JOIN delta.`$rightPath` r ON l.id = r.id
+      """)
+      val plan = df.queryExecution.executedPlan
+      val scans = collect(plan) { case s: CometDeltaNativeScanExec => s }
+      assert(scans.size == 2, s"expected 2 Delta scans, got ${scans.size}:\n$plan")
+
+      val nativeRows = df.collect().toSeq.map(normalizeRow).sortBy(_.mkString("|"))
+      withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
+        val vanilla = spark
+          .sql(s"""
+            SELECT l.id, l.lname, r.rname
+            FROM delta.`$leftPath` l
+            LEFT JOIN delta.`$rightPath` r ON l.id = r.id
+          """)
+          .collect()
+          .toSeq
+          .map(normalizeRow)
+          .sortBy(_.mkString("|"))
+        assert(nativeRows == vanilla, s"native=$nativeRows\nvanilla=$vanilla")
+      }
+    }
+  }
+
+  test("partitioned table with filter on non-partition column") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("part_data_filter") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      (0 until 24)
+        .map(i => (i.toLong, s"name_$i", if (i < 12) "hot" else "cold"))
+        .toDF("id", "name", "tier")
+        .write
+        .partitionBy("tier")
+        .format("delta")
+        .save(tablePath)
+
+      // Filter on `id` (non-partition). Should still return the right rows.
+      assertDeltaNativeMatches(tablePath, _.where("id % 2 = 0"))
+      // Combined predicate on both a partition col and a data col.
+      assertDeltaNativeMatches(tablePath, _.where("tier = 'hot' AND id >= 4"))
+    }
+  }
+
+  test("write, overwrite, append, read full history") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("history") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      // v0: initial.
+      (0 until 5)
+        .map(i => (i.toLong, s"v0_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .save(tablePath)
+      // v1: overwrite.
+      (0 until 3)
+        .map(i => (i.toLong, s"v1_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .save(tablePath)
+      // v2: append.
+      (10 until 13)
+        .map(i => (i.toLong, s"v2_$i"))
+        .toDF("id", "name")
+        .write
+        .format("delta")
+        .mode("append")
+        .save(tablePath)
+
+      // Each version has a different row set; we test time-travel for all three.
+      (0 to 2).foreach { v =>
+        val native = spark.read
+          .format("delta")
+          .option("versionAsOf", v.toString)
+          .load(tablePath)
+          .collect()
+          .toSeq
+          .map(normalizeRow)
+        withSQLConf(CometConf.COMET_DELTA_NATIVE_ENABLED.key -> "false") {
+          val vanilla = spark.read
+            .format("delta")
+            .option("versionAsOf", v.toString)
+            .load(tablePath)
+            .collect()
+            .toSeq
+            .map(normalizeRow)
+          assert(
+            native.sortBy(_.mkString("|")) == vanilla.sortBy(_.mkString("|")),
+            s"v$v mismatch\nnative=$native\nvanilla=$vanilla")
+        }
+      }
+    }
+  }
+
   test("wider primitive type coverage") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("primitives") { tablePath =>
