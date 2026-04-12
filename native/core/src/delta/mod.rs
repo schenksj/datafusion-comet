@@ -37,6 +37,7 @@
 pub mod engine;
 pub mod error;
 pub mod jni;
+pub mod predicate;
 pub mod scan;
 
 #[cfg(test)]

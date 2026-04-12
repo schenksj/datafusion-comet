@@ -118,6 +118,15 @@ pub fn plan_delta_scan(
     config: &DeltaStorageConfig,
     version: Option<u64>,
 ) -> DeltaResult<DeltaScanPlan> {
+    plan_delta_scan_with_predicate(url_str, config, version, None)
+}
+
+pub fn plan_delta_scan_with_predicate(
+    url_str: &str,
+    config: &DeltaStorageConfig,
+    version: Option<u64>,
+    kernel_predicate: Option<delta_kernel::expressions::Predicate>,
+) -> DeltaResult<DeltaScanPlan> {
     let url = normalize_url(url_str)?;
     let engine = create_engine(&url, config)?;
 
@@ -154,7 +163,11 @@ pub fn plan_delta_scan(
     // the scan — we need the URL to materialize DVs below.
     let snapshot_arc: Arc<_> = snapshot;
     let table_root_url = snapshot_arc.table_root().clone();
-    let scan = Arc::clone(&snapshot_arc).scan_builder().build()?;
+    let mut scan_builder = Arc::clone(&snapshot_arc).scan_builder();
+    if let Some(pred) = kernel_predicate {
+        scan_builder = scan_builder.with_predicate(Arc::new(pred));
+    }
+    let scan = scan_builder.build()?;
 
     // Temporary collection that keeps the raw kernel `DvInfo` alongside the
     // rest of the metadata. We need the `DvInfo` to materialize the deleted

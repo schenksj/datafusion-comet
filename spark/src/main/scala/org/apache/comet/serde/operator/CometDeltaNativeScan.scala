@@ -113,10 +113,31 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     val snapshotVersion: Long =
       DeltaReflection.extractSnapshotVersion(relation).getOrElse(-1L)
 
-    // --- 1. Ask kernel for the active file list ---
+    // Phase 2: serialize the data filters so kernel can apply stats-based file
+    // pruning during log replay. The same filters will also be pushed down into
+    // ParquetSource for row-group-level pruning - the two layers are additive.
+    val predicateBytes: Array[Byte] = {
+      val protoFilters = new ListBuffer[Expr]()
+      scan.supportedDataFilters.foreach { filter =>
+        exprToProto(filter, scan.output) match {
+          case Some(proto) => protoFilters += proto
+          case _ =>
+        }
+      }
+      if (protoFilters.nonEmpty) {
+        // Wrap in a single AND conjunction proto so the native side receives one
+        // expression tree. Use a Scan-like wrapper message or just serialize
+        // the first filter (TODO: combine with AND for multiple).
+        protoFilters.head.toByteArray
+      } else {
+        Array.emptyByteArray
+      }
+    }
+
+    // --- 1. Ask kernel for the active file list (with optional predicate for file pruning) ---
     val taskListBytes =
       try {
-        nativeLib.planDeltaScan(tableRoot, snapshotVersion, storageOptions)
+        nativeLib.planDeltaScan(tableRoot, snapshotVersion, storageOptions, predicateBytes)
       } catch {
         case e: Throwable =>
           logWarning(s"CometDeltaNativeScan: delta-kernel-rs log replay failed for $tableRoot", e)

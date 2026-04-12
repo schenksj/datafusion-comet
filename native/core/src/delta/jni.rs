@@ -23,13 +23,16 @@
 //! Spark executors via Comet's usual split-mode serialization.
 
 use jni::{
-    objects::{JClass, JMap, JObject, JString},
+    objects::{JByteArray, JClass, JMap, JObject, JString},
     sys::{jbyteArray, jlong},
     Env, EnvUnowned,
 };
 use prost::Message;
 
-use crate::delta::{plan_delta_scan, DeltaStorageConfig};
+use crate::delta::{
+    scan::plan_delta_scan_with_predicate,
+    DeltaStorageConfig,
+};
 use crate::errors::{try_unwrap_or_throw, CometError, CometResult};
 use datafusion_comet_proto::spark_operator::{
     DeltaPartitionValue, DeltaScanTask, DeltaScanTaskList,
@@ -59,6 +62,7 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
     table_url: JString,
     snapshot_version: jlong,
     storage_options: JObject,
+    predicate_bytes: JByteArray,
 ) -> jbyteArray {
     try_unwrap_or_throw(&e, |env| {
         let url_str: String = table_url.try_to_string(env)?;
@@ -74,9 +78,33 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
             extract_storage_config(env, &jmap)?
         };
 
-        let plan = plan_delta_scan(&url_str, &config, version).map_err(|e| {
-            CometError::Internal(format!("delta_kernel log replay failed: {e}"))
-        })?;
+        // Phase 2: deserialize the Catalyst predicate (if provided) for
+        // kernel's stats-based file pruning. Empty bytes = no predicate.
+        let _predicate_proto: Option<Vec<u8>> = if predicate_bytes.is_null() {
+            None
+        } else {
+            let bytes = env.convert_byte_array(predicate_bytes)?;
+            if bytes.is_empty() {
+                None
+            } else {
+                Some(bytes)
+            }
+        };
+
+        // Phase 2: translate Catalyst predicate proto → kernel Predicate for
+        // stats-based file pruning during log replay.
+        let kernel_predicate = _predicate_proto.and_then(|bytes| {
+            use prost::Message;
+            datafusion_comet_proto::spark_expression::Expr::decode(bytes.as_slice())
+                .ok()
+                .map(|expr| crate::delta::predicate::catalyst_to_kernel_predicate(&expr))
+        });
+
+        let plan =
+            plan_delta_scan_with_predicate(&url_str, &config, version, kernel_predicate)
+                .map_err(|e| {
+                    CometError::Internal(format!("delta_kernel log replay failed: {e}"))
+                })?;
 
         let tasks: Vec<DeltaScanTask> = plan
             .entries

@@ -202,7 +202,8 @@ class Native extends NativeBase {
   @native def planDeltaScan(
       tableUrl: String,
       snapshotVersion: Long,
-      storageOptions: java.util.Map[String, String]): Array[Byte]
+      storageOptions: java.util.Map[String, String],
+      predicateBytes: Array[Byte]): Array[Byte]
 
   /**
    * Log the beginning of an event.
