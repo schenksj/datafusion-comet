@@ -234,6 +234,18 @@ private[comet] object NativeScanPlanDataInjector extends PlanDataInjector {
  * Injector for DeltaScan operators (Phase 5 split-mode serialization).
  */
 private[comet] object DeltaPlanDataInjector extends PlanDataInjector {
+  import java.nio.ByteBuffer
+  import java.util.{LinkedHashMap, Map => JMap}
+
+  private final val maxCacheEntries = 16
+
+  private val commonCache = java.util.Collections.synchronizedMap(
+    new LinkedHashMap[ByteBuffer, OperatorOuterClass.DeltaScanCommon](4, 0.75f, true) {
+      override def removeEldestEntry(
+          eldest: JMap.Entry[ByteBuffer, OperatorOuterClass.DeltaScanCommon]): Boolean = {
+        size() > maxCacheEntries
+      }
+    })
 
   override def canInject(op: Operator): Boolean =
     op.hasDeltaScan &&
@@ -247,7 +259,14 @@ private[comet] object DeltaPlanDataInjector extends PlanDataInjector {
       op: Operator,
       commonBytes: Array[Byte],
       partitionBytes: Array[Byte]): Operator = {
-    val common = OperatorOuterClass.DeltaScanCommon.parseFrom(commonBytes)
+    val cacheKey = ByteBuffer.wrap(commonBytes)
+    val common = commonCache.synchronized {
+      Option(commonCache.get(cacheKey)).getOrElse {
+        val parsed = OperatorOuterClass.DeltaScanCommon.parseFrom(commonBytes)
+        commonCache.put(cacheKey, parsed)
+        parsed
+      }
+    }
     val tasksOnly = OperatorOuterClass.DeltaScan.parseFrom(partitionBytes)
 
     val scanBuilder = op.getDeltaScan.toBuilder

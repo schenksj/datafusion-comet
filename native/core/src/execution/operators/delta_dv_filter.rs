@@ -247,6 +247,8 @@ impl DeltaDvFilterStream {
         // that fall inside [batch_start, batch_end).
         let mut mask_buf: Vec<bool> = vec![true; batch_rows as usize];
         let mut dropped: usize = 0;
+        // Loop is safe: next_delete_idx < deleted.len() is checked by the while
+        // condition, and deleted is sorted ascending by the kernel contract.
         while self.next_delete_idx < self.deleted.len() {
             let d = self.deleted[self.next_delete_idx];
             if d >= batch_end {

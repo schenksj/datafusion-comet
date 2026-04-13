@@ -11,7 +11,7 @@
 // Unless required by applicable law or agreed to in writing,
 // software distributed under the License is distributed on an
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either success or implied.  See the License for the
+// KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
@@ -105,14 +105,21 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
         // BoundReference index-to-name resolution.
         let kernel_predicate = _predicate_proto.and_then(|bytes| {
             use prost::Message;
-            datafusion_comet_proto::spark_expression::Expr::decode(bytes.as_slice())
-                .ok()
-                .map(|expr| {
+            match datafusion_comet_proto::spark_expression::Expr::decode(bytes.as_slice()) {
+                Ok(expr) => Some(
                     crate::delta::predicate::catalyst_to_kernel_predicate_with_names(
                         &expr,
                         &col_names,
-                    )
-                })
+                    ),
+                ),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to decode predicate for Delta file pruning: {e}; \
+                         scanning all files"
+                    );
+                    None
+                }
+            }
         });
 
         let plan =
@@ -238,6 +245,9 @@ fn read_string_array(
     let mut result = Vec::with_capacity(len);
     for i in 0..len {
         let obj = arr.get_element(env, i)?;
+        // SAFETY: get_element returns a valid local JObject reference that we
+        // immediately convert to JString. The array is String[], so the cast
+        // is valid. The env lifetime outlives this scope.
         let jstr = unsafe { JString::from_raw(env, obj.into_raw()) };
         result.push(jstr.try_to_string(env)?);
     }
@@ -256,7 +266,9 @@ fn map_get_string(
     match jmap.get(env, &key_jobj)? {
         None => Ok(None),
         Some(value) => {
-            // Safe: `Map<String, String>::get` only ever returns a String.
+            // SAFETY: Map<String, String>::get always returns a String. The
+            // JObject reference is valid because JMap::get returned it from the
+            // current env frame. We consume the local ref via into_raw().
             let jstr = unsafe { JString::from_raw(env, value.into_raw()) };
             Ok(Some(jstr.try_to_string(env)?))
         }

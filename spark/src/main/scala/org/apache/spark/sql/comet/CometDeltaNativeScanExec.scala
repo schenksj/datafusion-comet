@@ -19,12 +19,21 @@
 
 package org.apache.spark.sql.comet
 
+import java.util.Locale
+
 import scala.jdk.CollectionConverters._
 
-import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, UnknownPartitioning}
-import org.apache.spark.sql.execution.FileSourceScanExec
+import org.apache.spark.sql.execution.{FileSourceScanExec, InSubqueryExec}
+import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.util.AccumulatorV2
 
 import com.google.common.base.Objects
 
@@ -32,15 +41,16 @@ import org.apache.comet.serde.OperatorOuterClass
 import org.apache.comet.serde.OperatorOuterClass.Operator
 
 /**
- * Native Delta Lake scan operator with Phase 5 split-mode serialization.
+ * Native Delta Lake scan operator with split-mode serialization and DPP support.
  *
  * Common scan metadata (schemas, filters, projections, storage options, column mappings) is
  * serialized once at planning time in `nativeOp`. Per-partition file lists are materialized
  * lazily in `serializedPartitionData` at execution time so each Spark task receives only its own
  * slice of the file list, reducing driver memory.
  *
- * The `PlanDataInjector` machinery (via `DeltaPlanDataInjector`) merges common + per-partition
- * data at runtime on each executor before the native plan is executed.
+ * DPP (Dynamic Partition Pruning) is supported by deferring partition pruning of DPP expressions
+ * to execution time. Static partition filters are applied at planning time in
+ * `CometDeltaNativeScan.prunePartitions`; DPP filters are resolved in `serializedPartitionData`.
  */
 case class CometDeltaNativeScanExec(
     override val nativeOp: Operator,
@@ -48,28 +58,34 @@ case class CometDeltaNativeScanExec(
     override val serializedPlanOpt: SerializedPlan,
     @transient originalPlan: FileSourceScanExec,
     tableRoot: String,
-    @transient taskListBytes: Array[Byte])
+    @transient taskListBytes: Array[Byte],
+    @transient dppFilters: Seq[Expression] = Seq.empty,
+    partitionSchema: StructType = new StructType())
     extends CometLeafExec {
 
   override val supportsColumnar: Boolean = true
 
   override val nodeName: String = s"CometDeltaNativeScan $tableRoot"
 
-  /**
-   * Lazy split-mode partition serialization. Each element of `perPartitionData` contains a
-   * serialized `DeltaScan` message with ONLY the tasks for that partition (no common block).
-   * `commonData` contains the serialized `DeltaScanCommon`.
-   */
+  override protected def doPrepare(): Unit = {
+    dppFilters.foreach {
+      case DynamicPruningExpression(e: InSubqueryExec) =>
+        e.plan.prepare()
+      case _ =>
+    }
+    super.doPrepare()
+  }
+
   @transient private lazy val serializedPartitionData: (Array[Byte], Array[Array[Byte]]) = {
     val commonBytes = nativeOp.getDeltaScan.getCommon.toByteArray
 
-    // Parse the full task list returned by planDeltaScan on the driver.
     val taskList = OperatorOuterClass.DeltaScanTaskList.parseFrom(taskListBytes)
+    var allTasks = taskList.getTasksList.asScala.toSeq
 
-    // Each file becomes its own Spark partition for maximum parallelism.
-    // Future optimization: merge small files into larger partitions using
-    // Spark's maxSplitBytes-based logic.
-    val allTasks = taskList.getTasksList.asScala.toSeq
+    if (dppFilters.nonEmpty && partitionSchema.nonEmpty) {
+      allTasks = applyDppFilters(allTasks)
+    }
+
     val perPartitionBytes = if (allTasks.isEmpty) {
       Array.empty[Array[Byte]]
     } else {
@@ -85,6 +101,46 @@ case class CometDeltaNativeScanExec(
     (commonBytes, perPartitionBytes)
   }
 
+  private def applyDppFilters(
+      tasks: Seq[OperatorOuterClass.DeltaScanTask]): Seq[OperatorOuterClass.DeltaScanTask] = {
+    dppFilters.foreach {
+      case DynamicPruningExpression(inSub: InSubqueryExec) if inSub.values().isEmpty =>
+        inSub.updateResult()
+      case _ =>
+    }
+
+    val resolvedFilters = dppFilters.map {
+      case DynamicPruningExpression(e) => e
+      case other => other
+    }
+    if (resolvedFilters.isEmpty) return tasks
+
+    val caseSensitive = SQLConf.get.getConf[Boolean](SQLConf.CASE_SENSITIVE)
+    val combined = resolvedFilters.reduce(And)
+    val bound = combined.transform { case a: AttributeReference =>
+      val idx = partitionSchema.fields.indexWhere(f =>
+        if (caseSensitive) f.name == a.name
+        else f.name.toLowerCase(Locale.ROOT) == a.name.toLowerCase(Locale.ROOT))
+      if (idx < 0) return tasks
+      BoundReference(idx, partitionSchema(idx).dataType, partitionSchema(idx).nullable)
+    }
+    val predicate = InterpretedPredicate(bound)
+    predicate.initialize(0)
+
+    tasks.filter { task =>
+      val row = InternalRow.fromSeq(partitionSchema.fields.toSeq.map { field =>
+        val proto = task.getPartitionValuesList.asScala.find(_.getName == field.name)
+        val strValue =
+          if (proto.exists(_.hasValue)) Some(proto.get.getValue) else None
+        castPartitionString(strValue, field.dataType)
+      })
+      predicate.eval(row)
+    }
+  }
+
+  private def castPartitionString(str: Option[String], dt: DataType): Any =
+    org.apache.comet.delta.DeltaReflection.castPartitionString(str, dt)
+
   def commonData: Array[Byte] = serializedPartitionData._1
   def perPartitionData: Array[Array[Byte]] = serializedPartitionData._2
 
@@ -95,6 +151,55 @@ case class CometDeltaNativeScanExec(
 
   override lazy val outputOrdering: Seq[SortOrder] = Nil
 
+  private class ImmutableSQLMetric(metricType: String) extends SQLMetric(metricType, 0) {
+    override def merge(other: AccumulatorV2[Long, Long]): Unit = {}
+    override def reset(): Unit = {}
+  }
+
+  override lazy val metrics: Map[String, SQLMetric] = {
+    val taskList =
+      if (taskListBytes != null) {
+        OperatorOuterClass.DeltaScanTaskList.parseFrom(taskListBytes)
+      } else {
+        null
+      }
+
+    val baseMetrics = Map(
+      "output_rows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
+      "num_splits" -> SQLMetrics.createMetric(sparkContext, "number of file splits processed"))
+
+    val planningMetrics = if (taskList != null) {
+      val totalFiles = new ImmutableSQLMetric("sum")
+      totalFiles.set(taskList.getTasksCount.toLong)
+      sparkContext.register(totalFiles, "total files")
+
+      val dvFiles = new ImmutableSQLMetric("sum")
+      dvFiles.set(taskList.getTasksList.asScala.count(!_.getDeletedRowIndexesList.isEmpty).toLong)
+      sparkContext.register(dvFiles, "files with deletion vectors")
+
+      Map("total_files" -> totalFiles, "dv_files" -> dvFiles)
+    } else {
+      Map.empty[String, SQLMetric]
+    }
+
+    baseMetrics ++ planningMetrics
+  }
+
+  override def doExecuteColumnar(): RDD[ColumnarBatch] = {
+    val nativeMetrics = CometMetricNode.fromCometPlan(this)
+    val serializedPlan = CometExec.serializeNativePlan(nativeOp)
+    CometExecRDD(
+      sparkContext,
+      inputRDDs = Seq.empty,
+      commonByKey = Map(tableRoot -> commonData),
+      perPartitionByKey = Map(tableRoot -> perPartitionData),
+      serializedPlan = serializedPlan,
+      numPartitions = perPartitionData.length,
+      numOutputCols = output.length,
+      nativeMetrics = nativeMetrics,
+      subqueries = Seq.empty)
+  }
+
   override def convertBlock(): CometDeltaNativeScanExec = {
     val newSerializedPlan = if (serializedPlanOpt.isEmpty) {
       val bytes = CometExec.serializeNativePlan(nativeOp)
@@ -102,7 +207,15 @@ case class CometDeltaNativeScanExec(
     } else {
       serializedPlanOpt
     }
-    copy(serializedPlanOpt = newSerializedPlan)
+    CometDeltaNativeScanExec(
+      nativeOp,
+      output,
+      newSerializedPlan,
+      originalPlan,
+      tableRoot,
+      taskListBytes,
+      dppFilters,
+      partitionSchema)
   }
 
   override protected def doCanonicalize(): CometDeltaNativeScanExec = {
@@ -110,10 +223,24 @@ case class CometDeltaNativeScanExec(
       output = output.map(QueryPlan.normalizeExpressions(_, output)),
       serializedPlanOpt = SerializedPlan(None),
       originalPlan = null,
-      taskListBytes = null)
+      taskListBytes = null,
+      dppFilters = Seq.empty)
   }
 
-  override def stringArgs: Iterator[Any] = Iterator(output, tableRoot)
+  override def stringArgs: Iterator[Any] = {
+    val taskCount =
+      if (taskListBytes != null) {
+        OperatorOuterClass.DeltaScanTaskList.parseFrom(taskListBytes).getTasksCount
+      } else {
+        0
+      }
+    val dppStr = if (dppFilters.nonEmpty) {
+      s", dpp=${dppFilters.mkString("[", ", ", "]")}"
+    } else {
+      ""
+    }
+    Iterator(output, s"$tableRoot ($taskCount files$dppStr)")
+  }
 
   override def equals(obj: Any): Boolean = obj match {
     case other: CometDeltaNativeScanExec =>

@@ -54,6 +54,9 @@ pub enum DeltaError {
 
     #[error("delta kernel error: {0}")]
     Kernel(#[from] delta_kernel::Error),
+
+    #[error("{0}")]
+    Internal(String),
 }
 
 pub type DeltaResult<T> = std::result::Result<T, DeltaError>;

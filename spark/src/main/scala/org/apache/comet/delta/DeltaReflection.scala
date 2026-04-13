@@ -137,4 +137,48 @@ object DeltaReflection extends Logging {
       case _: Exception => None
     }
   }
+
+  /**
+   * Convert a Delta partition value string to a Catalyst-internal representation. Delta stores
+   * partition values as strings in add actions; this converts them to the correct type for
+   * predicate evaluation.
+   */
+  def castPartitionString(str: Option[String], dt: org.apache.spark.sql.types.DataType): Any = {
+    import org.apache.spark.sql.catalyst.util.DateTimeUtils
+    import org.apache.spark.sql.types._
+    import org.apache.spark.unsafe.types.UTF8String
+    str match {
+      case None | Some(null) => null
+      case Some(s) =>
+        try {
+          dt match {
+            case StringType => UTF8String.fromString(s)
+            case IntegerType => s.toInt
+            case LongType => s.toLong
+            case ShortType => s.toShort
+            case ByteType => s.toByte
+            case FloatType => s.toFloat
+            case DoubleType => s.toDouble
+            case BooleanType => s.toBoolean
+            case DateType =>
+              DateTimeUtils
+                .stringToDate(UTF8String.fromString(s))
+                .getOrElse(null)
+            case _: TimestampType =>
+              DateTimeUtils
+                .stringToTimestamp(UTF8String.fromString(s), java.time.ZoneOffset.UTC)
+                .getOrElse(null)
+            case d: DecimalType =>
+              val dec =
+                org.apache.spark.sql.types.Decimal(new java.math.BigDecimal(s))
+              dec.changePrecision(d.precision, d.scale)
+              dec
+            case _ => UTF8String.fromString(s)
+          }
+        } catch {
+          case _: NumberFormatException | _: IllegalArgumentException =>
+            null
+        }
+    }
+  }
 }

@@ -240,14 +240,12 @@ pub fn plan_delta_scan_with_predicate(
     // processing if driver OOM becomes an issue at extreme scale.
     let mut entries: Vec<DeltaFileEntry> = Vec::with_capacity(raw.len());
     for r in raw {
-        // get_row_indexes returns Ok(Some(Vec<u64>)) when a DV is present,
-        // Ok(None) when has_vector() lied (shouldn't happen), or Err on I/O
-        // failure. The `?` propagates I/O errors; `unwrap_or_default` handles
-        // the None case defensively (empty = no deletions, safe fallback).
         let deleted_row_indexes = if r.dv_info.has_vector() {
             r.dv_info
                 .get_row_indexes(&engine, &table_root_url)?
-                .unwrap_or_default()
+                .ok_or_else(|| DeltaError::Internal(
+                    format!("DV has_vector() true but get_row_indexes() returned None for {}", r.path),
+                ))?
         } else {
             Vec::new()
         };

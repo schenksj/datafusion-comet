@@ -1358,7 +1358,7 @@ impl PhysicalPlanner {
                 let common = scan
                     .common
                     .as_ref()
-                    .ok_or_else(|| GeneralError("DeltaScan missing common data".into()))?;
+                    .ok_or_else(|| GeneralError("DeltaScan proto missing 'common' field (Scala serialization error)".into()))?;
 
                 let required_schema: SchemaRef =
                     convert_spark_types_to_arrow_schema(common.required_schema.as_slice());
@@ -1415,7 +1415,19 @@ impl PhysicalPlanner {
                 let data_filters: Result<Vec<Arc<dyn PhysicalExpr>>, ExecutionError> = common
                     .data_filters
                     .iter()
-                    .map(|expr| self.create_expr(expr, Arc::clone(&required_schema)))
+                    .map(|expr| {
+                        let filter =
+                            self.create_expr(expr, Arc::clone(&required_schema))?;
+                        if has_column_mapping {
+                            let mut rewriter = ColumnMappingFilterRewriter {
+                                logical_to_physical: &logical_to_physical,
+                                data_schema: &data_schema,
+                            };
+                            Ok(filter.rewrite(&mut rewriter).data()?)
+                        } else {
+                            Ok(filter)
+                        }
+                    })
                     .collect();
 
                 let object_store_options: HashMap<String, String> = common
@@ -1459,39 +1471,21 @@ impl PhysicalPlanner {
                     .tasks
                     .first()
                     .map(|t| t.file_path.clone())
-                    .ok_or_else(|| GeneralError("DeltaScan has no tasks".into()))?;
+                    .ok_or_else(|| GeneralError("DeltaScan has no tasks after split-mode injection (check DeltaPlanDataInjector)".into()))?;
                 let (object_store_url, _) = prepare_object_store_with_configs(
                     self.session_ctx.runtime_env(),
                     one_file,
                     &object_store_options,
                 )?;
 
-                // When column mapping is active, required_schema also needs physical
-                // names so init_datasource_exec's name-matching logic works against the
-                // physical data_schema.
-                let read_required_schema = if has_column_mapping {
-                    let new_fields: Vec<_> = required_schema
-                        .fields()
-                        .iter()
-                        .map(|f| {
-                            if let Some(physical) = logical_to_physical.get(f.name()) {
-                                Arc::new(Field::new(
-                                    physical,
-                                    f.data_type().clone(),
-                                    f.is_nullable(),
-                                ))
-                            } else {
-                                Arc::clone(f)
-                            }
-                        })
-                        .collect();
-                    Arc::new(Schema::new(new_fields))
-                } else {
-                    Arc::clone(&required_schema)
-                };
-
+                // Keep required_schema in LOGICAL names (Spark's convention).
+                // data_schema uses physical names (when column mapping is active).
+                // DataFusion's schema adapter bridges the gap: it matches file
+                // columns against data_schema by name and produces the
+                // required_schema output shape, injecting nulls for missing
+                // columns (schema evolution).
                 let delta_exec = init_datasource_exec(
-                    read_required_schema,
+                    Arc::clone(&required_schema),
                     Some(data_schema),
                     Some(partition_schema),
                     object_store_url,
@@ -1518,33 +1512,9 @@ impl PhysicalPlanner {
                         delta_exec
                     };
 
-                // Phase 4: when column mapping is active, the output has PHYSICAL
-                // column names. Add a ProjectionExec to rename back to logical.
-                let final_exec = if has_column_mapping {
-                    let physical_to_logical: HashMap<String, String> = logical_to_physical
-                        .iter()
-                        .map(|(l, p)| (p.clone(), l.clone()))
-                        .collect();
-                    let input_schema = final_exec.schema();
-                    let rename_exprs: Result<Vec<(Arc<dyn PhysicalExpr>, String)>, ExecutionError> = input_schema
-                        .fields()
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, f)| {
-                            let col: Arc<dyn PhysicalExpr> =
-                                Arc::new(Column::new(f.name(), idx));
-                            let logical = physical_to_logical
-                                .get(f.name())
-                                .cloned()
-                                .unwrap_or_else(|| f.name().clone());
-                            Ok((col, logical))
-                        })
-                        .collect();
-                    let rename_exprs = rename_exprs?;
-                    Arc::new(ProjectionExec::try_new(rename_exprs, final_exec)?) as Arc<dyn ExecutionPlan>
-                } else {
-                    final_exec
-                };
+                // No rename projection needed: required_schema already uses
+                // logical names, and DataFusion's schema adapter handles the
+                // physical→logical mapping internally via data_schema.
 
                 Ok((
                     vec![],
@@ -2997,6 +2967,45 @@ fn expr_to_columns(
     right_field_indices.sort();
 
     Ok((left_field_indices, right_field_indices))
+}
+
+/// Rewrites Column references in a PhysicalExpr from logical names/indices
+/// (as in required_schema) to physical names/indices (as in data_schema).
+/// Used by the Delta scan path when column mapping is active so that pushed-down
+/// data filters match the DataSourceExec's base schema (physical column names).
+struct ColumnMappingFilterRewriter<'a> {
+    logical_to_physical: &'a HashMap<String, String>,
+    data_schema: &'a SchemaRef,
+}
+
+impl TreeNodeRewriter for ColumnMappingFilterRewriter<'_> {
+    type Node = Arc<dyn PhysicalExpr>;
+
+    fn f_down(
+        &mut self,
+        node: Self::Node,
+    ) -> datafusion::common::Result<Transformed<Self::Node>> {
+        if let Some(column) = node.as_any().downcast_ref::<Column>() {
+            if let Some(physical_name) = self.logical_to_physical.get(column.name()) {
+                if let Some(idx) = self
+                    .data_schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == physical_name)
+                {
+                    return Ok(Transformed::yes(Arc::new(Column::new(physical_name, idx))));
+                }
+                log::warn!(
+                    "Column mapping: physical name '{}' for logical '{}' not found in data_schema; \
+                     filter may fail at execution time",
+                    physical_name, column.name()
+                );
+            }
+            Ok(Transformed::no(node))
+        } else {
+            Ok(Transformed::no(node))
+        }
+    }
 }
 
 /// A physical join filter rewritter which rewrites the column indices in the expression

@@ -44,11 +44,12 @@ import org.apache.comet.serde.QueryPlanSerde.exprToProto
 /**
  * Validation and serde logic for the native Delta Lake scan.
  *
- * Unlike `CometNativeScan` / `CometIcebergNativeScan`, this serde does **all** the work
- * synchronously inside `convert()` - no split-mode, no lazy partition serialization. The driver
- * calls `Native.planDeltaScan` to enumerate files via `delta-kernel-rs`, then packs them into a
- * single `DeltaScan` proto alongside the common metadata. All file tasks end up on one Spark
- * partition in Phase 1; per-task parallelism arrives with Phase 5.
+ * `convert()` calls `Native.planDeltaScan` to enumerate files via `delta-kernel-rs`, builds the
+ * `DeltaScanCommon` proto with schemas/filters/options, applies static partition pruning, and
+ * stashes the task list in a ThreadLocal. `createExec()` retrieves it and builds a
+ * `CometDeltaNativeScanExec` with split-mode serialization: common data serialized once at
+ * planning time, per-partition task lists materialized lazily at execution time. DPP filters are
+ * applied at execution time in the exec's `serializedPartitionData`.
  */
 object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Logging {
 
@@ -270,7 +271,8 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     }
 
     // Phase 4: pass column mapping from kernel through to the native planner.
-    taskList.getColumnMappingsList.asScala.foreach { cm =>
+    val columnMappings = taskList.getColumnMappingsList.asScala
+    columnMappings.foreach { cm =>
       commonBuilder.addColumnMappings(
         OperatorOuterClass.DeltaColumnMapping
           .newBuilder()
@@ -358,51 +360,30 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     }
   }
 
-  /**
-   * Convert a Delta partition value (always a string, always stored in the add action) into a
-   * Catalyst-internal representation for the given data type. Returns `null` for null/unset
-   * values. Handles the subset of primitive types Delta supports for partition columns: string,
-   * int, long, short, byte, float, double, boolean, date, timestamp, and decimal. Other types
-   * fall back to a string representation.
-   */
-  private def castPartitionString(str: Option[String], dt: DataType): Any = str match {
-    case None => null
-    case Some(s) if s == null => null
-    case Some(s) =>
-      dt match {
-        case StringType => UTF8String.fromString(s)
-        case IntegerType => s.toInt
-        case LongType => s.toLong
-        case ShortType => s.toShort
-        case ByteType => s.toByte
-        case FloatType => s.toFloat
-        case DoubleType => s.toDouble
-        case BooleanType => s.toBoolean
-        case DateType => DateTimeUtils.stringToDate(UTF8String.fromString(s)).get
-        case _: TimestampType =>
-          DateTimeUtils.stringToTimestamp(UTF8String.fromString(s), java.time.ZoneOffset.UTC).get
-        case d: DecimalType =>
-          val dec = org.apache.spark.sql.types.Decimal(new java.math.BigDecimal(s))
-          dec.changePrecision(d.precision, d.scale)
-          dec
-        case other =>
-          throw new IllegalArgumentException(
-            s"Unsupported Delta partition column type $other for value '$s'. " +
-              "Supported types: string, int, long, short, byte, float, double, " +
-              "boolean, date, timestamp, decimal.")
-      }
-  }
+  private def castPartitionString(str: Option[String], dt: DataType): Any =
+    DeltaReflection.castPartitionString(str, dt)
 
   override def createExec(nativeOp: Operator, op: CometScanExec): CometNativeExec = {
     val tableRoot = DeltaReflection.extractTableRoot(op.relation).getOrElse("unknown")
-    val tlBytes = Option(lastTaskListBytes.get()).getOrElse(Array.emptyByteArray)
-    lastTaskListBytes.remove() // clean up
+    val tlBytes =
+      try {
+        Option(lastTaskListBytes.get()).getOrElse(Array.emptyByteArray)
+      } finally {
+        lastTaskListBytes.remove()
+      }
+
+    val dppFilters = op.partitionFilters.filter(
+      _.exists(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.PlanExpression[_]]))
+    val partitionSchema = op.relation.partitionSchema
+
     CometDeltaNativeScanExec(
       nativeOp,
       op.output,
       org.apache.spark.sql.comet.SerializedPlan(None),
       op.wrapped,
       tableRoot,
-      tlBytes)
+      tlBytes,
+      dppFilters,
+      partitionSchema)
   }
 }

@@ -396,6 +396,26 @@ case class CometScanRule(session: SparkSession)
     if (!isSchemaSupported(scanExec, SCAN_NATIVE_DELTA_COMPAT, r)) {
       return None
     }
+
+    // Validate filesystem schemes from the scan's input files.
+    val supportedSchemes =
+      Set("file", "s3", "s3a", "gs", "gcs", "abfss", "abfs", "wasbs", "wasb", "oss")
+    val inputFiles = scanExec.relation.location.inputFiles
+    if (inputFiles.nonEmpty) {
+      val schemes = inputFiles
+        .map(f => new java.net.URI(f).getScheme)
+        .filter(_ != null)
+        .toSet
+      val unsupported = schemes -- supportedSchemes
+      if (unsupported.nonEmpty) {
+        withInfo(
+          scanExec,
+          s"Native Delta scan does not support filesystem schemes: " +
+            unsupported.mkString(", "))
+        return None
+      }
+    }
+
     Some(CometScanExec(scanExec, session, SCAN_NATIVE_DELTA_COMPAT))
   }
 
