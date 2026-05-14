@@ -35,6 +35,8 @@ extern crate datafusion_comet_jni_bridge;
 // up in the built cdylib.
 #[cfg(feature = "contrib-example")]
 extern crate comet_contrib_example;
+#[cfg(feature = "contrib-delta")]
+extern crate comet_contrib_delta;
 
 use jni::{
     objects::{JClass, JString},

@@ -1,0 +1,60 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[package]
+name = "comet-contrib-delta"
+description = "delta-kernel-rs integration for Comet. Reads Delta tables via kernel-rs's log replay and DataFusion's parquet scan, with DV / column-mapping / row-tracking support. Linked into libcomet via core's `contrib-delta` Cargo feature flag."
+workspace = "../../../native"
+version = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Public SPI surface (kept minimal so the dependency graph is a DAG).
+comet-contrib-spi = { path = "../../../native/contrib-spi" }
+# Core's proto crate -- the contrib's own proto imports `SparkStructField` and `Expr`
+# from here via prost-build's extern_path (see build.rs) so no types get duplicated.
+datafusion-comet-proto = { workspace = true }
+# Heavy Delta deps. These intentionally live ONLY in the contrib crate, never in core.
+# delta_kernel 0.19 pins arrow-57 / object_store-0.12 internally; they live in a
+# separate dep subtree from Comet's arrow-58 / object_store-0.13 and never exchange
+# typed values -- only plain Rust types cross the boundary (ScanFile, HashMap, etc.).
+delta_kernel = { version = "0.19", default-features = false, features = ["default-engine-rustls", "arrow"] }
+# Second object_store version required by delta_kernel 0.19 (kernel's engine uses 0.12).
+# Renamed so it doesn't collide with workspace-wide `object_store = "0.13.1"`.
+object_store_kernel = { package = "object_store", version = "0.12", features = ["aws", "azure"] }
+# Roaring bitmap decoder for Delta deletion vectors (inline + on-disk).
+roaring = "0.10"
+
+# Shared deps from workspace.
+datafusion = { workspace = true }
+arrow = { workspace = true }
+object_store = { workspace = true }
+url = { workspace = true }
+log = "0.4"
+ctor = "0.4"
+prost = "0.14.3"
+jni = "0.22.4"
+
+[build-dependencies]
+prost-build = "0.14.3"

@@ -23,7 +23,7 @@ default-members = ["core", "spark-expr", "common", "proto", "jni-bridge", "shuff
 # `../contrib/<name>/native` and are workspace members so workspace lockfile + workspace
 # dependencies apply; they're NOT default-members because they're consumed via core's
 # optional Cargo feature flags rather than built standalone.
-members = ["core", "spark-expr", "common", "proto", "jni-bridge", "shuffle", "hdfs", "fs-hdfs", "contrib-spi", "../contrib/example/native"]
+members = ["core", "spark-expr", "common", "proto", "jni-bridge", "shuffle", "hdfs", "fs-hdfs", "contrib-spi", "../contrib/example/native", "../contrib/delta/native"]
 resolver = "2"
 
 [workspace.package]

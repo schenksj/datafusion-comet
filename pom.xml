@@ -46,6 +46,7 @@ under the License.
       docs/contrib-delta-migration-plan.md.
     -->
     <module>contrib/example</module>
+    <module>contrib/delta</module>
   </modules>
 
   <properties>
