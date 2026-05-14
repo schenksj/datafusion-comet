@@ -1710,6 +1710,8 @@ name = "comet-contrib-delta"
 version = "0.17.0"
 dependencies = [
  "arrow 58.2.0",
+ "chrono",
+ "chrono-tz",
  "comet-contrib-spi",
  "ctor 0.4.3",
  "datafusion",
@@ -1738,6 +1740,7 @@ dependencies = [
  "comet-contrib-spi",
  "ctor 0.4.3",
  "datafusion",
+ "datafusion-comet-proto",
  "log",
  "prost",
  "prost-build",
@@ -1748,6 +1751,7 @@ name = "comet-contrib-spi"
 version = "0.17.0"
 dependencies = [
  "datafusion",
+ "datafusion-comet-proto",
  "log",
 ]
 

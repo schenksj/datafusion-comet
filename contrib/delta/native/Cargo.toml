@@ -63,6 +63,10 @@ log = "0.4"
 ctor = "0.4"
 prost = "0.14.3"
 jni = "0.22.4"
+# Used by parse_delta_partition_scalar for timestamp parsing across the JVM's TZ shapes
+# (IANA names, GMT±HH:MM, etc). Match core's transitive pins.
+chrono = "0.4"
+chrono-tz = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1.39.0", features = ["macros", "rt-multi-thread"] }
