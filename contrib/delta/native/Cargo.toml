@@ -35,6 +35,9 @@ comet-contrib-spi = { path = "../../../native/contrib-spi" }
 # Core's proto crate -- the contrib's own proto imports `SparkStructField` and `Expr`
 # from here via prost-build's extern_path (see build.rs) so no types get duplicated.
 datafusion-comet-proto = { workspace = true }
+# JNI helpers (CometError, CometResult, try_unwrap_or_throw, JVMClasses). jni-bridge is
+# a leaf crate -- depending on it doesn't drag any Comet logic into the contrib.
+datafusion-comet-jni-bridge = { path = "../../../native/jni-bridge" }
 # Heavy Delta deps. These intentionally live ONLY in the contrib crate, never in core.
 # delta_kernel 0.19 pins arrow-57 / object_store-0.12 internally; they live in a
 # separate dep subtree from Comet's arrow-58 / object_store-0.13 and never exchange
@@ -51,10 +54,19 @@ datafusion = { workspace = true }
 arrow = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }
+# Match core's pinned versions for these deps -- they're not workspace-declared, so we
+# duplicate to keep linkage uniform.
+parquet = { version = "58.1.0", default-features = false, features = ["experimental"] }
+futures = "0.3"
+thiserror = "2"
 log = "0.4"
 ctor = "0.4"
 prost = "0.14.3"
 jni = "0.22.4"
+
+[dev-dependencies]
+tokio = { version = "1.39.0", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
 
 [build-dependencies]
 prost-build = "0.14.3"
