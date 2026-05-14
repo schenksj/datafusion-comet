@@ -48,14 +48,7 @@ pub mod jni;
 pub mod predicate;
 pub mod scan;
 pub mod dv_filter;
-
-// TODO(contrib-delta): the original integration test references core's
-// `crate::parquet::parquet_exec::init_datasource_exec` which is not exposed through
-// `comet-contrib-spi`. For PR2 we'll either expose it through the SPI or rewrite
-// the test against the contrib's own surface. For the validation build we skip the
-// module entirely -- it isn't part of the SPI dispatch path the validation is
-// proving out.
-// #[cfg(test)] mod integration_tests;
+pub mod planner;
 
 pub use engine::{create_engine, create_object_store, DeltaStorageConfig};
 pub use error::{DeltaError, DeltaResult};
@@ -77,6 +70,8 @@ fn register() {
     log::info!(
         "comet-contrib-delta: registering ContribOperatorPlanner kind={DELTA_SCAN_KIND:?}"
     );
-    // TODO P4: register the planner once the dispatcher body has been adapted from
-    // core's planner.rs OpStruct::DeltaScan arm.
+    comet_contrib_spi::register_contrib_planner(
+        DELTA_SCAN_KIND,
+        std::sync::Arc::new(planner::DeltaScanPlanner),
+    );
 }
