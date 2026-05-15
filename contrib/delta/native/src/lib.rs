@@ -40,15 +40,13 @@
 
 use std::sync::Arc;
 
-use comet_contrib_spi::{
-    register_contrib_planner, ContribError, ContribOperatorPlanner, ContribPlannerContext,
-};
-use datafusion::physical_plan::ExecutionPlan;
+use comet_contrib_spi::register_contrib_planner;
 
 pub mod dv_filter;
 pub mod engine;
 pub mod error;
 pub mod jni;
+pub mod planner;
 pub mod predicate;
 pub mod scan;
 
@@ -67,30 +65,13 @@ pub use scan::{list_delta_files, plan_delta_scan, DeltaFileEntry, DeltaScanPlan}
 /// it.
 pub const DELTA_SCAN_KIND: &str = "delta-scan";
 
-/// P1 stub. P3 replaces this with the real ~150-line dispatcher port that builds a
-/// `DataSourceExec` over Comet's tuned ParquetSource, wraps in `DeltaDvFilterExec`
-/// when DVs are present, and applies the rename projection for column-mapping tables.
-struct DeltaScanPlanner;
-
-impl ContribOperatorPlanner for DeltaScanPlanner {
-    fn plan(
-        &self,
-        _ctx: &dyn ContribPlannerContext,
-        _payload: &[u8],
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>, ContribError> {
-        Err(ContribError::Plan(format!(
-            "{DELTA_SCAN_KIND}: not yet implemented (PR2 P1 scaffold). \
-             Wire-up is complete -- planner dispatch reaches this code path -- but \
-             the dispatcher body lands in P3."
-        )))
-    }
-}
-
 #[ctor::ctor]
 fn register() {
     let _ = std::panic::catch_unwind(|| {
-        register_contrib_planner(DELTA_SCAN_KIND, Arc::new(DeltaScanPlanner));
+        register_contrib_planner(
+            DELTA_SCAN_KIND,
+            Arc::new(planner::DeltaScanPlanner),
+        );
     })
     .map_err(|panic| {
         eprintln!("comet-contrib-delta: #[ctor] panicked: {panic:?}");
