@@ -19,21 +19,38 @@
 
 package org.apache.comet.contrib.delta
 
-import org.apache.spark.sql.comet.CometDeltaNativeScanExec
+import org.apache.spark.sql.comet.{CometDeltaNativeScanExec, CometScanExec}
 import org.apache.spark.sql.execution.SparkPlan
 
 import org.apache.comet.serde.CometOperatorSerde
 import org.apache.comet.spi.CometOperatorSerdeExtension
 
 /**
- * Discovered via `META-INF/services/org.apache.comet.spi.CometOperatorSerdeExtension` to
- * register `CometDeltaNativeScanExec`'s serde with `CometExecRule`. Without this entry,
- * `CometExecRule` wouldn't know how to convert a `CometDeltaNativeScanExec` into the
- * `ContribOp` envelope for the native dispatch path.
+ * Discovered via `META-INF/services/org.apache.comet.spi.CometOperatorSerdeExtension`.
+ * Three SPI surfaces are exercised:
+ *
+ *   - `serdes`: class-keyed serde for `CometDeltaNativeScanExec` (the post-conversion
+ *     native exec class the contrib defines). Picked up after the native plan is built.
+ *   - `matchOperator`: predicate-keyed serde for the `CometScanExec` marker the
+ *     contrib's `DeltaScanRuleExtension.transformV1` returns. `CometScanExec` is shared
+ *     with core's generic file-scan dispatch, so we can't route on class alone --
+ *     `scanImpl == CometDeltaNativeScan.ScanImpl` is the disambiguator.
+ *   - `nativeParquetScanImpls`: declares that scans tagged with our scanImpl go through
+ *     Comet's tuned ParquetSource. `CometScanExec.supportedDataFilters` consults this
+ *     set to decide whether to drop dynamic-pruning filters + IsNull/IsNotNull on
+ *     ArrayType columns the same way it does for `SCAN_NATIVE_DATAFUSION`.
  */
 class DeltaOperatorSerdeExtension extends CometOperatorSerdeExtension {
   override def name: String = "delta"
 
   override def serdes: Map[Class[_ <: SparkPlan], CometOperatorSerde[_]] =
     Map(classOf[CometDeltaNativeScanExec] -> CometDeltaNativeScan)
+
+  override def matchOperator(op: SparkPlan): Option[CometOperatorSerde[_]] = op match {
+    case s: CometScanExec if s.scanImpl == CometDeltaNativeScan.ScanImpl =>
+      Some(CometDeltaNativeScan)
+    case _ => None
+  }
+
+  override def nativeParquetScanImpls: Set[String] = Set(CometDeltaNativeScan.ScanImpl)
 }

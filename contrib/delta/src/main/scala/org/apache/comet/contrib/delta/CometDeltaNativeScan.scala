@@ -56,6 +56,23 @@ import comet.contrib.delta.DeltaOperator.{DeltaScan, DeltaScanCommon, DeltaScanT
  */
 object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Logging {
 
+  /**
+   * `kind` string for the `ContribOp` envelope this serde produces. The native side's
+   * `comet-contrib-delta` rlib registers `DeltaScanPlanner` under this same kind via
+   * `register_contrib_planner(DELTA_SCAN_KIND, ...)` in
+   * `contrib/delta/native/src/lib.rs`. Keep the two in sync.
+   */
+  val DeltaScanKind: String = "delta-scan"
+
+  /**
+   * `scanImpl` tag the contrib uses on `CometScanExec` markers produced by
+   * `DeltaScanRuleExtension.transformV1`. Contrib-local constant (not in core's
+   * CometConf), declared as `nativeParquetScanImpls` in `DeltaOperatorSerdeExtension`
+   * so `CometScanExec.supportedDataFilters` applies the right exclusions, and matched
+   * in `DeltaOperatorSerdeExtension.matchOperator` to route through this serde.
+   */
+  val ScanImpl: String = "native_delta_compat"
+
   /** Private lazy handle to the native library - one instance per JVM. */
   private lazy val nativeLib = new org.apache.comet.contrib.delta.Native()
 
