@@ -49,5 +49,27 @@ trait CometOperatorSerdeExtension {
    * Convention: each contrib's mapping should reference only classes the contrib itself defines,
    * so two contribs never claim ownership of the same operator class.
    */
-  def serdes: Map[Class[_ <: SparkPlan], CometOperatorSerde[_]]
+  def serdes: Map[Class[_ <: SparkPlan], CometOperatorSerde[_]] = Map.empty
+
+  /**
+   * Predicate-based dispatch hook for contribs whose serde key cannot be expressed as a unique
+   * `SparkPlan` class. The canonical case is the `CometScanExec` marker-with-`scanImpl`-tag
+   * pattern: a contrib's `CometScanRuleExtension.transformV1` returns
+   * `CometScanExec(scanExec, session, "native_delta_compat")`, but `CometScanExec` is a case
+   * class shared with core, so a class-keyed map can't disambiguate by the tag. The contrib
+   * overrides this method to inspect the plan and return its serde:
+   *
+   * {{{
+   *   override def matchOperator(op: SparkPlan): Option[CometOperatorSerde[_]] = op match {
+   *     case s: CometScanExec if s.scanImpl == CometConf.SCAN_NATIVE_DELTA_COMPAT =>
+   *       Some(CometDeltaNativeScan)
+   *     case _ => None
+   *   }
+   * }}}
+   *
+   * `CometExecRule` consults `matchOperator` only after the class-keyed `serdes` map misses, so
+   * contribs with a unique exec class never need to implement this. Multiple registered
+   * extensions' `matchOperator` returns are tried in registration order; the first `Some` wins.
+   */
+  def matchOperator(op: SparkPlan): Option[CometOperatorSerde[_]] = None
 }
