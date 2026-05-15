@@ -159,7 +159,11 @@ case class CometScanExec(
    * on array columns (see [[isNullCheckOnArrayColumn]]).
    */
   lazy val supportedDataFilters: Seq[Expression] = {
-    if (scanImpl == CometConf.SCAN_NATIVE_DATAFUSION) {
+    // SCAN_NATIVE_DATAFUSION and SCAN_NATIVE_DELTA_COMPAT both go through Comet's
+    // tuned ParquetSource, which has the same filter-pushdown semantics. Iceberg's
+    // native path keeps the full filter set because its predicate evaluator differs.
+    if (scanImpl == CometConf.SCAN_NATIVE_DATAFUSION ||
+      scanImpl == CometConf.SCAN_NATIVE_DELTA_COMPAT) {
       dataFilters
         .filterNot(isDynamicPruningFilter)
         .filterNot(isNullCheckOnArrayColumn)

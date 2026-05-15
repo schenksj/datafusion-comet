@@ -113,6 +113,11 @@ object CometConf extends ShimCometConf {
 
   val SCAN_NATIVE_DATAFUSION = "native_datafusion"
   val SCAN_NATIVE_ICEBERG_COMPAT = "native_iceberg_compat"
+  // Contrib scan marker. The Delta contrib (and any future format whose convert/createExec
+  // dispatch keys on a string tag rather than a SparkPlan subclass) uses this scanImpl
+  // value to mark `CometScanExec` instances it produces. `CometOperatorSerdeExtension.
+  // matchOperator` is the contrib SPI hook that maps the marker to the contrib's serde.
+  val SCAN_NATIVE_DELTA_COMPAT = "native_delta_compat"
   val SCAN_AUTO = "auto"
 
   val COMET_NATIVE_SCAN_IMPL: ConfigEntry[String] = conf("spark.comet.scan.impl")

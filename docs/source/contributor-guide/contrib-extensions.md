@@ -277,9 +277,10 @@ trait CometOperatorSerdeExtension {
 }
 ```
 
-Contribs that need a custom physical operator (e.g., a contrib-specific scan exec
-carrying contrib-private state) define their own `SparkPlan` subclass and register a
-serde keyed on the new class:
+Two dispatch shapes are supported:
+
+**Class-keyed** — the contrib defines its own `SparkPlan` subclass (typical for
+operator-style contribs):
 
 ```scala
 case class CometMyFormatScanExec(...) extends CometNativeExec { /* ... */ }
@@ -296,8 +297,36 @@ The merged map across all extensions is computed once at registry load time;
 contribs are logged as a warning at load — the convention is **one contrib defines a
 class, that contrib owns its serde**.
 
-Avoid relying on the legacy `scanImpl: String` tag pattern on a generic `CometScanExec`
-— the SPI dispatches by class, not by tag.
+**Predicate-keyed (marker-class with scanImpl tag)** — required when the contrib uses
+core's `CometScanExec` as a marker disambiguated by a `scanImpl` string. `CometScanExec`
+is a Scala case class shared with core, so two contribs marking different tag values
+on the same class would otherwise collide. Override `matchOperator` instead of
+populating `serdes`:
+
+```scala
+import org.apache.comet.CometConf
+
+class MyFormatSerdeExtension extends CometOperatorSerdeExtension {
+  override def name: String = "myformat"
+  override def matchOperator(op: SparkPlan): Option[CometOperatorSerde[_]] = op match {
+    case s: CometScanExec if s.scanImpl == CometConf.SCAN_NATIVE_DELTA_COMPAT =>
+      Some(CometMyFormatScan)
+    case _ => None
+  }
+}
+```
+
+`CometExecRule` checks `matchOperator` only after the class-keyed `serdes` map misses,
+so the two patterns coexist. Multiple registered extensions' `matchOperator` calls are
+tried in registration order; the first `Some` wins. The Delta contrib uses this pattern
+(it returns `CometScanExec(..., SCAN_NATIVE_DELTA_COMPAT)` from `transformV1`).
+
+The published `SCAN_NATIVE_*` markers live on `CometConf`. If your contrib needs a new
+one, add it there with a brief comment alongside `SCAN_NATIVE_DATAFUSION` /
+`SCAN_NATIVE_ICEBERG_COMPAT` / `SCAN_NATIVE_DELTA_COMPAT`. `CometScanExec.
+supportedDataFilters` keys off this constant set — if your contrib uses Comet's tuned
+ParquetSource (same filter semantics as DataFusion/Delta), add the new tag to that
+check too.
 
 ##### `CometOperatorSerde[T <: SparkPlan]` contract
 
