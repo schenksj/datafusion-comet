@@ -49,10 +49,15 @@ under the License.
   <packaging>pom</packaging>
 
   <dependencies>
+    <!--
+      Delta Lake 4.1.0 targets Spark 4.1 + Java 17. This branch is Spark 4.1.1, so
+      4.1.x is the right line. Pinned to a specific patch rather than a range so
+      version-skew issues are obvious in release notes when the contrib is bumped.
+    -->
     <dependency>
       <groupId>io.delta</groupId>
       <artifactId>delta-spark_${scala.binary.version}</artifactId>
-      <version>3.3.2</version>
+      <version>4.1.0</version>
       <scope>provided</scope>
     </dependency>
   </dependencies>

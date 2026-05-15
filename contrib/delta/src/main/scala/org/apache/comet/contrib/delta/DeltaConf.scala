@@ -29,8 +29,15 @@ import org.apache.comet.{ConfigBuilder, ConfigEntry}
  */
 object DeltaConf {
 
+  // CometConf.register asserts every config has a non-empty category — used for grouping
+  // entries in the generated user-guide docs. "scan" matches the existing core
+  // CATEGORY_SCAN string (CATEGORY_* constants in CometConf are `private val` so contribs
+  // can't reference the symbol; the assertion only checks `nonEmpty`).
+  private val CATEGORY = "scan"
+
   val COMET_DELTA_NATIVE_ENABLED: ConfigEntry[Boolean] =
     ConfigBuilder("spark.comet.scan.deltaNative.enabled")
+      .category(CATEGORY)
       .doc(
         "Whether to enable native Delta table scans via delta-kernel-rs. When enabled, " +
           "Delta tables are read directly through Comet's tuned ParquetSource + " +
@@ -40,6 +47,7 @@ object DeltaConf {
 
   val COMET_DELTA_FALLBACK_ON_UNSUPPORTED_FEATURE: ConfigEntry[Boolean] =
     ConfigBuilder("spark.comet.scan.deltaNative.fallbackOnUnsupportedFeature")
+      .category(CATEGORY)
       .doc(
         "When true (default), the Delta contrib falls back to Spark's Delta reader on " +
           "any Delta protocol feature it doesn't yet support. When false, the contrib " +
@@ -50,6 +58,7 @@ object DeltaConf {
 
   val COMET_DELTA_DATA_FILE_CONCURRENCY_LIMIT: ConfigEntry[Int] =
     ConfigBuilder("spark.comet.scan.deltaNative.dataFileConcurrencyLimit")
+      .category(CATEGORY)
       .doc(
         "Per-Spark-task concurrency when reading Delta data files. Higher values " +
           "improve throughput on tables with many small files at the cost of memory. " +
