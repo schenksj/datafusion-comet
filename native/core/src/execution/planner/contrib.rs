@@ -125,7 +125,7 @@ mod tests {
     /// MAINTENANCE: when adding a new `contrib-<name>` feature to `native/core/Cargo.toml`,
     /// extend the `not(any(...))` predicate below with the new feature name so the
     /// canary still compiles under that contrib's standalone CI matrix entry.
-    #[cfg(not(any(feature = "contrib-example")))]
+    #[cfg(not(any(feature = "contrib-example", feature = "contrib-delta")))]
     #[test]
     fn production_build_has_no_contrib_planners_registered() {
         // Direct read through the SPI's public API. This test is the canary for

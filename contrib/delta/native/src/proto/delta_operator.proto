@@ -1,0 +1,107 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+// Contrib-private proto package. Symbols never collide with core's `spark.spark_operator`
+// or any other contrib's package.
+package comet.contrib.delta;
+
+// Re-uses core's base shared types (SparkStructField, Expr) rather than duplicating them.
+// `prost-build` is configured with `extern_path` (see build.rs) so the generated Rust
+// resolves `spark.spark_operator.SparkStructField` to `datafusion_comet_proto::spark_operator::SparkStructField`
+// and `spark.spark_expression.Expr` to `datafusion_comet_proto::spark_expression::Expr`.
+import "expr.proto";
+import "operator.proto";
+
+// =====================================================================================
+// Messages moved verbatim from core's operator.proto on the delta-kernel-phase-1 branch.
+// Field numbers are preserved so on-the-wire bytes produced by JVM-side serdes that
+// previously wrote `OpStruct.delta_scan` decode cleanly here under the new
+// `OpStruct.contrib_op { kind = "delta-scan", payload = <these bytes> }` envelope.
+// =====================================================================================
+
+// Per-scan invariants. Lives at the head of the operator payload.
+message DeltaScanCommon {
+  // Required schema (projection applied to data schema).
+  repeated spark.spark_operator.SparkStructField required_schema = 1;
+  // Full data schema of the table (on-disk parquet schema).
+  repeated spark.spark_operator.SparkStructField data_schema = 2;
+  // Partition columns (stored in add actions, not in file paths).
+  repeated spark.spark_operator.SparkStructField partition_schema = 3;
+  // Pushed-down data filters (Catalyst translated).
+  repeated spark.spark_expression.Expr data_filters = 4;
+  // Column projection indices into (data_schema ++ partition_schema).
+  repeated int64 projection_vector = 5;
+  string session_timezone = 6;
+  bool case_sensitive = 7;
+  // Cloud storage credentials / options, keyed by Hadoop-style names.
+  map<string, string> object_store_options = 8;
+  // Root path of the Delta table (file:// or s3://...).
+  string table_root = 9;
+  // Optional snapshot version; unset = latest.
+  optional uint64 snapshot_version = 10;
+  // Per-file parallelism knob within a single Spark task.
+  uint32 data_file_concurrency_limit = 11;
+  // Informational label for debug output.
+  string source = 12;
+  // Logical->physical column mapping (column_mapping_mode = id or name).
+  repeated DeltaColumnMapping column_mappings = 13;
+  optional string materialized_row_id_column_name = 14;
+  optional string materialized_row_commit_version_column_name = 15;
+  bool ignore_missing_files = 16;
+}
+
+// Operator payload that the JVM serde wraps in `ContribOp.payload`.
+message DeltaScan {
+  DeltaScanCommon common = 1;
+  repeated DeltaScanTask tasks = 2;
+}
+
+message DeltaScanTask {
+  string file_path = 1;
+  uint64 file_size = 2;
+  optional uint64 record_count = 3;
+  repeated DeltaPartitionValue partition_values = 4;
+  // Pre-materialised deleted row indexes (kernel resolves the DV bitmap on the driver).
+  // Empty = no DV on this file.
+  repeated uint64 deleted_row_indexes = 5;
+  optional int64 base_row_id = 6;
+  optional int64 default_row_commit_version = 7;
+  // File-splitting byte range. Both unset = read whole file.
+  optional uint64 byte_range_start = 8;
+  optional uint64 byte_range_end = 9;
+}
+
+message DeltaPartitionValue {
+  string name = 1;
+  optional string value = 2;
+}
+
+// JNI return value from planDeltaScan -- the list of tasks for a given snapshot.
+message DeltaScanTaskList {
+  uint64 snapshot_version = 1;
+  string table_root = 2;
+  repeated DeltaScanTask tasks = 3;
+  repeated string unsupported_features = 4;
+  repeated DeltaColumnMapping column_mappings = 5;
+}
+
+message DeltaColumnMapping {
+  string logical_name = 1;
+  string physical_name = 2;
+}

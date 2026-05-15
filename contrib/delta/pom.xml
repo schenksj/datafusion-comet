@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.apache.datafusion</groupId>
+    <artifactId>comet-parent-spark${spark.version.short}_${scala.binary.version}</artifactId>
+    <version>0.17.0-SNAPSHOT</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+
+  <!--
+    Deps-only pom for the Delta contrib. `<packaging>pom</packaging>` so this
+    module produces a metadata artifact only (no JAR, no compiled classes).
+    The contrib's Scala/Java sources are compiled INTO comet-spark.jar via the
+    `contrib-delta` Maven profile on spark/pom.xml; the contrib's Rust rlib is
+    linked into libcomet via the matching `contrib-delta` Cargo feature on
+    native/core. This pom exists ONLY to enumerate the external Maven deps the
+    contrib needs at compile time (delta-spark); spark/pom.xml's profile
+    depends on it via `<type>pom</type>` so Maven resolves those deps
+    transitively onto comet-spark's classpath.
+
+    Pinned to delta-spark 3.3.2 / Spark 3.5 for this release. delta-spark is
+    `provided` scope; the user ships delta-spark on their own classpath. We
+    don't bundle.
+  -->
+  <artifactId>comet-contrib-delta-deps-spark${spark.version.short}_${scala.binary.version}</artifactId>
+  <name>comet-contrib-delta-deps</name>
+  <packaging>pom</packaging>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.delta</groupId>
+      <artifactId>delta-spark_${scala.binary.version}</artifactId>
+      <version>3.3.2</version>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
+</project>

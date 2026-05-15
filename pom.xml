@@ -55,6 +55,7 @@ under the License.
       docs/source/contributor-guide/contrib-extensions.md.
     -->
     <module>contrib/example</module>
+    <module>contrib/delta</module>
   </modules>
 
   <properties>

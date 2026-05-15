@@ -469,6 +469,93 @@ under the License.
         </plugins>
       </build>
     </profile>
+
+    <!--
+      Delta contrib (PR2). Mirrors the contrib-example profile shape exactly; bundles
+      delta-spark via the comet-contrib-delta-deps pom, injects the contrib's Scala
+      sources / resources / tests, and generates the contrib's Java proto from the
+      same `delta_operator.proto` schema the Rust side uses. Activating this profile
+      MUST be paired with `cargo build` plus `contrib-delta` Cargo feature so the
+      Rust planner gets linked into libcomet; otherwise the dispatcher returns
+      "No contrib planner registered for kind=delta-scan" at execution time.
+    -->
+    <profile>
+      <id>contrib-delta</id>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.datafusion</groupId>
+          <artifactId>comet-contrib-delta-deps-spark${spark.version.short}_${scala.binary.version}</artifactId>
+          <version>${project.version}</version>
+          <type>pom</type>
+        </dependency>
+      </dependencies>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>add-contrib-delta-source</id>
+                <phase>generate-sources</phase>
+                <goals><goal>add-source</goal></goals>
+                <configuration>
+                  <sources>
+                    <source>../contrib/delta/src/main/scala</source>
+                  </sources>
+                </configuration>
+              </execution>
+              <execution>
+                <id>add-contrib-delta-test-source</id>
+                <phase>generate-test-sources</phase>
+                <goals><goal>add-test-source</goal></goals>
+                <configuration>
+                  <sources>
+                    <source>../contrib/delta/src/test/scala</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-resources-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>copy-contrib-delta-resources</id>
+                <phase>process-resources</phase>
+                <goals><goal>copy-resources</goal></goals>
+                <configuration>
+                  <outputDirectory>${project.build.outputDirectory}</outputDirectory>
+                  <resources>
+                    <resource>
+                      <directory>../contrib/delta/src/main/resources</directory>
+                    </resource>
+                  </resources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>com.github.os72</groupId>
+            <artifactId>protoc-jar-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>generate-contrib-delta-proto</id>
+                <phase>generate-sources</phase>
+                <goals><goal>run</goal></goals>
+                <configuration>
+                  <protocArtifact>com.google.protobuf:protoc:${protobuf.version}</protocArtifact>
+                  <inputDirectories>
+                    <include>../contrib/delta/native/src/proto</include>
+                  </inputDirectories>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
   </profiles>
 
   <build>
