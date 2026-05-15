@@ -17,7 +17,7 @@
 
 //! Driver-side JNI entry point for Delta log replay.
 //!
-//! Exposes `Java_org_apache_comet_Native_planDeltaScan`. The Scala driver
+//! Exposes `Java_org_apache_comet_contrib_delta_Native_planDeltaScan`. The Scala driver
 //! calls this once per query to ask kernel for the active file list at a
 //! given snapshot version, then distributes the returned tasks across
 //! Spark executors via Comet's usual split-mode serialization.
@@ -36,7 +36,7 @@ use datafusion_comet_jni_bridge::errors::{try_unwrap_or_throw, CometError, Comet
 // datafusion_comet_proto::spark_operator).
 use crate::proto::{DeltaPartitionValue, DeltaScanTask, DeltaScanTaskList};
 
-/// `Java_org_apache_comet_Native_planDeltaScan`.
+/// `Java_org_apache_comet_contrib_delta_Native_planDeltaScan`.
 ///
 /// # Arguments (JNI wire order)
 /// 1. `table_url` — absolute URL or bare path of the Delta table root
@@ -54,7 +54,7 @@ use crate::proto::{DeltaPartitionValue, DeltaScanTask, DeltaScanTaskList};
 /// # Safety
 /// Inherently unsafe because it dereferences raw JNI pointers.
 #[no_mangle]
-pub unsafe extern "system" fn Java_org_apache_comet_Native_planDeltaScan(
+pub unsafe extern "system" fn Java_org_apache_comet_contrib_delta_Native_planDeltaScan(
     e: EnvUnowned,
     _class: JClass,
     table_url: JString,
