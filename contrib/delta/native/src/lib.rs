@@ -45,11 +45,22 @@ use comet_contrib_spi::{
 };
 use datafusion::physical_plan::ExecutionPlan;
 
+pub mod dv_filter;
+pub mod engine;
+pub mod error;
+pub mod jni;
+pub mod predicate;
+pub mod scan;
+
 /// Generated proto types for `delta_operator.proto`. `build.rs` writes the module here
 /// at compile time; `src/generated/` is gitignored.
 pub mod proto {
     include!(concat!("generated/", "comet.contrib.delta.rs"));
 }
+
+pub use engine::{create_engine, create_object_store, DeltaStorageConfig};
+pub use error::{DeltaError, DeltaResult};
+pub use scan::{list_delta_files, plan_delta_scan, DeltaFileEntry, DeltaScanPlan};
 
 /// Stable kind identifier for the Delta scan operator. The Scala-side serde writes this
 /// into the `ContribOp.kind` proto field; the native dispatcher looks up the planner by

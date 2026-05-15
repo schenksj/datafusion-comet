@@ -1727,7 +1727,9 @@ dependencies = [
  "prost",
  "prost-build",
  "roaring 0.10.12",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "url",
 ]
 

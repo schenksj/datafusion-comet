@@ -67,5 +67,11 @@ jni = "0.22.4"
 chrono = "0.4"
 chrono-tz = "0.10"
 
+[dev-dependencies]
+# Used by unit tests under #[cfg(test)] in scan.rs to materialise a Delta table
+# in a tempdir without polluting the real filesystem.
+tempfile = "3"
+tokio = { version = "1.39.0", features = ["macros", "rt-multi-thread"] }
+
 [build-dependencies]
 prost-build = "0.14.3"
