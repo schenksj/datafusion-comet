@@ -37,7 +37,7 @@ import org.apache.spark.util.AccumulatorV2
 
 import com.google.common.base.Objects
 
-import org.apache.comet.serde.OperatorOuterClass
+import org.apache.comet.contrib.delta.proto.DeltaOperator
 import org.apache.comet.serde.OperatorOuterClass.Operator
 
 /**
@@ -83,11 +83,14 @@ case class CometDeltaNativeScanExec(
     super.doPrepare()
   }
 
-  @transient private lazy val commonBytes: Array[Byte] =
-    nativeOp.getDeltaScan.getCommon.toByteArray
+  @transient private lazy val commonBytes: Array[Byte] = {
+    // Decode the contrib-private DeltaScan from the ContribOp envelope payload.
+    val envelope = nativeOp.getContribOp
+    DeltaOperator.DeltaScan.parseFrom(envelope.getPayload).getCommon.toByteArray
+  }
 
-  @transient private lazy val allTasks: Seq[OperatorOuterClass.DeltaScanTask] =
-    OperatorOuterClass.DeltaScanTaskList.parseFrom(taskListBytes).getTasksList.asScala.toSeq
+  @transient private lazy val allTasks: Seq[DeltaOperator.DeltaScanTask] =
+    DeltaOperator.DeltaScanTaskList.parseFrom(taskListBytes).getTasksList.asScala.toSeq
 
   /**
    * Synthesise a `Seq[FilePartition]` from this scan's tasks, with each task becoming one
@@ -105,7 +108,8 @@ case class CometDeltaNativeScanExec(
       val pvRow = InternalRow.fromSeq(partitionSchema.fields.toSeq.map { f =>
         val proto = task.getPartitionValuesList.asScala.find(_.getName == f.name)
         val s = if (proto.exists(_.hasValue)) Some(proto.get.getValue) else None
-        org.apache.comet.delta.DeltaReflection.castPartitionString(s, f.dataType, sessionTz)
+        org.apache.comet.contrib.delta.DeltaReflection
+          .castPartitionString(s, f.dataType, sessionTz)
       })
       val sparkPath =
         org.apache.spark.paths.SparkPath.fromUrlString(task.getFilePath)
@@ -141,7 +145,7 @@ case class CometDeltaNativeScanExec(
       Array.empty[Array[Byte]]
     } else {
       packTasks(tasks).map { group =>
-        val builder = OperatorOuterClass.DeltaScan.newBuilder()
+        val builder = DeltaOperator.DeltaScan.newBuilder()
         group.foreach(builder.addTasks)
         builder.build().toByteArray
       }.toArray
@@ -152,15 +156,15 @@ case class CometDeltaNativeScanExec(
   // via CometDeltaNativeScan.createExec into `oneTaskPerPartition`), short-circuit
   // packing so each task gets its own partition. `setInputFileForDeltaScan` reads
   // task[0]'s path; with 1 task per partition that path correctly attributes every row.
-  private def packTasks(tasks: Seq[OperatorOuterClass.DeltaScanTask])
-      : Seq[Seq[OperatorOuterClass.DeltaScanTask]] = {
+  private def packTasks(
+      tasks: Seq[DeltaOperator.DeltaScanTask]): Seq[Seq[DeltaOperator.DeltaScanTask]] = {
     if (oneTaskPerPartition) return tasks.map(t => Seq(t))
     val conf = originalPlan.relation.sparkSession.sessionState.conf
     val openCostInBytes = conf.filesOpenCostInBytes
     val maxPartitionBytes = conf.filesMaxPartitionBytes
     val minPartitionNum = conf.filesMinPartitionNum
       .getOrElse(originalPlan.relation.sparkSession.sparkContext.defaultParallelism)
-    def taskSize(t: OperatorOuterClass.DeltaScanTask): Long = {
+    def taskSize(t: DeltaOperator.DeltaScanTask): Long = {
       if (t.hasByteRangeStart && t.hasByteRangeEnd) {
         math.max(0L, t.getByteRangeEnd - t.getByteRangeStart)
       } else t.getFileSize
@@ -168,8 +172,8 @@ case class CometDeltaNativeScanExec(
     val totalBytes = tasks.map(t => taskSize(t) + openCostInBytes).sum
     val bytesPerCore = totalBytes / math.max(1, minPartitionNum)
     val msb = math.min(maxPartitionBytes, math.max(openCostInBytes, bytesPerCore))
-    val out = scala.collection.mutable.ArrayBuffer[Seq[OperatorOuterClass.DeltaScanTask]]()
-    val current = scala.collection.mutable.ArrayBuffer[OperatorOuterClass.DeltaScanTask]()
+    val out = scala.collection.mutable.ArrayBuffer[Seq[DeltaOperator.DeltaScanTask]]()
+    val current = scala.collection.mutable.ArrayBuffer[DeltaOperator.DeltaScanTask]()
     var currentSize = 0L
     tasks.foreach { task =>
       val size = taskSize(task)
@@ -191,7 +195,7 @@ case class CometDeltaNativeScanExec(
     buildPerPartitionBytes()
 
   private def applyDppFilters(
-      tasks: Seq[OperatorOuterClass.DeltaScanTask]): Seq[OperatorOuterClass.DeltaScanTask] = {
+      tasks: Seq[DeltaOperator.DeltaScanTask]): Seq[DeltaOperator.DeltaScanTask] = {
     // If any DPP subquery is still a `SubqueryAdaptiveBroadcastExec` placeholder,
     // AQE hasn't yet replaced it with the real broadcast plan. We can't execute
     // it ourselves (that plan's `doExecute` throws), so skip pruning for this
@@ -232,7 +236,7 @@ case class CometDeltaNativeScanExec(
         val proto = task.getPartitionValuesList.asScala.find(_.getName == field.name)
         val strValue =
           if (proto.exists(_.hasValue)) Some(proto.get.getValue) else None
-        org.apache.comet.delta.DeltaReflection
+        org.apache.comet.contrib.delta.DeltaReflection
           .castPartitionString(strValue, field.dataType, sessionZoneId)
       })
       predicate.eval(row)
@@ -269,7 +273,7 @@ case class CometDeltaNativeScanExec(
   override lazy val metrics: Map[String, SQLMetric] = {
     val taskList =
       if (taskListBytes != null) {
-        OperatorOuterClass.DeltaScanTaskList.parseFrom(taskListBytes)
+        DeltaOperator.DeltaScanTaskList.parseFrom(taskListBytes)
       } else {
         null
       }
@@ -326,7 +330,7 @@ case class CometDeltaNativeScanExec(
         val broadcastedConf = sparkSession.sparkContext
           .broadcast(new org.apache.spark.util.SerializableConfiguration(hadoopConf))
         val paths = execPerPartitionBytes.flatMap { bytes =>
-          OperatorOuterClass.DeltaScan.parseFrom(bytes).getTasksList.asScala.map(_.getFilePath)
+          DeltaOperator.DeltaScan.parseFrom(bytes).getTasksList.asScala.map(_.getFilePath)
         }.toSeq
         (Some(broadcastedConf), paths)
       } else {
@@ -382,7 +386,7 @@ case class CometDeltaNativeScanExec(
   override def stringArgs: Iterator[Any] = {
     val taskCount =
       if (taskListBytes != null) {
-        OperatorOuterClass.DeltaScanTaskList.parseFrom(taskListBytes).getTasksCount
+        DeltaOperator.DeltaScanTaskList.parseFrom(taskListBytes).getTasksCount
       } else {
         0
       }
@@ -423,7 +427,7 @@ object CometDeltaNativeScanExec {
    * data into a single map entry and one scan inherits the other's file list.
    */
   def computeSourceKey(nativeOp: Operator): String = {
-    val common = nativeOp.getDeltaScan.getCommon
+    val common = DeltaOperator.DeltaScan.parseFrom(nativeOp.getContribOp.getPayload).getCommon
     val components = Seq(
       common.getTableRoot,
       common.getSnapshotVersion.toString,

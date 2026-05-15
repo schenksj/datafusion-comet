@@ -21,6 +21,12 @@ syntax = "proto3";
 // or any other contrib's package.
 package comet.contrib.delta;
 
+// Java-side options. Place generated classes under `org.apache.comet.contrib.delta.proto`
+// so scalastyle import grouping treats them like other Comet imports (rather than as a
+// third-party `comet.*` package, which would trip the import-grouping rule).
+option java_package = "org.apache.comet.contrib.delta.proto";
+option java_outer_classname = "DeltaOperator";
+
 // Re-uses core's base shared types (SparkStructField, Expr) rather than duplicating them.
 // `prost-build` is configured with `extern_path` (see build.rs) so the generated Rust
 // resolves `spark.spark_operator.SparkStructField` to `datafusion_comet_proto::spark_operator::SparkStructField`

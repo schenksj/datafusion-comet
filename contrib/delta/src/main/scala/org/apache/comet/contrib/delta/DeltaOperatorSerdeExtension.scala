@@ -26,19 +26,19 @@ import org.apache.comet.serde.CometOperatorSerde
 import org.apache.comet.spi.CometOperatorSerdeExtension
 
 /**
- * Discovered via `META-INF/services/org.apache.comet.spi.CometOperatorSerdeExtension`.
- * Three SPI surfaces are exercised:
+ * Discovered via `META-INF/services/org.apache.comet.spi.CometOperatorSerdeExtension`. Three SPI
+ * surfaces are exercised:
  *
- *   - `serdes`: class-keyed serde for `CometDeltaNativeScanExec` (the post-conversion
- *     native exec class the contrib defines). Picked up after the native plan is built.
- *   - `matchOperator`: predicate-keyed serde for the `CometScanExec` marker the
- *     contrib's `DeltaScanRuleExtension.transformV1` returns. `CometScanExec` is shared
- *     with core's generic file-scan dispatch, so we can't route on class alone --
- *     `scanImpl == CometDeltaNativeScan.ScanImpl` is the disambiguator.
- *   - `nativeParquetScanImpls`: declares that scans tagged with our scanImpl go through
- *     Comet's tuned ParquetSource. `CometScanExec.supportedDataFilters` consults this
- *     set to decide whether to drop dynamic-pruning filters + IsNull/IsNotNull on
- *     ArrayType columns the same way it does for `SCAN_NATIVE_DATAFUSION`.
+ *   - `serdes`: class-keyed serde for `CometDeltaNativeScanExec` (the post-conversion native exec
+ *     class the contrib defines). Picked up after the native plan is built.
+ *   - `matchOperator`: predicate-keyed serde for the `CometScanExec` marker the contrib's
+ *     `DeltaScanRuleExtension.transformV1` returns. `CometScanExec` is shared with core's generic
+ *     file-scan dispatch, so we can't route on class alone -- `scanImpl ==
+ *     CometDeltaNativeScan.ScanImpl` is the disambiguator.
+ *   - `nativeParquetScanImpls`: declares that scans tagged with our scanImpl go through Comet's
+ *     tuned ParquetSource. `CometScanExec.supportedDataFilters` consults this set to decide
+ *     whether to drop dynamic-pruning filters + IsNull/IsNotNull on ArrayType columns the same
+ *     way it does for `SCAN_NATIVE_DATAFUSION`.
  */
 class DeltaOperatorSerdeExtension extends CometOperatorSerdeExtension {
   override def name: String = "delta"

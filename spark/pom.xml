@@ -546,9 +546,21 @@ under the License.
                 <goals><goal>run</goal></goals>
                 <configuration>
                   <protocArtifact>com.google.protobuf:protoc:${protobuf.version}</protocArtifact>
+                  <!--
+                    The contrib's `delta_operator.proto` imports core's `expr.proto` and
+                    `operator.proto`, so `includeDirectories` points at core's proto dir.
+                    Write to a SEPARATE output dir (`generated-sources-contrib-delta`)
+                    rather than sharing `generated-sources` with the default protoc
+                    execution; the plugin uses presence of an output dir as a cache
+                    marker, and reusing the same dir makes it skip the second execution.
+                  -->
                   <inputDirectories>
                     <include>../contrib/delta/native/src/proto</include>
                   </inputDirectories>
+                  <includeDirectories>
+                    <include>../native/proto/src/proto</include>
+                  </includeDirectories>
+                  <outputDirectory>${project.build.directory}/generated-sources-contrib-delta</outputDirectory>
                 </configuration>
               </execution>
             </executions>

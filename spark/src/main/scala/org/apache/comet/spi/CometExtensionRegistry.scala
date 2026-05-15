@@ -128,16 +128,6 @@ object CometExtensionRegistry extends Logging {
   @volatile private var nativeParquetScanImplsCache: Set[String] = Set.empty
 
   /**
-   * Union of every registered extension's `nativeParquetScanImpls`. Consumed by
-   * `CometScanExec.supportedDataFilters` to decide whether the marker scan's filter set
-   * should get the same native-parquet exclusions as `SCAN_NATIVE_DATAFUSION`. Computed
-   * once at `load()` time; empty until `load()` has run.
-   */
-  def nativeParquetScanImpls: Set[String] = nativeParquetScanImplsCache
-
-  @volatile private var nativeParquetScanImplsCache: Set[String] = Set.empty
-
-  /**
    * Log a warning when two registered contribs claim the same `Class[_ <: SparkPlan]` for serde
    * dispatch. The convention documented in `contrib-extensions.md` is that each contrib defines
    * its own exec class and registers a serde keyed on that class; a collision usually means a

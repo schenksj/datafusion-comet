@@ -349,9 +349,9 @@ object DeltaReflection extends Logging {
       /**
        * The raw `DeletionVectorDescriptor` object (opaque via reflection -- the concrete type is
        * `org.apache.spark.sql.delta.actions.DeletionVectorDescriptor` but we keep it as `AnyRef`
-       * to preserve the no-compile-time-dep-on-spark-delta property). `null` when the AddFile
-       * has no DV. Pass to `materializeDeletedRowIndexes` to convert into a `Array[Long]` of
-       * deleted row indexes.
+       * to preserve the no-compile-time-dep-on-spark-delta property). `null` when the AddFile has
+       * no DV. Pass to `materializeDeletedRowIndexes` to convert into a `Array[Long]` of deleted
+       * row indexes.
        */
       dvDescriptor: AnyRef,
       /**
@@ -488,11 +488,13 @@ object DeltaReflection extends Logging {
         .getConstructor(classOf[org.apache.hadoop.conf.Configuration])
         .newInstance(hadoopConf)
         .asInstanceOf[AnyRef]
-      val readMethod = storeCls.getMethods.find { m =>
-        m.getName == "read" &&
-        m.getParameterCount == 2 &&
-        m.getParameterTypes()(1) == classOf[org.apache.hadoop.fs.Path]
-      }.getOrElse(return None)
+      val readMethod = storeCls.getMethods
+        .find { m =>
+          m.getName == "read" &&
+          m.getParameterCount == 2 &&
+          m.getParameterTypes()(1) == classOf[org.apache.hadoop.fs.Path]
+        }
+        .getOrElse(return None)
       val tablePath = new org.apache.hadoop.fs.Path(tableRoot)
       val bitmap = readMethod.invoke(store, dvDescriptor, tablePath)
       // RoaringBitmapArray.toArray returns Array[Long] of all set bits (= deleted row indexes).
@@ -501,8 +503,7 @@ object DeltaReflection extends Logging {
       Some(indexes)
     } catch {
       case scala.util.control.NonFatal(e) =>
-        logWarning(
-          s"materializeDeletedRowIndexes failed for table $tableRoot: ${e.getMessage}")
+        logWarning(s"materializeDeletedRowIndexes failed for table $tableRoot: ${e.getMessage}")
         None
     }
   }

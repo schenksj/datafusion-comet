@@ -22,11 +22,10 @@ package org.apache.comet.contrib.delta
 import org.apache.comet.{ConfigBuilder, ConfigEntry}
 
 /**
- * Contrib-local config entries for the Delta integration. Lives in the contrib's package
- * rather than in core's `CometConf` so PR1 stays format-agnostic. Side-effect of object
- * construction is registering the entries with `CometConf.allConfs` (via the
- * `ConfigBuilder` machinery), so they show up in the generated user-guide docs and
- * `SQLConf` resolution works the usual way.
+ * Contrib-local config entries for the Delta integration. Lives in the contrib's package rather
+ * than in core's `CometConf` so PR1 stays format-agnostic. Side-effect of object construction is
+ * registering the entries with `CometConf.allConfs` (via the `ConfigBuilder` machinery), so they
+ * show up in the generated user-guide docs and `SQLConf` resolution works the usual way.
  */
 object DeltaConf {
 
@@ -49,11 +48,21 @@ object DeltaConf {
       .booleanConf
       .createWithDefault(true)
 
+  val COMET_DELTA_DATA_FILE_CONCURRENCY_LIMIT: ConfigEntry[Int] =
+    ConfigBuilder("spark.comet.scan.deltaNative.dataFileConcurrencyLimit")
+      .doc(
+        "Per-Spark-task concurrency when reading Delta data files. Higher values " +
+          "improve throughput on tables with many small files at the cost of memory. " +
+          "Values between 2 and 8 are typical.")
+      .intConf
+      .checkValue(v => v > 0, "Data file concurrency limit must be positive")
+      .createWithDefault(1)
+
   /**
    * Relation-options key the contrib reads to know whether the surrounding plan references
    * `input_file_name()` / `input_file_block_*`. When set to `"true"`, the contrib emits
-   * `oneTaskPerPartition = true` on the `CometDeltaNativeScanExec` so packTasks keeps each
-   * task in its own partition and `CometExecRDD.setInputFileForDeltaScan` can set
+   * `oneTaskPerPartition = true` on the `CometDeltaNativeScanExec` so packTasks keeps each task
+   * in its own partition and `CometExecRDD.setInputFileForDeltaScan` can set
    * `InputFileBlockHolder` to the correct path.
    */
   val NeedsInputFileNameOption: String = "comet.contrib.delta.needsInputFileName"

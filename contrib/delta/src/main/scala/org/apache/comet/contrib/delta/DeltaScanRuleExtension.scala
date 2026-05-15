@@ -40,31 +40,31 @@ import org.apache.comet.spi.CometScanRuleExtension
 /**
  * `CometScanRuleExtension` for Delta tables.
  *
- * Three responsibilities, ported from the pre-SPI `delta-kernel-phase-1` branch's
- * in-core `CometScanRule.scala`:
+ * Three responsibilities, ported from the pre-SPI `delta-kernel-phase-1` branch's in-core
+ * `CometScanRule.scala`:
  *
- *   - [[preTransform]] runs `stripDeltaDvWrappers` -- undoes Delta's
- *     `PreprocessTableWithDVs` Catalyst-strategy rewrite for DV-bearing scans so the
- *     clean scan reaches [[transformV1]]. Some scans must stay Spark-native (Delta's
- *     reader synthesises a `__delta_internal_is_row_deleted` column Comet's reader
- *     can't); those are tagged with [[DvProtectedTag]] for `transformV1` to decline.
- *   - [[matchesV1]] probes the relation's file format via reflection (no
- *     compile-time `io.delta.spark` dependency required).
- *   - [[transformV1]] runs `nativeDeltaScan`: schema / encryption / parquet-field-ID
- *     gates, column-mapping metadata re-attachment, row-tracking rewrite, and finally
- *     `CometScanExec(scan, session, CometDeltaNativeScan.ScanImpl)`. [[CometExecRule]]
- *     picks up the marker via [[DeltaOperatorSerdeExtension.matchOperator]] and routes
- *     it through [[CometDeltaNativeScan]].
+ *   - [[preTransform]] runs `stripDeltaDvWrappers` -- undoes Delta's `PreprocessTableWithDVs`
+ *     Catalyst-strategy rewrite for DV-bearing scans so the clean scan reaches [[transformV1]].
+ *     Some scans must stay Spark-native (Delta's reader synthesises a
+ *     `__delta_internal_is_row_deleted` column Comet's reader can't); those are tagged with
+ *     [[DvProtectedTag]] for `transformV1` to decline.
+ *   - [[matchesV1]] probes the relation's file format via reflection (no compile-time
+ *     `io.delta.spark` dependency required).
+ *   - [[transformV1]] runs `nativeDeltaScan`: schema / encryption / parquet-field-ID gates,
+ *     column-mapping metadata re-attachment, row-tracking rewrite, and finally
+ *     `CometScanExec(scan, session, CometDeltaNativeScan.ScanImpl)`. [[CometExecRule]] picks up
+ *     the marker via [[DeltaOperatorSerdeExtension.matchOperator]] and routes it through
+ *     [[CometDeltaNativeScan]].
  *
  * SPI surfaces used:
- *   - `CometScanRule.isSchemaSupported` (private[comet]) -- avoids duplicating ~25
- *     lines of schema check + fallback-reason emission.
+ *   - `CometScanRule.isSchemaSupported` (private[comet]) -- avoids duplicating ~25 lines of
+ *     schema check + fallback-reason emission.
  *   - `CometParquetUtils.{encryptionEnabled, isEncryptionConfigSupported}` -- same.
  *   - `CometSparkSessionExtensions.withInfo` -- same.
  *   - Spark TreeNodeTag for cross-method (preTransform -> transformV1) state passing.
  *
- * The mutable.Set[FileSourceScanExec] of dv-protected scans on the pre-SPI branch is
- * replaced with the TreeNodeTag mechanism, which is the SPI's documented pattern.
+ * The mutable.Set[FileSourceScanExec] of dv-protected scans on the pre-SPI branch is replaced
+ * with the TreeNodeTag mechanism, which is the SPI's documented pattern.
  */
 class DeltaScanRuleExtension extends CometScanRuleExtension {
 
@@ -81,7 +81,7 @@ class DeltaScanRuleExtension extends CometScanRuleExtension {
   // ===========================================================================
 
   override def preTransform(plan: SparkPlan, session: SparkSession): SparkPlan = {
-    if (!CometConf.COMET_DELTA_NATIVE_ENABLED.get()) return plan
+    if (!DeltaConf.COMET_DELTA_NATIVE_ENABLED.get()) return plan
     stripDeltaDvWrappers(plan)
   }
 
@@ -108,9 +108,9 @@ class DeltaScanRuleExtension extends CometScanRuleExtension {
   }
 
   /**
-   * True when the child subtree contains a Delta `FileSourceScanExec` Comet's native path
-   * will not apply the DV on. Two shapes both fall back: `TahoeBatchFileIndex` with
-   * DV-bearing AddFiles, and any Delta scan whose schema already contains the synthetic
+   * True when the child subtree contains a Delta `FileSourceScanExec` Comet's native path will
+   * not apply the DV on. Two shapes both fall back: `TahoeBatchFileIndex` with DV-bearing
+   * AddFiles, and any Delta scan whose schema already contains the synthetic
    * `__delta_internal_is_row_deleted` column.
    */
   private def scanBelowFallsBackForDvs(plan: SparkPlan): Boolean = {
@@ -207,10 +207,10 @@ class DeltaScanRuleExtension extends CometScanRuleExtension {
       session: SparkSession,
       scanExec: FileSourceScanExec,
       r: HadoopFsRelation): Option[SparkPlan] = {
-    if (!CometConf.COMET_DELTA_NATIVE_ENABLED.get()) {
+    if (!DeltaConf.COMET_DELTA_NATIVE_ENABLED.get()) {
       withInfo(
         scanExec,
-        s"Native Delta scan disabled because ${CometConf.COMET_DELTA_NATIVE_ENABLED.key} " +
+        s"Native Delta scan disabled because ${DeltaConf.COMET_DELTA_NATIVE_ENABLED.key} " +
           "is not enabled")
       return None
     }
@@ -222,9 +222,7 @@ class DeltaScanRuleExtension extends CometScanRuleExtension {
     }
     val hadoopConf = r.sparkSession.sessionState.newHadoopConfWithOptions(r.options)
     if (encryptionEnabled(hadoopConf) && !isEncryptionConfigSupported(hadoopConf)) {
-      withInfo(
-        scanExec,
-        s"${CometDeltaNativeScan.ScanImpl} does not support encryption config")
+      withInfo(scanExec, s"${CometDeltaNativeScan.ScanImpl} does not support encryption config")
       return None
     }
     if (!CometScanRule.isSchemaSupported(scanExec, CometDeltaNativeScan.ScanImpl, r)) {
@@ -366,10 +364,10 @@ class DeltaScanRuleExtension extends CometScanRuleExtension {
   }
 
   /**
-   * Returns `Some(Some(plan))` when a row-tracking rewrite was applied, `Some(None)` when
-   * we detected row-tracking columns we can't translate, and `None` when the scan has no
-   * row-tracking columns. Caller uses the outer Option to distinguish
-   * "applied" / "decline" / "no rewrite needed".
+   * Returns `Some(Some(plan))` when a row-tracking rewrite was applied, `Some(None)` when we
+   * detected row-tracking columns we can't translate, and `None` when the scan has no
+   * row-tracking columns. Caller uses the outer Option to distinguish "applied" / "decline" / "no
+   * rewrite needed".
    */
   private def applyRowTrackingRewrite(
       scanExec: FileSourceScanExec,
@@ -480,8 +478,8 @@ class DeltaScanRuleExtension extends CometScanRuleExtension {
     val baseNewOutput = origOutput.map { a =>
       renameMap.get(a.name) match {
         case Some(phys) =>
-          AttributeReference(phys, a.dataType, nullable = true, a.metadata)(
-            qualifier = a.qualifier)
+          AttributeReference(phys, a.dataType, nullable = true, a.metadata)(qualifier =
+            a.qualifier)
         case None => a
       }
     }
@@ -540,9 +538,10 @@ class DeltaScanRuleExtension extends CometScanRuleExtension {
 }
 
 object DeltaScanRuleExtension {
+
   /**
-   * Plan-tree tag attached during `preTransform` to mark `FileSourceScanExec`s whose
-   * native conversion `transformV1` must decline -- Comet's reader can't produce the
+   * Plan-tree tag attached during `preTransform` to mark `FileSourceScanExec`s whose native
+   * conversion `transformV1` must decline -- Comet's reader can't produce the
    * `__delta_internal_is_row_deleted` column the outer DV-filter wrapper requires.
    */
   val DvProtectedTag: TreeNodeTag[Unit] =

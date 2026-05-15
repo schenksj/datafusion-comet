@@ -780,16 +780,10 @@ case class CometScanRule(session: SparkSession)
       case _ => false
     }
 
-<<<<<<< HEAD
-  // private[comet] so contrib extensions (under org.apache.comet.contrib.*) can reuse
-  // the same schema check + fallback-reason emission rather than duplicating the body.
-  private[comet] def isSchemaSupported(
-=======
   // Delegate to the companion object's pure helper so the implementation lives in one
   // place. Kept as a class-level method so existing in-class callers (transformV1Scan,
   // transformV2Scan) compile unchanged.
   private def isSchemaSupported(
->>>>>>> comet-contrib-spi
       scanExec: FileSourceScanExec,
       scanImpl: String,
       r: HadoopFsRelation): Boolean =

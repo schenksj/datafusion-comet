@@ -52,7 +52,7 @@ class RowTrackingAugmentedFileIndex(
     defaultRowCommitVersionColumnName: String)
     extends FileIndex {
 
-  override def rootPaths: scala.collection.Seq[Path] = delegate.rootPaths
+  override def rootPaths: Seq[Path] = delegate.rootPaths
 
   override def inputFiles: Array[String] = delegate.inputFiles
 
@@ -79,8 +79,8 @@ class RowTrackingAugmentedFileIndex(
    * of tasks.
    */
   override def listFiles(
-      partitionFilters: scala.collection.Seq[Expression],
-      dataFilters: scala.collection.Seq[Expression]): scala.collection.Seq[PartitionDirectory] = {
+      partitionFilters: Seq[Expression],
+      dataFilters: Seq[Expression]): Seq[PartitionDirectory] = {
     val underlying = delegate.listFiles(partitionFilters, dataFilters)
     underlying.flatMap { pd =>
       pd.files.map { fileStatus =>
