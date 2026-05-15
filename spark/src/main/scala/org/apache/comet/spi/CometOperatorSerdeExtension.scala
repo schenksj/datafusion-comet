@@ -55,14 +55,15 @@ trait CometOperatorSerdeExtension {
    * Predicate-based dispatch hook for contribs whose serde key cannot be expressed as a unique
    * `SparkPlan` class. The canonical case is the `CometScanExec` marker-with-`scanImpl`-tag
    * pattern: a contrib's `CometScanRuleExtension.transformV1` returns
-   * `CometScanExec(scanExec, session, "native_delta_compat")`, but `CometScanExec` is a case
+   * `CometScanExec(scanExec, session, "my-contrib-tag")`, but `CometScanExec` is a case
    * class shared with core, so a class-keyed map can't disambiguate by the tag. The contrib
    * overrides this method to inspect the plan and return its serde:
    *
    * {{{
+   *   private val MyScanImpl = "native_myformat_compat"   // contrib-local constant
+   *
    *   override def matchOperator(op: SparkPlan): Option[CometOperatorSerde[_]] = op match {
-   *     case s: CometScanExec if s.scanImpl == CometConf.SCAN_NATIVE_DELTA_COMPAT =>
-   *       Some(CometDeltaNativeScan)
+   *     case s: CometScanExec if s.scanImpl == MyScanImpl => Some(CometMyFormatScan)
    *     case _ => None
    *   }
    * }}}
@@ -72,4 +73,21 @@ trait CometOperatorSerdeExtension {
    * extensions' `matchOperator` returns are tried in registration order; the first `Some` wins.
    */
   def matchOperator(op: SparkPlan): Option[CometOperatorSerde[_]] = None
+
+  /**
+   * Declares which `scanImpl` string tags this contrib produces from
+   * `CometScanRuleExtension.transformV1` when using the `CometScanExec(marker, scanImpl=X)`
+   * pattern. Tags listed here get `CometScanExec.supportedDataFilters`'s native-parquet
+   * filter exclusions (drop dynamic pruning + IsNull/IsNotNull on ArrayType columns), the
+   * same treatment `SCAN_NATIVE_DATAFUSION` receives.
+   *
+   * Override only if your contrib uses the marker-class pattern AND your native side goes
+   * through Comet's tuned `ParquetSource`. Contribs that define their own `SparkPlan`
+   * subclass (rather than reusing `CometScanExec`) don't need this; they control filter
+   * selection themselves.
+   *
+   * Example: a Delta contrib that uses `CometScanExec(..., scanImpl="native_delta_compat")`
+   * would override this to `Set("native_delta_compat")`.
+   */
+  def nativeParquetScanImpls: Set[String] = Set.empty
 }

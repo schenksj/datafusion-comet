@@ -71,12 +71,14 @@ object CometExtensionRegistry extends Logging {
     val newScanExts = loadOne[CometScanRuleExtension]("CometScanRuleExtension")
     val newSerdeExts = loadOne[CometOperatorSerdeExtension]("CometOperatorSerdeExtension")
     val newMerged = newSerdeExts.flatMap(_.serdes).toMap
+    val newNativeParquetTags = newSerdeExts.flatMap(_.nativeParquetScanImpls).toSet
     // Publish the @volatile fields BEFORE flipping `loaded` so other threads either see
     // the empty defaults (and may re-enter -- benign, blocked by the monitor) or the
     // fully-populated state (and may skip -- also benign).
     scanExts = newScanExts
     serdeExts = newSerdeExts
     mergedSerdesCache = newMerged
+    nativeParquetScanImplsCache = newNativeParquetTags
     loaded.set(true)
     if (newScanExts.nonEmpty || newSerdeExts.nonEmpty) {
       logInfo(
@@ -113,6 +115,16 @@ object CometExtensionRegistry extends Logging {
   @volatile private var mergedSerdesCache
     : Map[Class[_ <: org.apache.spark.sql.execution.SparkPlan],
       org.apache.comet.serde.CometOperatorSerde[_]] = Map.empty
+
+  /**
+   * Union of every registered extension's `nativeParquetScanImpls`. Consumed by
+   * `CometScanExec.supportedDataFilters` to decide whether the marker scan's filter set
+   * should get the same native-parquet exclusions as `SCAN_NATIVE_DATAFUSION`. Computed
+   * once at `load()` time; empty until `load()` has run.
+   */
+  def nativeParquetScanImpls: Set[String] = nativeParquetScanImplsCache
+
+  @volatile private var nativeParquetScanImplsCache: Set[String] = Set.empty
 
   /**
    * Log a warning when two registered contribs claim the same `Class[_ <: SparkPlan]` for serde
@@ -162,6 +174,7 @@ object CometExtensionRegistry extends Logging {
     scanExts = Seq.empty
     serdeExts = Seq.empty
     mergedSerdesCache = Map.empty
+    nativeParquetScanImplsCache = Set.empty
   }
 
   private def loadOne[T](label: String)(implicit ct: scala.reflect.ClassTag[T]): Seq[T] = {

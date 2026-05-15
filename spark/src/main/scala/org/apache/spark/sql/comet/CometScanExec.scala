@@ -159,11 +159,13 @@ case class CometScanExec(
    * on array columns (see [[isNullCheckOnArrayColumn]]).
    */
   lazy val supportedDataFilters: Seq[Expression] = {
-    // SCAN_NATIVE_DATAFUSION and SCAN_NATIVE_DELTA_COMPAT both go through Comet's
-    // tuned ParquetSource, which has the same filter-pushdown semantics. Iceberg's
-    // native path keeps the full filter set because its predicate evaluator differs.
+    // Contribs that use the CometScanExec marker pattern with their own scanImpl
+    // string can declare that their scan goes through Comet's tuned ParquetSource
+    // (and therefore wants DataFusion-style filter exclusions) by registering the
+    // tag via `CometOperatorSerdeExtension.nativeParquetScanImpls`. Core doesn't
+    // need to know any contrib's marker name; the registry is the source of truth.
     if (scanImpl == CometConf.SCAN_NATIVE_DATAFUSION ||
-      scanImpl == CometConf.SCAN_NATIVE_DELTA_COMPAT) {
+      CometScanExec.contribNativeParquetScanImpls.contains(scanImpl)) {
       dataFilters
         .filterNot(isDynamicPruningFilter)
         .filterNot(isNullCheckOnArrayColumn)
@@ -537,6 +539,17 @@ case class CometScanExec(
 }
 
 object CometScanExec {
+
+  /**
+   * Set of contrib-registered scanImpl tags whose CometScanExec should use Comet's
+   * native-parquet filter exclusion semantics (drop dynamic pruning + IsNull/IsNotNull on
+   * ArrayType columns). Populated lazily from
+   * `CometExtensionRegistry.serdeExtensions.flatMap(_.nativeParquetScanImpls)`. Each access
+   * re-reads the volatile field on `CometExtensionRegistry`; the cost is one HashSet
+   * lookup per CometScanExec construction, which is dwarfed by Spark's own per-plan work.
+   */
+  private[comet] def contribNativeParquetScanImpls: Set[String] =
+    org.apache.comet.spi.CometExtensionRegistry.nativeParquetScanImpls
 
   def apply(
       scanExec: FileSourceScanExec,

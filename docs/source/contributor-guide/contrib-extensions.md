@@ -300,33 +300,39 @@ class, that contrib owns its serde**.
 **Predicate-keyed (marker-class with scanImpl tag)** — required when the contrib uses
 core's `CometScanExec` as a marker disambiguated by a `scanImpl` string. `CometScanExec`
 is a Scala case class shared with core, so two contribs marking different tag values
-on the same class would otherwise collide. Override `matchOperator` instead of
-populating `serdes`:
+on the same class would otherwise collide. Override `matchOperator` instead of (or in
+addition to) populating `serdes`, and declare your tag(s) via `nativeParquetScanImpls`
+if your scan goes through Comet's tuned ParquetSource:
 
 ```scala
-import org.apache.comet.CometConf
-
 class MyFormatSerdeExtension extends CometOperatorSerdeExtension {
   override def name: String = "myformat"
+
+  // Your contrib's scanImpl marker. Pick a stable string; no central registry of these
+  // exists in core, but conventionally contribs use snake-case like "native_<name>_compat".
+  private val MyScanImpl = "native_myformat_compat"
+
   override def matchOperator(op: SparkPlan): Option[CometOperatorSerde[_]] = op match {
-    case s: CometScanExec if s.scanImpl == CometConf.SCAN_NATIVE_DELTA_COMPAT =>
-      Some(CometMyFormatScan)
+    case s: CometScanExec if s.scanImpl == MyScanImpl => Some(CometMyFormatScan)
     case _ => None
   }
+
+  // Tell core's CometScanExec.supportedDataFilters to apply DataFusion-style filter
+  // exclusions to this tag. Required when your scan goes through Comet's tuned
+  // ParquetSource (the same path SCAN_NATIVE_DATAFUSION uses).
+  override def nativeParquetScanImpls: Set[String] = Set(MyScanImpl)
 }
 ```
 
 `CometExecRule` checks `matchOperator` only after the class-keyed `serdes` map misses,
 so the two patterns coexist. Multiple registered extensions' `matchOperator` calls are
-tried in registration order; the first `Some` wins. The Delta contrib uses this pattern
-(it returns `CometScanExec(..., SCAN_NATIVE_DELTA_COMPAT)` from `transformV1`).
+tried in registration order; the first `Some` wins.
 
-The published `SCAN_NATIVE_*` markers live on `CometConf`. If your contrib needs a new
-one, add it there with a brief comment alongside `SCAN_NATIVE_DATAFUSION` /
-`SCAN_NATIVE_ICEBERG_COMPAT` / `SCAN_NATIVE_DELTA_COMPAT`. `CometScanExec.
-supportedDataFilters` keys off this constant set — if your contrib uses Comet's tuned
-ParquetSource (same filter semantics as DataFusion/Delta), add the new tag to that
-check too.
+Core's CometConf defines `SCAN_NATIVE_DATAFUSION` / `SCAN_NATIVE_ICEBERG_COMPAT` for
+core's own scan variants. Contribs are expected to define their own scanImpl strings
+inside their own code (not in `CometConf`); registering via `nativeParquetScanImpls`
+is the SPI hook that lets `CometScanExec.supportedDataFilters` apply the right filter
+treatment without core needing to know the contrib's tag name.
 
 ##### `CometOperatorSerde[T <: SparkPlan]` contract
 
