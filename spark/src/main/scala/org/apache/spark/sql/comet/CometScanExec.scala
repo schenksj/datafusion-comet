@@ -541,12 +541,12 @@ case class CometScanExec(
 object CometScanExec {
 
   /**
-   * Set of contrib-registered scanImpl tags whose CometScanExec should use Comet's
-   * native-parquet filter exclusion semantics (drop dynamic pruning + IsNull/IsNotNull on
-   * ArrayType columns). Populated lazily from
+   * Set of contrib-registered scanImpl tags whose CometScanExec should use Comet's native-parquet
+   * filter exclusion semantics (drop dynamic pruning + IsNull/IsNotNull on ArrayType columns).
+   * Populated lazily from
    * `CometExtensionRegistry.serdeExtensions.flatMap(_.nativeParquetScanImpls)`. Each access
-   * re-reads the volatile field on `CometExtensionRegistry`; the cost is one HashSet
-   * lookup per CometScanExec construction, which is dwarfed by Spark's own per-plan work.
+   * re-reads the volatile field on `CometExtensionRegistry`; the cost is one HashSet lookup per
+   * CometScanExec construction, which is dwarfed by Spark's own per-plan work.
    */
   private[comet] def contribNativeParquetScanImpls: Set[String] =
     org.apache.comet.spi.CometExtensionRegistry.nativeParquetScanImpls
