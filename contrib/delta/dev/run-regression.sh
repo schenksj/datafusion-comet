@@ -54,8 +54,9 @@ case "$DELTA_VERSION" in
     ;;
 esac
 
-COMET_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIFF_FILE="$COMET_ROOT/dev/diffs/delta/${DELTA_VERSION}.diff"
+# Script lives at contrib/delta/dev/run-regression.sh, so COMET_ROOT is three levels up.
+COMET_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+DIFF_FILE="$COMET_ROOT/contrib/delta/dev/diffs/${DELTA_VERSION}.diff"
 DELTA_WORKDIR="${DELTA_WORKDIR:-${TMPDIR:-/tmp}/delta-regression-${DELTA_VERSION}}"
 
 if [[ ! -f "$DIFF_FILE" ]]; then
@@ -108,6 +109,27 @@ else
     "${JAVA_OVERRIDE[@]}"
 fi
 
+# Sync Comet's just-installed artifacts to an ISOLATED publish dir. Pointing SBT
+# directly at ~/.m2/repository/ triggers coursier's sticky-resolver: orphan
+# pom-only entries left over from `mvn dependency:resolve` runs make it look for
+# unrelated transitive JARs (parquet, guava, azure, ...) at local-m2 and refuse
+# to fall through to maven-central. Isolating Comet's artifacts in a dedicated
+# directory means local-comet only matches `org.apache.datafusion:*` -- no
+# orphans to mistake.
+#
+# Hard-coded under /tmp (not $TMPDIR) because the path is also referenced in
+# dev/diffs/delta/<DELTA_VERSION>.diff (build/sbt-config/repositories), which
+# the diff applies into the Delta checkout. macOS's $TMPDIR is per-user under
+# /var/folders/..., so substituting it here would diverge from the diff's
+# literal path.
+COMET_PUBLISH_DIR="${COMET_PUBLISH_DIR:-/tmp/comet-published-${SPARK_SHORT}}"
+echo
+echo "[1.5/4] Syncing Comet artifacts to $COMET_PUBLISH_DIR..."
+rm -rf "$COMET_PUBLISH_DIR"
+mkdir -p "$COMET_PUBLISH_DIR/org/apache/datafusion"
+rsync -a "$HOME/.m2/repository/org/apache/datafusion/" "$COMET_PUBLISH_DIR/org/apache/datafusion/"
+echo "  Published: $(ls -1 "$COMET_PUBLISH_DIR/org/apache/datafusion/" | wc -l | tr -d ' ') Comet modules"
+
 # Step 2: clone Delta (or reuse existing checkout).
 #
 # `git clean -fd` here is intentional and cheap (sub-second): it removes
@@ -137,6 +159,13 @@ git apply "$DIFF_FILE"
 echo
 echo "[4/4] Running tests..."
 export SPARK_LOCAL_IP="${SPARK_LOCAL_IP:-localhost}"
+# Skip Delta's javaunidoc generation. Delta's `configureUnidoc` wires
+# `(Test / test) := (Test / test) dependsOn (Compile / unidoc)`, and the
+# javaunidoc step compiles auto-generated Java stubs from Scala test sources
+# that fail to resolve `org.apache.spark.sql.test.SQLTestData` etc. -- Delta's
+# own gap, not ours. Setting DISABLE_UNIDOC=1 short-circuits the helper
+# (Unidoc.scala line 52) so the test target runs directly.
+export DISABLE_UNIDOC=1
 
 # Delta 4.1.0 mandates Java 17; Comet itself builds fine on 17+. If the user
 # is iterating with a newer JDK on Comet, point this at a JDK 17 install for

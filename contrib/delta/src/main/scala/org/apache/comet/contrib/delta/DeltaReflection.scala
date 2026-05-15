@@ -188,11 +188,20 @@ object DeltaReflection extends Logging {
   def extractMetadataConfiguration(relation: HadoopFsRelation): Option[Map[String, String]] = {
     try {
       val location: Any = relation.location
-      // TahoeFileIndex and variants expose `metadata: Metadata`. Some share a direct field;
-      // CdcAddFileIndex and similar re-expose via `snapshot.metadata`. Try both.
-      val metadataObj = findAccessor(location, Seq("metadata")).orElse {
-        findAccessor(location, Seq("snapshot")).flatMap(findAccessor(_, Seq("metadata")))
-      }
+      // Three-shape lookup. `TahoeBatchFileIndex` exposes only a `SnapshotDescriptor`
+      // (not `Snapshot`), so the `snapshot.metadata` chain misses for it; we walk
+      // `deltaLog.update().metadata` for the case-3 fallback. Keeping this in sync with
+      // `extractSnapshotSchema` below is critical: when CM is enabled and we miss the
+      // config, the contrib doesn't detect column mapping is active and falls back to
+      // logical-name reads on physically-renamed files.
+      val metadataObj: Option[AnyRef] =
+        findAccessor(location, Seq("metadata"))
+          .orElse(findAccessor(location, Seq("snapshot")).flatMap(findAccessor(_, Seq("metadata"))))
+          .orElse {
+            findAccessor(location, Seq("deltaLog")).flatMap { dl =>
+              invokeNoArg(dl, "update").flatMap(findAccessor(_, Seq("metadata")))
+            }
+          }
       metadataObj.flatMap { m =>
         findAccessor(m, Seq("configuration")).collect {
           case scalaMap: Map[_, _] => scalaMap.asInstanceOf[Map[String, String]]
@@ -222,9 +231,26 @@ object DeltaReflection extends Logging {
   def extractSnapshotSchema(relation: HadoopFsRelation): Option[StructType] = {
     try {
       val location: Any = relation.location
-      val metadataObj = findAccessor(location, Seq("metadata")).orElse {
-        findAccessor(location, Seq("snapshot")).flatMap(findAccessor(_, Seq("metadata")))
-      }
+      // Three-shape lookup. `TahoeBatchFileIndex` (UPDATE/DELETE/MERGE post-rewrite and
+      // streaming micro-batches) exposes only a `SnapshotDescriptor` -- not a `Snapshot`,
+      // and the SnapshotDescriptor doesn't expose `Metadata` directly. For those, walk
+      // `deltaLog.update().metadata` (case 3) to get the LATEST snapshot's metadata.
+      // That's also correct for UPDATE/DELETE: those commands re-read the table at commit
+      // time, so the latest snapshot's column-mapping metadata is what governs how the
+      // parquet files we're about to read are interpreted. Without case 3, CM-name tables
+      // that have undergone RENAME COLUMN return wrong values from streaming/UPDATE/DELETE
+      // reads because the contrib falls back to `relation.dataSchema` whose StructField
+      // metadata is stripped by HadoopFsRelation, so `physicalName` is invisible,
+      // `column_mappings` proto stays empty, and the native parquet reader reads by
+      // logical name from a physically-renamed file.
+      val metadataObj: Option[AnyRef] =
+        findAccessor(location, Seq("metadata"))
+          .orElse(findAccessor(location, Seq("snapshot")).flatMap(findAccessor(_, Seq("metadata"))))
+          .orElse {
+            findAccessor(location, Seq("deltaLog")).flatMap { dl =>
+              invokeNoArg(dl, "update").flatMap(findAccessor(_, Seq("metadata")))
+            }
+          }
       metadataObj.flatMap { m =>
         // Delta's Metadata exposes a `schema(): StructType` method that parses its stored JSON
         // schema string. The returned StructType has full metadata preserved at every level.

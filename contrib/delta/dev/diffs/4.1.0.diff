@@ -50,21 +50,22 @@ index 6f16864..e623a08 100644
  
      // Required for testing table features see https://github.com/delta-io/delta/issues/1602
 diff --git a/build/sbt-config/repositories b/build/sbt-config/repositories
-index 2853417..a112394 100644
+index 2853417..62ff4b6 100644
 --- a/build/sbt-config/repositories
 +++ b/build/sbt-config/repositories
-@@ -13,3 +13,11 @@
+@@ -13,3 +13,12 @@
    typesafe-releases: https://repo.typesafe.com/typesafe/releases/
    apache-snapshot: https://repository.apache.org/content/groups/snapshots/
    jitpack: https://jitpack.io
-+  # Comet regression testing: pick up comet-spark-spark4.1 from `mvn install` output.
-+  # Placed LAST so coursier hits maven-central / spark-packages / etc. first and only
-+  # falls through to local-m2 for Comet's snapshot artifacts. Putting it earlier in
-+  # the chain triggers a coursier sticky-resolver behaviour: when an artifact's POM
-+  # is found at local-m2 (even an orphan pom-only leftover from `mvn` runs), coursier
-+  # tries to fetch its JAR from local-m2 too and refuses to fall through — causing
-+  # "file:/Users/.m2/.../foo.jar: not found" on unrelated transitives.
-+  local-m2: file://${user.home}/.m2/repository/
++  # Comet regression testing: dev/run-delta-regression.sh publishes Comet's just-built
++  # artifacts to an ISOLATED dir under $TMPDIR rather than ~/.m2/repository/. Pointing
++  # SBT directly at ~/.m2 triggers a coursier sticky-resolver bug: when an unrelated
++  # transitive (parquet/guava/azure/...) has an orphan pom-only entry in ~/.m2 from a
++  # prior `mvn` run, coursier resolves the POM at local-m2, then refuses to fall
++  # through to maven-central for the JAR — failing the build on artifacts that have
++  # nothing to do with Comet. The isolated dir contains only `org.apache.datafusion:*`
++  # so there are no unrelated POMs to mistakenly match.
++  local-comet: file:///tmp/comet-published-4.1/
 diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/CometSmokeTest.scala b/spark/src/test/scala/org/apache/spark/sql/delta/CometSmokeTest.scala
 new file mode 100644
 index 0000000..013ee98
@@ -180,3 +181,37 @@ index cb28a4f..44a2a37 100644
 +      .set("spark.memory.offHeap.size", "10g")
    }
  }
+diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/test/ScanReportHelper.scala b/spark/src/test/scala/org/apache/spark/sql/delta/test/ScanReportHelper.scala
+index e7c4b90..32246a2 100644
+--- a/spark/src/test/scala/org/apache/spark/sql/delta/test/ScanReportHelper.scala
++++ b/spark/src/test/scala/org/apache/spark/sql/delta/test/ScanReportHelper.scala
+@@ -44,6 +44,11 @@ trait ScanReportHelper extends SharedSparkSession with AdaptiveSparkPlanHelper {
+     collectWithSubqueries(plan)({
+       case fs: FileSourceScanExec => Seq(fs)
+       case cached: InMemoryTableScanExec => collectScans(cached.relation.cacheBuilder.cachedPlan)
++      // Comet regression: Comet rewrites `FileSourceScanExec` into its own leaf
++      // variants. Tests that inspect scan metrics would otherwise see an empty
++      // list and fail with `MatchError: ArrayBuffer()`.
++      case c: org.apache.spark.sql.comet.CometScanExec => Seq(c.wrapped)
++      case c: org.apache.spark.sql.comet.CometDeltaNativeScanExec => Seq(c.originalPlan)
+     }).flatten
+   }
+ 
+diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/test/TestsStatistics.scala b/spark/src/test/scala/org/apache/spark/sql/delta/test/TestsStatistics.scala
+index 93c7da9..755fae9 100644
+--- a/spark/src/test/scala/org/apache/spark/sql/delta/test/TestsStatistics.scala
++++ b/spark/src/test/scala/org/apache/spark/sql/delta/test/TestsStatistics.scala
+@@ -79,6 +79,13 @@ trait TestsStatistics  { self: DeltaSQLTestUtils =>
+       case f: FileSourceScanExec => Some(f)
+       case InputAdapter(f: FileSourceScanExec) => Some(f)
+       case ColumnarToRowExec(InputAdapter(f: FileSourceScanExec)) => Some(f)
++      // Comet regression: unwrap the Comet scan variants Comet's rules produce in
++      // place of Spark's `FileSourceScanExec`. Tests that search for the scan in
++      // the executed plan (e.g. to read its metrics) are otherwise blind to them.
++      case c: org.apache.spark.sql.comet.CometScanExec => Some(c.wrapped)
++      case c: org.apache.spark.sql.comet.CometDeltaNativeScanExec => Some(c.originalPlan)
++      case org.apache.spark.sql.comet.CometNativeColumnarToRowExec(inner) =>
++        unapply(inner)
+       case _ => None
+     }
+   }

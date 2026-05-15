@@ -19,9 +19,12 @@
 
 package org.apache.comet.contrib.delta
 
-import org.apache.spark.sql.comet.{CometDeltaNativeScanExec, CometScanExec}
+import org.apache.spark.TaskContext
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.comet.{CometDeltaNativeScanExec, CometExecRDD, CometScanExec, DeltaInputFileBlockHolder}
 import org.apache.spark.sql.execution.SparkPlan
 
+import org.apache.comet.contrib.delta.proto.DeltaOperator
 import org.apache.comet.serde.CometOperatorSerde
 import org.apache.comet.spi.CometOperatorSerdeExtension
 
@@ -40,7 +43,7 @@ import org.apache.comet.spi.CometOperatorSerdeExtension
  *     whether to drop dynamic-pruning filters + IsNull/IsNotNull on ArrayType columns the same
  *     way it does for `SCAN_NATIVE_DATAFUSION`.
  */
-class DeltaOperatorSerdeExtension extends CometOperatorSerdeExtension {
+class DeltaOperatorSerdeExtension extends CometOperatorSerdeExtension with Logging {
   override def name: String = "delta"
 
   override def serdes: Map[Class[_ <: SparkPlan], CometOperatorSerde[_]] =
@@ -53,4 +56,52 @@ class DeltaOperatorSerdeExtension extends CometOperatorSerdeExtension {
   }
 
   override def nativeParquetScanImpls: Set[String] = Set(CometDeltaNativeScan.ScanImpl)
+
+  /**
+   * Register the executor-side per-partition metadata handler. Wired through PR1's generic
+   * SPI on `CometExecRDD` so core stays format-agnostic. The handler populates Spark's
+   * `InputFileBlockHolder` from the per-partition `DeltaScan` payload so:
+   *   - `input_file_name()` returns the file path Delta committed (not empty),
+   *   - Delta's `_metadata.file_path` resolves to the AddFile its UPDATE/DELETE/MERGE
+   *     `getTouchedFile` lookup expects (otherwise: `DELTA_FILE_TO_OVERWRITE_NOT_FOUND`).
+   *
+   * Conventions the handler honors:
+   *   - No-op when the partition has no plan data, or when no key's payload parses as a
+   *     `DeltaScan` proto with at least one task (another contrib may own the key).
+   *   - Each Delta partition reads exactly one file when `input_file_name()` is requested
+   *     (the rule's `oneTaskPerPartition` path), so reading the first task is correct.
+   *   - Registers a `TaskCompletionListener` to `unset()` the holder so the value doesn't
+   *     leak into subsequent tasks on the same executor thread.
+   */
+  override def init(): Unit = {
+    CometExecRDD.registerPartitionMetadataHandler(
+      DeltaOperatorSerdeExtension.setInputFileForDeltaScan)
+  }
+}
+
+object DeltaOperatorSerdeExtension extends Logging {
+  private[delta] def setInputFileForDeltaScan(
+      planDataByKey: Map[String, Array[Byte]],
+      context: TaskContext): Unit = {
+    if (planDataByKey.isEmpty) return
+    planDataByKey.values.view
+      .flatMap { bytes =>
+        try {
+          val scan = DeltaOperator.DeltaScan.parseFrom(bytes)
+          if (scan.getTasksCount > 0) {
+            val t = scan.getTasks(0)
+            Some((t.getFilePath, t.getFileSize))
+          } else None
+        } catch {
+          // Parse failure is expected on partitions owned by another contrib whose proto
+          // shape doesn't match -- silently skip. Debug-logging it would be too noisy in
+          // a session that has multiple contribs registered.
+          case _: Throwable => None
+        }
+      }
+      .headOption
+      .foreach { case (filePath, fileSize) =>
+        DeltaInputFileBlockHolder.set(filePath, fileSize, context)
+      }
+  }
 }
