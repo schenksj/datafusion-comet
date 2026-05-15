@@ -780,7 +780,9 @@ case class CometScanRule(session: SparkSession)
       case _ => false
     }
 
-  private def isSchemaSupported(
+  // private[comet] so contrib extensions (under org.apache.comet.contrib.*) can reuse
+  // the same schema check + fallback-reason emission rather than duplicating the body.
+  private[comet] def isSchemaSupported(
       scanExec: FileSourceScanExec,
       scanImpl: String,
       r: HadoopFsRelation): Boolean = {
