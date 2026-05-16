@@ -93,7 +93,8 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
   // sets InputFileBlockHolder to the correct path and Spark's JVM-side
   // input_file_name() evaluation (no native serde exists) returns the right
   // value.
-  private def scanNeedsInputFileName(scan: CometScanExec): Boolean =
+  /** Visible to `DeltaOperatorSerdeExtension.matchOperator` for routing decisions. */
+  private[delta] def scanNeedsInputFileName(scan: CometScanExec): Boolean =
     scan.relation.options
       .get(DeltaConf.NeedsInputFileNameOption)
       .contains("true")

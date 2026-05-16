@@ -21,7 +21,7 @@ package org.apache.comet.contrib.delta
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.comet.{CometDeltaNativeScanExec, CometExecRDD, CometScanExec, DeltaInputFileBlockHolder}
+import org.apache.spark.sql.comet.{CometDeltaNativeScanExec, CometExecRDD, CometScanExec, DeltaInputFileBlockHolder, DeltaPlanDataInjector, PlanDataInjector}
 import org.apache.spark.sql.execution.SparkPlan
 
 import org.apache.comet.contrib.delta.proto.DeltaOperator
@@ -76,6 +76,7 @@ class DeltaOperatorSerdeExtension extends CometOperatorSerdeExtension with Loggi
   override def init(): Unit = {
     CometExecRDD.registerPartitionMetadataHandler(
       DeltaOperatorSerdeExtension.setInputFileForDeltaScan)
+    PlanDataInjector.registerInjector(DeltaPlanDataInjector)
   }
 }
 
