@@ -46,8 +46,13 @@ import org.apache.comet.spi.CometOperatorSerdeExtension
 class DeltaOperatorSerdeExtension extends CometOperatorSerdeExtension with Logging {
   override def name: String = "delta"
 
-  override def serdes: Map[Class[_ <: SparkPlan], CometOperatorSerde[_]] =
-    Map(classOf[CometDeltaNativeScanExec] -> CometDeltaNativeScan)
+  // No class-keyed serdes. The marker `CometScanExec(scanImpl=native_delta_compat)` is the only
+  // shape that needs serde dispatch (handled by `matchOperator` below); the post-conversion
+  // `CometDeltaNativeScanExec` is already a `CometNativeExec` and is preserved by core's
+  // `case _: CometPlan` arm in `CometExecRule.convertNode`. Registering the post-conversion exec
+  // here would cause re-dispatch with the wrong static type at `getSupportLevel(operator: T)`
+  // (T = CometScanExec) and crash with ClassCastException.
+  override def serdes: Map[Class[_ <: SparkPlan], CometOperatorSerde[_]] = Map.empty
 
   override def matchOperator(op: SparkPlan): Option[CometOperatorSerde[_]] = op match {
     case s: CometScanExec if s.scanImpl == CometDeltaNativeScan.ScanImpl =>
