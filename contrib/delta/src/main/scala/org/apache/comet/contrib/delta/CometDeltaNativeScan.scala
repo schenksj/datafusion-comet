@@ -544,9 +544,24 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // would pick the wrong child. Manifested as "Invalid comparison Utf8 <= Int32"
     // on `b.d > 0` (d is INT, ordinal 0 in pruned `b: struct<d>`, but ordinal 0
     // in the file struct is `c` STRING). #79 fix 2026-05-13.
-    val requiredSchemaFields =
-      if (columnMappingActive) scan.requiredSchema.fields.map(physicaliseRequiredField)
-      else scan.requiredSchema.fields
+    // `requiredSchema` on the wire is the SCAN's output schema -- i.e. data columns the
+    // scan reads from parquet PLUS partition columns it materialises from
+    // PartitionedFile.partition_values. Upstream operators in the native plan tree bind
+    // their column references by index into this schema. For non-partitioned tables
+    // `scan.requiredSchema` is the whole output already; for partitioned tables Spark
+    // gives us just the data half here, so we append the partition fields at the tail to
+    // match the layout indices in `projection_vector` resolve into.
+    val partitionFieldsForRequired: Array[StructField] = {
+      val haveLc = scan.requiredSchema.fields.map(_.name.toLowerCase(Locale.ROOT)).toSet
+      relation.partitionSchema.fields.filterNot(f =>
+        haveLc.contains(f.name.toLowerCase(Locale.ROOT)))
+    }
+    val requiredSchemaFields = {
+      val base =
+        if (columnMappingActive) scan.requiredSchema.fields.map(physicaliseRequiredField)
+        else scan.requiredSchema.fields
+      base ++ partitionFieldsForRequired
+    }
     val physicalFileDataSchemaFields = if (columnMappingActive) {
       val requiredByName = requiredSchemaFields
         .map(f => f.name.toLowerCase(Locale.ROOT) -> f)
@@ -625,10 +640,29 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     }
     if (scan.conf.getConf(SQLConf.PARQUET_FILTER_PUSHDOWN_ENABLED) &&
       CometConf.COMET_RESPECT_PARQUET_FILTER_PUSHDOWN.get(scan.conf)) {
+      // Partition columns are NOT in the file's data schema; the native parquet path
+      // evaluates pushed-down filters against the file-data schema only, so a filter
+      // that references a partition column would resolve to an out-of-bounds Bound
+      // index ("Column index N is out of bound. Schema: Field {<file-data-fields>}").
+      // Spark normally separates `partitionFilters` from `dataFilters` at planning
+      // time, but `scan.supportedDataFilters` can still surface filters that touch
+      // both data + partition columns (or pure-partition filters when the optimizer
+      // didn't peel them off cleanly). Skip any filter that references a partition
+      // attribute; partition pruning is handled separately by `prunePartitions`
+      // driver-side via the kernel/AddFile path.
+      val partitionNamesLc: Set[String] =
+        relation.partitionSchema.fields.map(_.name.toLowerCase(Locale.ROOT)).toSet
+      def referencesPartitionColumn(e: Expression): Boolean = e.exists {
+        case a: org.apache.spark.sql.catalyst.expressions.AttributeReference =>
+          partitionNamesLc.contains(a.name.toLowerCase(Locale.ROOT))
+        case _ => false
+      }
       val dataFilters = new ListBuffer[Expr]()
       scan.supportedDataFilters.foreach { filter =>
         if (referencesNestedAccess(filter)) {
           logInfo(s"CometDeltaNativeScan: skipping pushdown of nested-access filter $filter")
+        } else if (referencesPartitionColumn(filter)) {
+          logInfo(s"CometDeltaNativeScan: skipping pushdown of partition-column filter $filter")
         } else {
           exprToProto(filter, scan.output) match {
             case Some(proto) => dataFilters += proto
