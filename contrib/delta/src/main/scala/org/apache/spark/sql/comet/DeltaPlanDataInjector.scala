@@ -59,11 +59,8 @@ object DeltaPlanDataInjector extends PlanDataInjector {
     scan.getTasksCount == 0
   }
 
-  override def getKey(op: Operator): Option[String] = {
-    // Mirror `CometDeltaNativeScanExec.computeSourceKey` so the driver-side key and the
-    // executor-side lookup key match exactly.
+  override def getKey(op: Operator): Option[String] =
     Some(CometDeltaNativeScanExec.computeSourceKey(op))
-  }
 
   override def inject(
       op: Operator,
@@ -72,16 +69,8 @@ object DeltaPlanDataInjector extends PlanDataInjector {
     // `commonBytes` is the `DeltaScanCommon`'s bytes; the contrib doesn't actually send a
     // separate common payload per partition (the planning-time `ContribOp.payload` already
     // carries the common block in full). `partitionBytes` is the serialized `DeltaScan` that
-    // packs only this partition's tasks plus the same common block. Merge by taking the
-    // partition's payload verbatim and re-wrapping it in the ContribOp envelope.
-    //
-    // Note: the partition payload is a full `DeltaScan` (with `common` set) rather than a
-    // tasks-only proto. This matches how `CometDeltaNativeScanExec.serializedPartitionData`
-    // builds it -- the buildPerPartitionBytes routine emits a `DeltaScan.newBuilder()` per
-    // partition, sets `tasks` for that partition, but does NOT carry the heavy common block
-    // again to avoid duplicating the schemas across partitions. So the partition proto is
-    // tasks-only on the wire; we have to splice the original `common` back in here before
-    // handing to native.
+    // packs only this partition's tasks (no common block) to avoid duplicating schemas across
+    // partitions. Splice the partition's tasks into the original common-only envelope.
     val tasksOnlyScan = DeltaOperator.DeltaScan.parseFrom(partitionBytes)
     val originalEnvelope = op.getContribOp
     val originalScan = DeltaOperator.DeltaScan.parseFrom(originalEnvelope.getPayload)

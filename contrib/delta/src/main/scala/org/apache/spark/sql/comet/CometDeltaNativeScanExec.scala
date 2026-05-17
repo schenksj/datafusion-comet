@@ -68,7 +68,17 @@ case class CometDeltaNativeScanExec(
      * plan references `input_file_name()` / `input_file_block_*`.
      */
     oneTaskPerPartition: Boolean = false)
-    extends CometLeafExec {
+    extends CometLeafExec
+    with PlanDataSource {
+
+  // PlanDataSource SPI: lets `CometNativeExec.findAllPlanData` discover this scan's
+  // per-partition payload generically (no core-side class enumeration). Without this,
+  // a Delta scan nested under any non-leaf Comet operator (CometProject, CometFilter, ...)
+  // would have its per-partition tasks dropped at `injectPlanData` lookup time and the
+  // native side would decode a tasks-empty `DeltaScan` -> `EmptyExec` -> 0 rows.
+  override def planDataSourceKey: String = sourceKey
+  override def planDataCommonBytes: Array[Byte] = commonData
+  override def planDataPerPartitionBytes: Array[Array[Byte]] = perPartitionData
 
   override val supportsColumnar: Boolean = true
 
