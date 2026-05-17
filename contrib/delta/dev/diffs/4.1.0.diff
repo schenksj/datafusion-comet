@@ -215,3 +215,18 @@ index 93c7da9..755fae9 100644
        case _ => None
      }
    }
+diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSuite.scala b/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSuite.scala
+--- a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSuite.scala
++++ b/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSuite.scala
+@@ -118,6 +118,11 @@
+       val query = spark.read.format("delta").load(testPath).where("part = 1")
+       val fileScans = query.queryExecution.executedPlan.collect {
+         case f: FileSourceScanExec => f
++        // Comet regression: Comet's planner replaces `FileSourceScanExec` with
++        // `CometDeltaNativeScanExec`. Its `metrics` map aliases `numFiles` to the
++        // post-pruning task count so this assertion exercises the same partition-skip
++        // semantics from the Comet path.
++        case c: org.apache.spark.sql.comet.CometDeltaNativeScanExec => c
+       }
+ 
+       // Force the query to read files and generate metrics
