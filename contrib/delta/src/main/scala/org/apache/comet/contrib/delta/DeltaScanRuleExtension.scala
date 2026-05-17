@@ -22,7 +22,7 @@ package org.apache.comet.contrib.delta
 import java.util.Locale
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Attribute, AttributeReference, Coalesce, EqualTo, Expression, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Attribute, AttributeReference, Coalesce, EqualTo, Expression, InputFileBlockLength, InputFileBlockStart, InputFileName, Literal}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.comet.CometScanExec
 import org.apache.spark.sql.execution.{FileSourceScanExec, FilterExec, ProjectExec, SparkPlan}
@@ -200,7 +200,29 @@ class DeltaScanRuleExtension extends CometScanRuleExtension {
         "Leaving scan to Delta so its DV filter above can apply deletion vectors")
       return None
     }
-    nativeDeltaScan(session, scanExec, scanExec.relation)
+    // Detect references to `input_file_name()` / `input_file_block_*` anywhere in the
+    // surrounding plan tree. When present, the contrib's serde MUST emit one task per
+    // partition so `CometExecRDD`'s per-partition `InputFileBlockHolder` hook attributes
+    // every row to the correct file path. Delta's UPDATE/DELETE/MERGE flows use
+    // `input_file_name()` to find "touched files"; without this tag, multiple files
+    // packed into one Spark partition share the FIRST task's file path, and Delta
+    // rewrites the wrong files (or fails to find rows to rewrite at all). Triggered by
+    // tests like `UpdateBaseMiscTests "data and partition predicates -
+    // Partition=true Skipping=false"` which has multiple files in one partition.
+    val needsInputFileName = plan.exists { node =>
+      node.expressions.exists(_.exists {
+        case _: InputFileName | _: InputFileBlockStart | _: InputFileBlockLength => true
+        case _ => false
+      })
+    }
+    val scanForDelta = if (needsInputFileName) {
+      val taggedOptions = scanExec.relation.options +
+        (DeltaConf.NeedsInputFileNameOption -> "true")
+      val taggedRelation = scanExec.relation.copy(options = taggedOptions)(
+        scanExec.relation.sparkSession)
+      scanExec.copy(relation = taggedRelation)
+    } else scanExec
+    nativeDeltaScan(session, scanForDelta, scanForDelta.relation)
   }
 
   private def nativeDeltaScan(
