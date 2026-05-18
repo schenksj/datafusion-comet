@@ -98,8 +98,15 @@ JAVA_OVERRIDE=(
 )
 if [[ -n "${FAST:-}" ]]; then
   echo "  FAST=1: skipping spotless/RAT/javadoc/source-jar plugins"
+  # Override `jni.dir` -> `native/target/release` because Comet's parent pom defaults it
+  # to `native/target/debug`. The non-FAST path implicitly fixes this via `-Prelease`,
+  # but FAST=1 drops that profile (it pulls in shade/javadoc), so without this override
+  # mvn bundles a stale debug-tree dylib and contrib-delta's `#[ctor]` planner registration
+  # silently goes missing -- every Delta scan then fails with "No contrib planner
+  # registered for ContribOp.kind=delta-scan" at runtime.
   ./mvnw install -DskipTests -Pspark-"$SPARK_SHORT" -Pcontrib-delta \
     "${JAVA_OVERRIDE[@]}" \
+    -Djni.dir="$COMET_ROOT/native/target/release" \
     -Dspotless.check.skip=true \
     -Drat.skip=true \
     -Dmaven.javadoc.skip=true \
