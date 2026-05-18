@@ -102,6 +102,7 @@ impl ContribPlannerContext for CorePlannerContext<'_> {
             params.encryption_enabled,
             params.use_field_id,
             params.ignore_missing_field_id,
+            params.ignore_missing_files,
         )
         .map(|e| e as Arc<dyn ExecutionPlan>)
         .map_err(|e| ContribError::Plan(format!("init_datasource_exec: {e}")))

@@ -180,11 +180,6 @@ impl ContribOperatorPlanner for DeltaScanPlanner {
         let (object_store_url, _root_path) =
             ctx.prepare_object_store(one_file, &object_store_options)?;
 
-        // ignore_missing_files: Delta-specific flag (true when user has set
-        // `spark.sql.files.ignoreMissingFiles=true`). Not exposed through the SPI's
-        // ParquetDatasourceParams today; deferred until a real-world need surfaces.
-        let _ignore_missing_files = common.ignore_missing_files;
-
         let params = ParquetDatasourceParams::new(
             Arc::clone(&required_schema),
             object_store_url,
@@ -195,7 +190,8 @@ impl ContribOperatorPlanner for DeltaScanPlanner {
         .with_projection_vector(projection_vector)
         .with_data_filters(data_filters?)
         .with_session_timezone(common.session_timezone.clone())
-        .with_case_sensitive(common.case_sensitive);
+        .with_case_sensitive(common.case_sensitive)
+        .with_ignore_missing_files(common.ignore_missing_files);
         let delta_exec = ctx.build_parquet_datasource_exec(params)?;
 
         // Wrap in a DV filter when any partition has a DV. Skip the wrapper otherwise

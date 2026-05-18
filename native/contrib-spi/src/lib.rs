@@ -105,6 +105,13 @@ pub struct ParquetDatasourceParams {
     pub encryption_enabled: bool,
     pub use_field_id: bool,
     pub ignore_missing_field_id: bool,
+    /// When true, files that fail to open with a NotFound error are silently
+    /// skipped (their contribution to the scan is an empty stream). Matches
+    /// Spark's `spark.sql.files.ignoreMissingFiles=true` semantics. Used by the
+    /// Delta contrib to honour `spark.databricks.delta.files.ignoreMissingFiles`
+    /// when files have been deleted between snapshot planning and task execution
+    /// (e.g. concurrent vacuum).
+    pub ignore_missing_files: bool,
 }
 
 impl ParquetDatasourceParams {
@@ -131,6 +138,7 @@ impl ParquetDatasourceParams {
             encryption_enabled: false,
             use_field_id: false,
             ignore_missing_field_id: false,
+            ignore_missing_files: false,
         }
     }
 
@@ -178,6 +186,10 @@ impl ParquetDatasourceParams {
     }
     pub fn with_ignore_missing_field_id(mut self, b: bool) -> Self {
         self.ignore_missing_field_id = b;
+        self
+    }
+    pub fn with_ignore_missing_files(mut self, b: bool) -> Self {
+        self.ignore_missing_files = b;
         self
     }
 }

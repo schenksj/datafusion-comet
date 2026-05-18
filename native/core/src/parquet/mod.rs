@@ -29,6 +29,7 @@ pub mod read;
 pub mod schema_adapter;
 
 mod cast_column;
+mod missing_file_tolerant;
 mod objectstore;
 
 use std::collections::HashMap;
@@ -518,6 +519,9 @@ pub unsafe extern "system" fn Java_org_apache_comet_parquet_Native_initRecordBat
             // The iceberg-compat path resolves IDs in the JVM via NativeBatchReader,
             // so the native side does not need to do field-ID matching here.
             false,
+            false,
+            // ignore_missing_files: iceberg-compat scan doesn't honour Spark's
+            // ignoreMissingFiles flag today; opt out by default.
             false,
         )?;
 

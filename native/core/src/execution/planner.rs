@@ -1377,6 +1377,11 @@ impl PhysicalPlanner {
                     common.encryption_enabled,
                     common.use_field_id,
                     common.ignore_missing_field_id,
+                    // Comet's core native_datafusion scan path doesn't surface
+                    // Spark's ignoreMissingFiles to the proto today; opt out by
+                    // default. Contribs that need it (e.g. Delta) wire through
+                    // ParquetDatasourceParams::with_ignore_missing_files.
+                    false,
                 )?;
                 Ok((
                     vec![],
