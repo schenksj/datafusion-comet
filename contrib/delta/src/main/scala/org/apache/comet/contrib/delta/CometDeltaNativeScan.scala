@@ -182,19 +182,30 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       } else if (protoFilters.size == 1) {
         protoFilters.head.toByteArray
       } else {
-        // Combine multiple filters into AND(f1, AND(f2, ...))
-        val combined = protoFilters.reduceLeft { (acc, f) =>
-          val and = ExprOuterClass.BinaryExpr
-            .newBuilder()
-            .setLeft(acc)
-            .setRight(f)
-            .build()
-          Expr
-            .newBuilder()
-            .setAnd(and)
-            .build()
+        // Combine filters into a balanced AND tree (depth O(log N) instead of
+        // O(N)). A linear left-deep fold overflows protobuf's default 100-level
+        // recursion limit for plans with many ANDed conditions (Delta data
+        // skipping predicates routinely build deep stats expressions: e.g.
+        // DataSkippingDeltaTests "remove redundant stats column references").
+        // Both the JVM serde (CometNativeColumnarToRowExec re-parses the plan
+        // for explain output) and the Rust prost decoder are subject to that
+        // limit, so balancing the tree fixes both sides.
+        def balancedAnd(slice: IndexedSeq[Expr]): Expr = {
+          if (slice.size == 1) {
+            slice.head
+          } else {
+            val mid = slice.size / 2
+            val left = balancedAnd(slice.slice(0, mid))
+            val right = balancedAnd(slice.slice(mid, slice.size))
+            val and = ExprOuterClass.BinaryExpr
+              .newBuilder()
+              .setLeft(left)
+              .setRight(right)
+              .build()
+            Expr.newBuilder().setAnd(and).build()
+          }
         }
-        combined.toByteArray
+        balancedAnd(protoFilters.toIndexedSeq).toByteArray
       }
     }
 
