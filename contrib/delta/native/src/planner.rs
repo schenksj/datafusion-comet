@@ -363,8 +363,16 @@ fn parse_delta_partition_scalar(
             use chrono::{DateTime, NaiveDateTime, TimeZone};
             use chrono_tz::Tz;
             if tz_opt.is_none() {
+                // Delta TypeWidening DATE -> TIMESTAMP_NTZ leaves the original DATE
+                // partition strings ("YYYY-MM-DD") in place; the column type changes
+                // but the AddFile partition value bytes do not. Accept the date-only
+                // form by promoting it to midnight, matching Spark's cast semantics.
                 let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
                     .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+                    .or_else(|_| {
+                        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                            .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                    })
                     .map_err(|e| format!("cannot parse TIMESTAMP_NTZ '{s}': {e}"))?;
                 let micros = chrono::Utc.from_utc_datetime(&naive).timestamp_micros();
                 return Ok(match unit {
@@ -390,8 +398,13 @@ fn parse_delta_partition_scalar(
             {
                 dt_with_tz.timestamp_micros()
             } else {
+                // Same DATE -> TIMESTAMP widening fallback as the NTZ branch above.
                 let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
                     .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+                    .or_else(|_| {
+                        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                            .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                    })
                     .map_err(|e| format!("cannot parse timestamp '{s}': {e}"))?;
                 use chrono::{FixedOffset, LocalResult};
                 fn parse_fixed_offset(s: &str) -> Option<FixedOffset> {
