@@ -68,8 +68,7 @@ private[comet] trait PlanDataInjector {
 
   /**
    * Which `OpStructCase` this injector cares about. Used by `injectPlanData` for an O(1)
-   * pre-filter so we don't run every injector's `canInject` against every operator in the
-   * tree.
+   * pre-filter so we don't run every injector's `canInject` against every operator in the tree.
    */
   def opStructCase: Operator.OpStructCase
 

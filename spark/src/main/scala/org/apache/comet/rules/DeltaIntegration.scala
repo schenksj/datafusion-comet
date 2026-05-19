@@ -29,23 +29,23 @@ import org.apache.comet.serde.CometOperatorSerde
 /**
  * Reflection-based bridge to the optional `contrib/delta/` integration.
  *
- * On default builds the contrib classes don't exist on the classpath, so the
- * reflective class lookups fail and every method here returns the "not handled"
- * sentinel. On builds compiled with `-Pcontrib-delta` (Maven) +
- * `--features contrib-delta` (Cargo), the contrib classes are present and the
- * lookups resolve, dispatching the call into the contrib helpers.
+ * On default builds the contrib classes don't exist on the classpath, so the reflective class
+ * lookups fail and every method here returns the "not handled" sentinel. On builds compiled with
+ * `-Pcontrib-delta` (Maven) + `--features contrib-delta` (Cargo), the contrib classes are present
+ * and the lookups resolve, dispatching the call into the contrib helpers.
  *
- * Keeping this bridge as one small file in core lets the Delta detection block
- * in `CometScanRule` and the serde dispatch in `CometExecRule` stay ~10 lines
- * each -- exactly the shape Parth's review on #4339 asked for.
+ * Keeping this bridge as one small file in core lets the Delta detection block in `CometScanRule`
+ * and the serde dispatch in `CometExecRule` stay ~10 lines each -- exactly the shape Parth's
+ * review on #4339 asked for.
  *
- * No `SPI`, no `ServiceLoader`, no registry: the contrib provides its own
- * static helper objects with stable names; this bridge just calls them.
+ * No `SPI`, no `ServiceLoader`, no registry: the contrib provides its own static helper objects
+ * with stable names; this bridge just calls them.
  */
 object DeltaIntegration {
 
   private val ScanRuleClass = "org.apache.comet.contrib.delta.DeltaScanRule"
   private val SerdeClass = "org.apache.comet.contrib.delta.CometDeltaNativeScan"
+
   /** scanImpl tag the contrib stamps on CometScanExec markers it produces. */
   val DeltaScanImpl: String = "native_delta_compat"
 
@@ -82,14 +82,12 @@ object DeltaIntegration {
   def isAvailable: Boolean = scanRuleCls.isDefined
 
   /**
-   * Delegate the V1 scan transform to the Delta contrib when both
-   *   (a) the contrib is on the classpath, AND
-   *   (b) the relation's file format is `DeltaParquetFileFormat`.
+   * Delegate the V1 scan transform to the Delta contrib when both (a) the contrib is on the
+   * classpath, AND (b) the relation's file format is `DeltaParquetFileFormat`.
    *
-   * Returns `Some(plan)` if the contrib handled the scan (either with a
-   * transformed `CometScanExec` marker or by explicitly declining via the
-   * `withInfo` path); `None` to indicate "not a Delta scan, proceed with the
-   * vanilla CometScanRule path".
+   * Returns `Some(plan)` if the contrib handled the scan (either with a transformed
+   * `CometScanExec` marker or by explicitly declining via the `withInfo` path); `None` to
+   * indicate "not a Delta scan, proceed with the vanilla CometScanRule path".
    */
   // Cached reflective binding: resolved once per JVM. The contrib's
   // `transformV1IfDelta` is invoked for every V1 scan in every plan, even
@@ -137,11 +135,10 @@ object DeltaIntegration {
   }
 
   /**
-   * The Delta scan handler, resolved via reflection from the contrib's
-   * `CometDeltaNativeScan` companion object. Returns `None` when the contrib
-   * isn't bundled into this build. `CometExecRule` calls this and passes the
-   * result through the standard `convertToComet(scan, handler)` path so the
-   * Delta scan flows through the same code as `CometNativeScan` etc.
+   * The Delta scan handler, resolved via reflection from the contrib's `CometDeltaNativeScan`
+   * companion object. Returns `None` when the contrib isn't bundled into this build.
+   * `CometExecRule` calls this and passes the result through the standard `convertToComet(scan,
+   * handler)` path so the Delta scan flows through the same code as `CometNativeScan` etc.
    */
   def scanHandler: Option[CometOperatorSerde[CometScanExec]] = serdeCls.flatMap { cls =>
     try {

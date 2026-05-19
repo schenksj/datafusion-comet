@@ -36,14 +36,14 @@ object ShimSparkErrorConverter {
   val ObjectLocationPattern: Regex = "Object at location (.+?) not found".r
 
   /**
-   * Wrap a native parquet failure (e.g. "Parquet error: Invalid Parquet file. Corrupt
-   * footer") in the FAILED_READ_FILE.NO_HINT SparkException Spark itself produces when
-   * its own parquet reader fails. Matches what Spark/Delta tests assert on (e.g.
-   * SnapshotManagementSuite "should not recover when the current checkpoint is broken"
-   * asserts the message contains "Encountered error while reading file" + the path).
+   * Wrap a native parquet failure (e.g. "Parquet error: Invalid Parquet file. Corrupt footer") in
+   * the FAILED_READ_FILE.NO_HINT SparkException Spark itself produces when its own parquet reader
+   * fails. Matches what Spark/Delta tests assert on (e.g. SnapshotManagementSuite "should not
+   * recover when the current checkpoint is broken" asserts the message contains "Encountered
+   * error while reading file" + the path).
    *
-   * File path is queried from Spark's `InputFileBlockHolder` thread-local. Falls back
-   * to an empty string when not set; the static phrasing still passes the assertion.
+   * File path is queried from Spark's `InputFileBlockHolder` thread-local. Falls back to an empty
+   * string when not set; the static phrasing still passes the assertion.
    */
   def wrapNativeParquetError(
       cause: Throwable,
