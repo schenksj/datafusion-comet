@@ -220,6 +220,18 @@ object DeltaReflection extends Logging {
   /** StructField metadata key under which Delta stores the column-mapping physical name. */
   val PhysicalNameMetadataKey: String = "delta.columnMapping.physicalName"
 
+  /** StructField metadata key under which Delta stores the column-mapping field ID (CM-id mode). */
+  val FieldIdMetadataKey: String = "delta.columnMapping.id"
+
+  /**
+   * StructField metadata key under which Spark+parquet store a field ID. Matches
+   * arrow-rs's `PARQUET_FIELD_ID_META_KEY`, which is what Comet's native schema_adapter
+   * looks for when `use_field_id=true`. To match the file's field IDs against the Spark
+   * schema we copy from Delta's `delta.columnMapping.id` to this key before serializing
+   * to native.
+   */
+  val ParquetFieldIdMetadataKey: String = "PARQUET:field_id"
+
   /**
    * Extract the Delta table's Snapshot-level schema (`Metadata.schema()` in Delta terms) via
    * reflection. Unlike the `relation.dataSchema` we get from Spark -- which has its StructField

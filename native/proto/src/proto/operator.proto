@@ -305,6 +305,11 @@ message DeltaScanCommon {
   // When true the DataSourceExec swallows object-store NotFound errors as empty
   // streams; matches Spark's `spark.sql.files.ignoreMissingFiles=true` semantics.
   bool ignore_missing_files = 16;
+  // When true the native parquet reader matches Spark schema fields to parquet
+  // file fields by `PARQUET:field_id` metadata rather than by name. Used by
+  // Delta tables with `delta.columnMapping.mode = id` (the contrib copies
+  // `delta.columnMapping.id` to `PARQUET:field_id` on each schema field).
+  bool use_field_id = 17;
 }
 
 // Operator payload for a Delta scan.

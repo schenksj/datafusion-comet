@@ -205,7 +205,7 @@ impl PhysicalPlanner {
             false, // return_null_struct_if_all_fields_missing
             self.session_ctx(),
             false, // encryption_enabled (Delta tables we natively support are unencrypted)
-            false, // use_field_id
+            common.use_field_id,
             false, // ignore_missing_field_id
             common.ignore_missing_files,
         )?;

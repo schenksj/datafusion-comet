@@ -102,6 +102,50 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
   // sets InputFileBlockHolder to the correct path and Spark's JVM-side
   // input_file_name() evaluation (no native serde exists) returns the right
   // value.
+  /**
+   * Translate Delta's `delta.columnMapping.id` metadata key to Spark+parquet's standard
+   * `parquet.field.id` key on every StructField at every level of nesting. Required for
+   * column-mapping `id` mode: Delta writes parquet files with `PARQUET:field_id` metadata
+   * (i.e. the same field IDs it stores in its own metadata), but Spark's
+   * `ParquetUtils.hasFieldId` -- and therefore Comet's serialisers -- only look at
+   * `parquet.field.id`. Without this translation, `use_field_id=true` would still find
+   * no IDs on the Spark schema and silently degrade to name-based matching.
+   *
+   * Top-level field metadata gets the new entry merged in via `MetadataBuilder`; nested
+   * StructTypes recurse; ArrayType and MapType walk into their element/key/value types.
+   * Fields without `delta.columnMapping.id` are passed through unchanged (e.g. partition
+   * columns, synthetic row-index columns, struct-leaf fields the metadata strip elided).
+   */
+  private[delta] def translateDeltaFieldIdToParquet(field: StructField): StructField = {
+    val newDataType = translateDataTypeFieldIds(field.dataType)
+    val newMetadata =
+      if (field.metadata.contains(DeltaReflection.FieldIdMetadataKey) &&
+        !field.metadata.contains(DeltaReflection.ParquetFieldIdMetadataKey)) {
+        val fieldId = field.metadata.getLong(DeltaReflection.FieldIdMetadataKey)
+        new org.apache.spark.sql.types.MetadataBuilder()
+          .withMetadata(field.metadata)
+          .putLong(DeltaReflection.ParquetFieldIdMetadataKey, fieldId)
+          .build()
+      } else field.metadata
+    StructField(field.name, newDataType, field.nullable, newMetadata)
+  }
+
+  private def translateDataTypeFieldIds(
+      dt: org.apache.spark.sql.types.DataType): org.apache.spark.sql.types.DataType =
+    dt match {
+      case s: StructType => StructType(s.fields.map(translateDeltaFieldIdToParquet))
+      case a: org.apache.spark.sql.types.ArrayType =>
+        org.apache.spark.sql.types.ArrayType(
+          translateDataTypeFieldIds(a.elementType),
+          a.containsNull)
+      case m: org.apache.spark.sql.types.MapType =>
+        org.apache.spark.sql.types.MapType(
+          translateDataTypeFieldIds(m.keyType),
+          translateDataTypeFieldIds(m.valueType),
+          m.valueContainsNull)
+      case other => other
+    }
+
   /** Visible to `DeltaOperatorSerdeExtension.matchOperator` for routing decisions. */
   private[delta] def scanNeedsInputFileName(scan: CometScanExec): Boolean =
     scan.relation.options
@@ -739,12 +783,39 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       }
     } else fileDataSchemaFields
 
-    val dataSchema = schema2Proto(physicalFileDataSchemaFields)
-    val requiredSchema = schema2Proto(requiredSchemaFields)
-    val partitionSchema = schema2Proto(relation.partitionSchema.fields)
+    // Column-mapping `id` mode: Delta stores the parquet field ID on every
+    // StructField (at every level of nesting) under
+    // `delta.columnMapping.id`. Spark's `ParquetUtils.hasFieldId` (used by
+    // `schema2Proto` and the StructType arm of `serializeDataType`) reads from
+    // `parquet.field.id`. Walk the schema tree and translate keys so the
+    // native side -- when `use_field_id=true` -- matches Spark schema fields
+    // to parquet file fields by ID instead of by name.
+    val cmModeIsId = DeltaReflection
+      .extractMetadataConfiguration(relation)
+      .flatMap(_.get("delta.columnMapping.mode"))
+      .exists(_.equalsIgnoreCase("id"))
+    val dataSchemaForProto =
+      if (cmModeIsId) {
+        physicalFileDataSchemaFields.map(
+          CometDeltaNativeScan.translateDeltaFieldIdToParquet)
+      } else physicalFileDataSchemaFields
+    val requiredSchemaForProto =
+      if (cmModeIsId) {
+        requiredSchemaFields.map(CometDeltaNativeScan.translateDeltaFieldIdToParquet)
+      } else requiredSchemaFields
+    val partitionSchemaForProto =
+      if (cmModeIsId) {
+        relation.partitionSchema.fields.map(
+          CometDeltaNativeScan.translateDeltaFieldIdToParquet)
+      } else relation.partitionSchema.fields
+
+    val dataSchema = schema2Proto(dataSchemaForProto)
+    val requiredSchema = schema2Proto(requiredSchemaForProto)
+    val partitionSchema = schema2Proto(partitionSchemaForProto)
     commonBuilder.addAllDataSchema(dataSchema.toIterable.asJava)
     commonBuilder.addAllRequiredSchema(requiredSchema.toIterable.asJava)
     commonBuilder.addAllPartitionSchema(partitionSchema.toIterable.asJava)
+    commonBuilder.setUseFieldId(cmModeIsId)
 
     // Projection vector maps output positions to (file_data_schema ++ partition_schema)
     // indices. Spark's `FileSourceScanExec` splits its visible schema into

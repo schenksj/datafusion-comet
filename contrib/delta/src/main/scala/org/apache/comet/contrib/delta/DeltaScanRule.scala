@@ -268,13 +268,10 @@ object DeltaScanRule {
     val cmMode = DeltaReflection
       .extractMetadataConfiguration(r)
       .flatMap(_.get("delta.columnMapping.mode"))
-    if (cmMode.exists(_.equalsIgnoreCase("id"))) {
-      withInfo(
-        scanExec,
-        s"${CometDeltaNativeScan.ScanImpl} does not support Delta column-mapping 'id' mode " +
-          "(parquet field-ID resolution required)")
-      return None
-    }
+    // Column mapping `id` mode is now wired: `CometDeltaNativeScan.convert` translates
+    // Delta's `delta.columnMapping.id` -> `parquet.field.id` on every StructField and
+    // sets `DeltaScanCommon.use_field_id = true`, which routes the native parquet reader
+    // through `schema_adapter.rs` field-ID matching. No gate needed.
     if (cmMode.exists(_.equalsIgnoreCase("name")) &&
       !session.sessionState.conf
         .getConfString("spark.databricks.delta.checkLatestSchemaOnRead", "true")
