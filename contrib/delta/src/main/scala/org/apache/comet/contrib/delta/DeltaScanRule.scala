@@ -279,6 +279,20 @@ object DeltaScanRule {
       !session.sessionState.conf
         .getConfString("spark.databricks.delta.checkLatestSchemaOnRead", "true")
         .equalsIgnoreCase("true")) {
+      // Load-bearing: Delta's `checkLatestSchemaOnRead` flag validates that the user's
+      // cached DataFrame schema is compatible with the latest snapshot's schema. Disabling
+      // it lets the user proceed with a potentially-stale schema view of the table.
+      //
+      // For CM-`name` reads we serialize a `column_mappings` vec derived from the snapshot
+      // we resolve at planning time (`DeltaReflection.extractSnapshotVersion`), and parquet
+      // files we read may carry physical column names from a *different* snapshot. With the
+      // schema-on-read check ON, Delta enforces consistency before we ever see the scan;
+      // with it OFF, we could end up serializing mappings from snapshot N while the parquet
+      // files reference physical names from snapshot N+1 (e.g. after a concurrent ALTER
+      // TABLE rename). Result: wrong-column reads.
+      //
+      // Fall back to Spark's Delta reader, which has its own per-file schema resolution
+      // that handles this case correctly.
       withInfo(
         scanExec,
         s"${CometDeltaNativeScan.ScanImpl} declines CM-name reads when " +
