@@ -1492,6 +1492,31 @@ impl PhysicalPlanner {
                     )),
                 ))
             }
+            OpStruct::DeltaScan(_scan) => {
+                // Delta Lake scan -- handled by the optional `contrib/delta/` integration.
+                // The dispatcher arm exists unconditionally so a default build that receives
+                // a Delta-shaped plan from a misconfigured driver gets a clear error instead
+                // of a "no match" decode failure. The body is feature-gated; subsequent
+                // commits will fill in the `contrib-delta`-enabled branch by delegating to
+                // `comet_contrib_delta`.
+                #[cfg(not(feature = "contrib-delta"))]
+                {
+                    Err(GeneralError(
+                        "Received a DeltaScan operator but core was built without the \
+                         `contrib-delta` Cargo feature. Rebuild with \
+                         `cargo build --features contrib-delta` to enable Delta Lake support."
+                            .into(),
+                    ))
+                }
+                #[cfg(feature = "contrib-delta")]
+                {
+                    // TODO(contrib-delta): wire to `comet_contrib_delta::plan_delta_scan`
+                    // once the implementation lands.
+                    Err(GeneralError(
+                        "comet-contrib-delta: planner not yet implemented".into(),
+                    ))
+                }
+            }
             OpStruct::ShuffleWriter(writer) => {
                 assert_eq!(children.len(), 1);
                 let (scans, shuffle_scans, child) =
