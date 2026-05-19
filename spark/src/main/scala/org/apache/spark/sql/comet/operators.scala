@@ -594,6 +594,20 @@ abstract class CometNativeExec extends CometExec {
         // Unified RDD creation - CometExecRDD handles all cases
         val subqueries = collectSubqueries(this)
         val hasScanInput = sparkPlans.exists(_.isInstanceOf[CometNativeScanExec])
+        // Collect per-partition file paths from any CometNativeScanExec leaves so
+        // CometExecIterator can populate FAILED_READ_FILE.NO_HINT exceptions with
+        // the actual path. Multiple scans (joins) get concatenated per partition.
+        val perPartitionFilePaths: Array[Seq[String]] = {
+          val scans = sparkPlans.collect { case s: CometNativeScanExec => s }
+          if (scans.isEmpty) Array.empty[Seq[String]]
+          else {
+            val perScan = scans.map(_.perPartitionFilePaths)
+            val n = firstNonBroadcastPlanNumPartitions
+            (0 until n).map { idx =>
+              perScan.flatMap { arr => if (arr.length > idx) arr(idx) else Seq.empty }.toSeq
+            }.toArray
+          }
+        }
         new CometExecRDD(
           sparkContext,
           inputs.toSeq,
@@ -606,7 +620,8 @@ abstract class CometNativeExec extends CometExec {
           subqueries,
           broadcastedHadoopConfForEncryption,
           encryptedFilePaths,
-          shuffleScanIndices) {
+          shuffleScanIndices,
+          perPartitionFilePaths = perPartitionFilePaths) {
           override def compute(
               split: Partition,
               context: TaskContext): Iterator[ColumnarBatch] = {

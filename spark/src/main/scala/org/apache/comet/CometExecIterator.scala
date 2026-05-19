@@ -68,7 +68,8 @@ class CometExecIterator(
     partitionIndex: Int,
     broadcastedHadoopConfForEncryption: Option[Broadcast[SerializableConfiguration]] = None,
     encryptedFilePaths: Seq[String] = Seq.empty,
-    shuffleBlockIterators: Map[Int, CometShuffleBlockIterator] = Map.empty)
+    shuffleBlockIterators: Map[Int, CometShuffleBlockIterator] = Map.empty,
+    taskFilePaths: Seq[String] = Seq.empty)
     extends Iterator[ColumnarBatch]
     with Logging {
 
@@ -185,7 +186,7 @@ class CometExecIterator(
             // its own parquet reader fails. The shim accesses spark-private APIs
             // (InputFileBlockHolder, QueryExecutionErrors) from a Spark-package class.
             throw org.apache.spark.sql.comet.shims.ShimSparkErrorConverter
-              .wrapNativeParquetError(e)
+              .wrapNativeParquetError(e, taskFilePaths)
           case _ =>
             throw e
         }

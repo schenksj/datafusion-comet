@@ -45,14 +45,26 @@ object ShimSparkErrorConverter {
    * File path is queried from Spark's `InputFileBlockHolder` thread-local. Falls back
    * to an empty string when not set; the static phrasing still passes the assertion.
    */
-  def wrapNativeParquetError(cause: Throwable): Throwable = {
-    val filePath =
+  def wrapNativeParquetError(
+      cause: Throwable,
+      taskFilePaths: Seq[String] = Seq.empty): Throwable = {
+    // Prefer the per-task file list threaded in from CometExecIterator (set by
+    // CometExecRDD via CometNativeExec/CometNativeScanExec collecting file paths from
+    // any scan leaves in the plan). Comet's native scan path does NOT go through
+    // Spark's FileScanRDD, so InputFileBlockHolder is typically not populated. Fall
+    // back to InputFileBlockHolder for any path that does set it. Tests like
+    // SnapshotManagementSuite assert the error message contains the file path, so an
+    // accurate path here is load-bearing.
+    val filePath = if (taskFilePaths.nonEmpty) {
+      taskFilePaths.mkString(",")
+    } else {
       try {
         val p = org.apache.spark.rdd.InputFileBlockHolder.getInputFilePath
         if (p == null) "" else p.toString
       } catch {
         case _: Throwable => ""
       }
+    }
     QueryExecutionErrors.cannotReadFilesError(cause, filePath)
   }
 }

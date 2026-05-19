@@ -156,7 +156,8 @@ case class CometNativeScanExec(
    * all files for all partitions in the driver, we serialize only common metadata (once) and each
    * partition's files (lazily, as tasks are scheduled).
    */
-  @transient private lazy val serializedPartitionData: (Array[Byte], Array[Array[Byte]]) = {
+  @transient private lazy val serializedPartitionData
+      : (Array[Byte], Array[Array[Byte]], Array[Seq[String]]) = {
     // Outer partitionFilters (wrapper) DPP is resolved by Spark's standard
     // prepare -> waitForSubqueries lifecycle, triggered explicitly via
     // CometLeafExec.ensureSubqueriesResolved called from
@@ -227,12 +228,20 @@ case class CometNativeScanExec(
       partitionNativeScan.toByteArray
     }.toArray
 
-    (commonBytes, perPartitionBytes)
+    // File paths per partition -- threaded through CometExecRDD to CometExecIterator
+    // so wrapNativeParquetError can populate FAILED_READ_FILE.NO_HINT exceptions with
+    // the actual file path. CometNativeScanExec bypasses Spark's FileScanRDD, so the
+    // standard InputFileBlockHolder thread-local isn't set.
+    val perPartitionPaths = filePartitions.map(_.files.map(_.filePath.toString).toSeq).toArray
+
+    (commonBytes, perPartitionBytes, perPartitionPaths)
   }
 
   def commonData: Array[Byte] = serializedPartitionData._1
 
   def perPartitionData: Array[Array[Byte]] = serializedPartitionData._2
+
+  def perPartitionFilePaths: Array[Seq[String]] = serializedPartitionData._3
 
   override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val nativeMetrics = CometMetricNode.fromCometPlan(this)
@@ -261,7 +270,8 @@ case class CometNativeScanExec(
       nativeMetrics,
       Seq.empty,
       broadcastedHadoopConfForEncryption,
-      encryptedFilePaths) {
+      encryptedFilePaths,
+      perPartitionFilePaths = perPartitionFilePaths) {
       override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
         val res = super.compute(split, context)
 
