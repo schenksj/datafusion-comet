@@ -163,6 +163,15 @@ case class CometScanRule(session: SparkSession)
 
     scanExec.relation match {
       case r: HadoopFsRelation =>
+        // Try the optional Delta contrib first. When this build wasn't compiled with
+        // `-Pcontrib-delta`, the bridge returns None and we fall through to the
+        // vanilla scan path. When the Delta classes are on the classpath, the contrib
+        // either claims the scan (returning a CometScanExec marker) or declines via
+        // its own `withInfo` fallback message.
+        DeltaIntegration.transformV1IfDelta(plan, session, scanExec, r) match {
+          case Some(handled) => return handled
+          case None => // proceed with vanilla logic
+        }
         if (!CometScanExec.isFileFormatSupported(r.fileFormat)) {
           return withInfo(scanExec, s"Unsupported file format ${r.fileFormat}")
         }
