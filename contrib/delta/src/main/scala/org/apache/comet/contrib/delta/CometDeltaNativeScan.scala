@@ -108,6 +108,136 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       .get(DeltaConf.NeedsInputFileNameOption)
       .contains("true")
 
+  /**
+   * Reflectively resolve Hadoop's AWSCredentialProviderList for an s3/s3a URI and merge
+   * the resulting (access, secret, optional token) triple into `baseOptions` under the
+   * standard `fs.s3a.access.key` / `fs.s3a.secret.key` / `fs.s3a.session.token` keys --
+   * the same keys `NativeConfig.extractObjectStoreOptions` would have picked up if the
+   * user had set them explicitly in `core-site.xml`.
+   *
+   * Reflection is intentional: `hadoop-aws` is an optional dep; on a default Comet
+   * deployment without S3 support on the classpath, `Class.forName` fails and we return
+   * the base options unchanged. Non-s3/s3a URIs return base options unchanged too --
+   * Azure / GCS / OSS resolve their own credential chains in kernel-rs's object_store
+   * (or via the static keys already in `baseOptions`).
+   *
+   * Skip when the user has already set explicit static keys (don't overwrite an explicit
+   * config with a resolved IAM-instance token).
+   *
+   * If reflection succeeds but credential resolution fails (e.g. IMDS unreachable, no
+   * provider configured), log a warning and return `baseOptions` -- the engine will
+   * still try anonymous access or surface a clearer error than a silent crash on first
+   * S3 read.
+   */
+  // Cached reflective binding for the S3A credential chain. Resolved once per JVM.
+  // The whole augment path is invoked on every Delta scan -- without caching, each scan
+  // pays a Class.forName + getMethod round-trip just to find the bridge available.
+  //
+  // `None` means we tried once and failed (hadoop-aws not on classpath, signature drift,
+  // etc.) -- subsequent calls short-circuit.
+  private case class S3ACredentialBinding(
+      createProviderList: java.lang.reflect.Method,
+      getCredentials: java.lang.reflect.Method,
+      getAccessKey: java.lang.reflect.Method,
+      getSecretKey: java.lang.reflect.Method,
+      sessionCredsCls: Option[Class[_]],
+      getSessionToken: Option[java.lang.reflect.Method])
+
+  @volatile private var s3aCredentialBindingCache: Option[Option[S3ACredentialBinding]] = None
+
+  private def s3aCredentialBinding: Option[S3ACredentialBinding] =
+    s3aCredentialBindingCache.getOrElse {
+      val binding = try {
+        // scalastyle:off classforname
+        val utilsCls = Class.forName("org.apache.hadoop.fs.s3a.S3AUtils")
+        // scalastyle:on classforname
+        val createMethod = utilsCls.getMethod(
+          "createAWSCredentialProviderList",
+          classOf[java.net.URI],
+          classOf[org.apache.hadoop.conf.Configuration])
+        // Resolve the provider-list + credentials methods off the runtime classes
+        // returned by createAWSCredentialProviderList. Method.invoke walks subclasses, so
+        // a one-time lookup on the declared return / argument types is enough.
+        val providerListCls = createMethod.getReturnType
+        val getCredentialsMethod = providerListCls.getMethod("getCredentials")
+        val credentialsCls = getCredentialsMethod.getReturnType
+        val getAccessKeyMethod = credentialsCls.getMethod("getAWSAccessKeyId")
+        val getSecretKeyMethod = credentialsCls.getMethod("getAWSSecretKey")
+        val (sessionCredsCls, getSessionTokenMethod) = try {
+          // scalastyle:off classforname
+          val cls = Class.forName("com.amazonaws.auth.AWSSessionCredentials")
+          // scalastyle:on classforname
+          (Some(cls), Some(cls.getMethod("getSessionToken")))
+        } catch { case _: ClassNotFoundException => (None, None) }
+        Some(
+          S3ACredentialBinding(
+            createMethod,
+            getCredentialsMethod,
+            getAccessKeyMethod,
+            getSecretKeyMethod,
+            sessionCredsCls,
+            getSessionTokenMethod))
+      } catch {
+        // hadoop-aws not on classpath, or signature drift -- mark as unavailable for the
+        // rest of the JVM's lifetime.
+        case _: ClassNotFoundException => None
+        case _: NoSuchMethodException => None
+        case scala.util.control.NonFatal(e) =>
+          logWarning(
+            s"S3A credential-chain reflection lookup failed; falling back to static-only " +
+              s"keys in Delta log replay: ${e.getMessage}",
+            e)
+          None
+      }
+      s3aCredentialBindingCache = Some(binding)
+      binding
+    }
+
+  private[delta] def augmentWithResolvedAwsCredentials(
+      baseOptions: Map[String, String],
+      tableRootUri: java.net.URI,
+      hadoopConf: org.apache.hadoop.conf.Configuration): Map[String, String] = {
+    val scheme = Option(tableRootUri.getScheme).map(_.toLowerCase).getOrElse("")
+    if (scheme != "s3" && scheme != "s3a") return baseOptions
+    if (baseOptions.contains("fs.s3a.access.key") &&
+      baseOptions.contains("fs.s3a.secret.key")) {
+      return baseOptions
+    }
+    s3aCredentialBinding match {
+      case None => baseOptions // hadoop-aws not available; nothing to resolve
+      case Some(binding) =>
+        try {
+          val providerList = binding.createProviderList.invoke(null, tableRootUri, hadoopConf)
+          val credentials = binding.getCredentials.invoke(providerList)
+          val accessKey = binding.getAccessKey.invoke(credentials)
+          val secretKey = binding.getSecretKey.invoke(credentials)
+          val sessionToken: Option[String] = (binding.sessionCredsCls, binding.getSessionToken) match {
+            case (Some(cls), Some(m)) if cls.isInstance(credentials) =>
+              Option(m.invoke(credentials)).map(_.toString)
+            case _ => None
+          }
+          val resolved = scala.collection.mutable.Map[String, String]() ++= baseOptions
+          Option(accessKey).map(_.toString).filter(_.nonEmpty).foreach { ak =>
+            resolved("fs.s3a.access.key") = ak
+          }
+          Option(secretKey).map(_.toString).filter(_.nonEmpty).foreach { sk =>
+            resolved("fs.s3a.secret.key") = sk
+          }
+          sessionToken.filter(_.nonEmpty).foreach { st =>
+            resolved("fs.s3a.session.token") = st
+          }
+          resolved.toMap
+        } catch {
+          case scala.util.control.NonFatal(e) =>
+            logWarning(
+              s"Delta log-replay credential resolution failed for $tableRootUri: " +
+                s"${e.getMessage}; falling back to static-only keys in storage options",
+              e)
+            baseOptions
+        }
+    }
+  }
+
   override def enabledConfig: Option[ConfigEntry[Boolean]] = Some(
     DeltaConf.COMET_DELTA_NATIVE_ENABLED)
 
@@ -155,8 +285,19 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     val hadoopConf =
       relation.sparkSession.sessionState.newHadoopConfWithOptions(relation.options)
     val tableRootUri = java.net.URI.create(tableRoot)
+    val baseOptions: Map[String, String] =
+      NativeConfig.extractObjectStoreOptions(hadoopConf, tableRootUri)
+    // For s3/s3a tables, resolve Hadoop's credential provider chain here so log replay
+    // authenticates under SimpleAWSCredentialsProvider / TemporaryAWSCredentialsProvider /
+    // AssumedRoleCredentialProvider / IAMInstanceCredentialsProvider just like the data
+    // path does. The contrib's native engine (delta-kernel-rs's DefaultEngine backed by
+    // object_store_kernel) doesn't run core's `build_credential_provider`, so we feed it
+    // resolved static keys instead. SNAPSHOT resolution: log replay completes in seconds,
+    // well within any reasonable credential TTL.
     val storageOptions: java.util.Map[String, String] =
-      NativeConfig.extractObjectStoreOptions(hadoopConf, tableRootUri).asJava
+      CometDeltaNativeScan
+        .augmentWithResolvedAwsCredentials(baseOptions, tableRootUri, hadoopConf)
+        .asJava
 
     // Honor Delta's time-travel options (versionAsOf / timestampAsOf) via the Delta-
     // resolved snapshot version sitting on the FileIndex. Delta's analysis phase pins
