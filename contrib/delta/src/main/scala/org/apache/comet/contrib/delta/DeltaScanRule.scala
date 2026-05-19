@@ -571,11 +571,15 @@ object DeltaScanRule {
    * `private[comet] CometScanRule.isSchemaSupported`. Kept local to the contrib so the
    * contrib doesn't need to widen core's visibility.
    */
+  // Reused across scans -- CometScanTypeChecker is stateless w.r.t. its scanImpl and
+  // doesn't mutate per-call state; the per-scan fallback-reasons ListBuffer is the only
+  // per-call mutable input.
+  private val typeChecker =
+    org.apache.comet.rules.CometScanTypeChecker(CometDeltaNativeScan.ScanImpl)
+
   private def isSchemaCometCompatible(
       scanExec: FileSourceScanExec,
       r: HadoopFsRelation): Boolean = {
-    val typeChecker =
-      org.apache.comet.rules.CometScanTypeChecker(CometDeltaNativeScan.ScanImpl)
     val fallbackReasons = new scala.collection.mutable.ListBuffer[String]()
     val ok = typeChecker.isSchemaSupported(scanExec.requiredSchema, fallbackReasons) &&
       typeChecker.isSchemaSupported(r.partitionSchema, fallbackReasons)
