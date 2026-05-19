@@ -181,14 +181,11 @@ class CometExecIterator(
           """^Parquet error: (?:.*)$""".r
         e.getMessage match {
           case parquetError() =>
-            // See org.apache.spark.sql.errors.QueryExecutionErrors.failedToReadDataError
-            // See org.apache.parquet.hadoop.ParquetFileReader for error message.
-            // _LEGACY_ERROR_TEMP_2254 has no message placeholders; Spark 4 strict-checks
-            // parameters and raises INTERNAL_ERROR if any are passed.
-            throw new SparkException(
-              errorClass = "_LEGACY_ERROR_TEMP_2254",
-              messageParameters = Map.empty,
-              cause = new SparkException("File is not a Parquet file.", e))
+            // Wrap in the FAILED_READ_FILE.NO_HINT SparkException Spark produces when
+            // its own parquet reader fails. The shim accesses spark-private APIs
+            // (InputFileBlockHolder, QueryExecutionErrors) from a Spark-package class.
+            throw org.apache.spark.sql.comet.shims.ShimSparkErrorConverter
+              .wrapNativeParquetError(e)
           case _ =>
             throw e
         }
