@@ -106,6 +106,12 @@ pub fn build_delta_partitioned_files(
 ) -> Result<Vec<PartitionedFile>, String> {
     let parsed_tz = SessionTimezone::parse(session_tz);
     let mut files = Vec::with_capacity(tasks.len());
+    // Reused scratch map for per-task partition-value lookup. Without it, the inner
+    // `partition_schema.fields()` loop walks `task.partition_values` with `.iter().find()`
+    // for every field -- O(width × values) per task. With it, build the map once per task
+    // and do O(1) gets. `clear()` keeps the allocation across tasks.
+    let mut partition_values_by_name: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
     for task in tasks {
         let url = Url::parse(task.file_path.as_ref())
             .map_err(|e| format!("Invalid Delta file URL: {e}"))?;
@@ -125,13 +131,15 @@ pub fn build_delta_partitioned_files(
 
         let mut partition_values: Vec<ScalarValue> =
             Vec::with_capacity(partition_schema.fields().len());
+        partition_values_by_name.clear();
+        for pv in &task.partition_values {
+            if let Some(v) = pv.value.as_deref() {
+                partition_values_by_name.insert(pv.name.as_str(), v);
+            }
+        }
         for field in partition_schema.fields() {
-            let proto_value = task
-                .partition_values
-                .iter()
-                .find(|p| p.name == *field.name());
-            let scalar = match proto_value.and_then(|p| p.value.clone()) {
-                Some(s) => parse_delta_partition_scalar(&s, field.data_type(), &parsed_tz, session_tz)
+            let scalar = match partition_values_by_name.get(field.name().as_str()).copied() {
+                Some(s) => parse_delta_partition_scalar(s, field.data_type(), &parsed_tz, session_tz)
                     .map_err(|e| {
                         format!(
                             "Failed to parse Delta partition value for column '{}': {e}",
