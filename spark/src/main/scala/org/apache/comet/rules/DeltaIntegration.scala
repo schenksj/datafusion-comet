@@ -91,20 +91,40 @@ object DeltaIntegration {
    * `withInfo` path); `None` to indicate "not a Delta scan, proceed with the
    * vanilla CometScanRule path".
    */
+  // Cached reflective binding: resolved once per JVM. The contrib's
+  // `transformV1IfDelta` is invoked for every V1 scan in every plan, even
+  // non-Delta ones; resolving the Method on each call would be a per-scan
+  // reflection round-trip just to find we don't apply.
+  @volatile private var transformV1IfDeltaBindingCache
+      : Option[Option[(AnyRef, java.lang.reflect.Method)]] = None
+
+  private def transformV1IfDeltaBinding: Option[(AnyRef, java.lang.reflect.Method)] =
+    transformV1IfDeltaBindingCache.getOrElse {
+      val binding = scanRuleCls.flatMap { cls =>
+        try {
+          val module = cls.getField("MODULE$").get(null)
+          val m = cls.getMethod(
+            "transformV1IfDelta",
+            classOf[SparkPlan],
+            classOf[SparkSession],
+            classOf[FileSourceScanExec],
+            classOf[HadoopFsRelation])
+          Some((module, m))
+        } catch {
+          case _: Exception => None
+        }
+      }
+      transformV1IfDeltaBindingCache = Some(binding)
+      binding
+    }
+
   def transformV1IfDelta(
       plan: SparkPlan,
       session: SparkSession,
       scanExec: FileSourceScanExec,
       relation: HadoopFsRelation): Option[SparkPlan] = {
-    scanRuleCls.flatMap { cls =>
+    transformV1IfDeltaBinding.flatMap { case (module, m) =>
       try {
-        val module = cls.getField("MODULE$").get(null)
-        val m = cls.getMethod(
-          "transformV1IfDelta",
-          classOf[SparkPlan],
-          classOf[SparkSession],
-          classOf[FileSourceScanExec],
-          classOf[HadoopFsRelation])
         Option(m.invoke(module, plan, session, scanExec, relation))
           .map(_.asInstanceOf[Option[SparkPlan]])
           .flatten
