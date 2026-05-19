@@ -20,20 +20,39 @@
 //! Enabled in core via `--features contrib-delta`. Default builds carry zero
 //! Delta surface; this crate is not linked unless the feature is on.
 //!
-//! This is the initial scaffolding commit. Subsequent commits port the working
-//! implementation from the `contrib-delta-pr2` branch piece by piece:
-//!   - delta-kernel-rs log replay
-//!   - deletion vector filter exec
-//!   - column-mapping translation
-//!   - partition value parsing
-//! All wired into core via the `OpStruct::DeltaScan` dispatcher arm in
-//! `native/core/src/execution/planner.rs`.
+//! Surfaces:
+//!   - JNI: `Java_org_apache_comet_contrib_delta_Native_planDeltaScan` (driver-side
+//!     log replay via delta-kernel-rs; returns a `DeltaScanTaskList` proto)
+//!   - [`DeltaDvFilterExec`]: deletion-vector filter exec wrapper, constructed by
+//!     core's planner dispatcher when any task in the scan carries a DV
+//!   - [`plan_delta_scan`]: helpers core's planner dispatcher invokes to assemble
+//!     a Delta scan's `DataSourceExec` (kernel-rs is JVM-side, so the per-scan
+//!     planning the JVM doesn't pre-resolve happens here)
+//!
+//! No `#[ctor]` registration, no contrib-private operator-planner registry; this
+//! crate exposes plain Rust functions that core calls directly under
+//! `#[cfg(feature = "contrib-delta")]`.
 
-// Re-export the typed Delta proto messages so contrib-internal code has a stable
-// short alias regardless of which crate they ultimately live in. (Today they live
-// in core's `datafusion_comet_proto::spark_operator`; if we later move them into a
-// contrib-private proto crate, only this re-export changes.)
-pub use datafusion_comet_proto::spark_operator::{
-    DeltaColumnMapping, DeltaPartitionValue, DeltaScan, DeltaScanCommon, DeltaScanTask,
-    DeltaScanTaskList,
-};
+pub mod dv_filter;
+pub mod engine;
+pub mod error;
+pub mod jni;
+pub mod planner;
+pub mod predicate;
+pub mod scan;
+
+/// Re-export of the Delta proto messages, named so module paths inside this crate
+/// can keep their original `use crate::proto::Delta...` form. The messages
+/// themselves live in core's proto crate (so the dispatcher arm in core has direct
+/// access to the typed variants).
+pub mod proto {
+    pub use datafusion_comet_proto::spark_operator::{
+        DeltaColumnMapping, DeltaPartitionValue, DeltaScan, DeltaScanCommon, DeltaScanTask,
+        DeltaScanTaskList,
+    };
+}
+
+pub use dv_filter::DeltaDvFilterExec;
+pub use engine::{create_engine, DeltaStorageConfig};
+pub use error::{DeltaError, DeltaResult};
+pub use scan::{list_delta_files, plan_delta_scan, DeltaFileEntry, DeltaScanPlan};

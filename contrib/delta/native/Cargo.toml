@@ -15,13 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Standalone Cargo.toml -- this crate is outside the `native/` workspace root, so
-# it cannot use `{ workspace = true }` value inheritance. Versions are kept in
-# sync with the rest of the repo by convention; CI verifies the major/minor.
+# Standalone Cargo.toml -- this crate is outside the `native/` workspace root, so it
+# cannot use `{ workspace = true }` inheritance. Versions are kept in sync with the
+# rest of the repo by convention; the path deps anchor against the same on-disk crates.
 
 [package]
 name = "comet-contrib-delta"
-description = "Delta Lake integration for Apache DataFusion Comet"
+description = "delta-kernel-rs integration for Comet. Reads Delta tables via kernel-rs's log replay and DataFusion's parquet scan, with DV / column-mapping / row-tracking support. Linked into libcomet via core's `contrib-delta` Cargo feature flag."
 version = "0.17.0"
 edition = "2021"
 rust-version = "1.86.0"
@@ -34,6 +34,41 @@ license = "Apache-2.0"
 crate-type = ["rlib"]
 
 [dependencies]
-# Skeleton only -- real deps land in subsequent commits as code is ported over from
-# contrib-delta-pr2 (delta_kernel, datafusion, datafusion-comet-proto, etc.).
+# Typed Delta proto messages live in core's proto crate (alongside IcebergScan, ...)
+# so the dispatcher arm has direct access. We re-export them as `crate::proto::*`.
 datafusion-comet-proto = { path = "../../../native/proto" }
+# JNI helpers (CometError, CometResult, try_unwrap_or_throw). jni-bridge is a leaf
+# crate -- depending on it doesn't drag any Comet logic into the contrib.
+datafusion-comet-jni-bridge = { path = "../../../native/jni-bridge" }
+# Heavy Delta deps -- intentionally live ONLY in this contrib, never in core. delta_kernel
+# 0.19 pins arrow-57 / object_store-0.12 internally; that subtree never exchanges typed
+# values with Comet's arrow-58 / object_store-0.13 -- only plain Rust types cross the
+# boundary (ScanFile, HashMap, etc.).
+delta_kernel = { version = "0.19", default-features = false, features = ["default-engine-rustls", "arrow"] }
+# Second object_store version required by delta_kernel 0.19 (kernel's engine uses 0.12).
+# Renamed so it doesn't collide with Comet's `object_store = "0.13.1"`.
+object_store_kernel = { package = "object_store", version = "0.12", features = ["aws", "azure"] }
+# Roaring bitmap decoder for Delta deletion vectors (inline + on-disk).
+roaring = "0.10"
+
+# DataFusion / Arrow / parquet versions chosen to match core's pinned values.
+datafusion = { version = "53.1.0", default-features = false, features = ["parquet"] }
+arrow = { version = "58.1.0", features = ["prettyprint", "ffi", "chrono-tz"] }
+object_store = { version = "0.13.1" }
+url = "2.5.4"
+parquet = { version = "58.1.0", default-features = false, features = ["experimental"] }
+futures = "0.3"
+thiserror = "2"
+prost = "0.14.3"
+jni = "0.22.4"
+# Used by parse_delta_partition_scalar for timestamp parsing across the JVM's TZ shapes
+# (IANA names, GMT+/-HH:MM, etc).
+chrono = "0.4"
+chrono-tz = "0.10"
+log = "0.4"
+
+[dev-dependencies]
+# Used by unit tests under #[cfg(test)] in scan.rs to materialise a Delta table
+# in a tempdir without polluting the real filesystem.
+tempfile = "3"
+tokio = { version = "1.39.0", features = ["macros", "rt-multi-thread"] }

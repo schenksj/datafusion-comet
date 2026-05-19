@@ -21,6 +21,9 @@ pub mod expression_registry;
 pub mod macros;
 pub mod operator_registry;
 
+#[cfg(feature = "contrib-delta")]
+mod contrib_delta_scan;
+
 use crate::execution::operators::init_csv_datasource_exec;
 use crate::execution::operators::IcebergScanExec;
 use crate::execution::{
@@ -1376,6 +1379,10 @@ impl PhysicalPlanner {
                     common.encryption_enabled,
                     common.use_field_id,
                     common.ignore_missing_field_id,
+                    // ignore_missing_files: not exposed through the native_datafusion
+                    // scan proto today. Contribs (e.g. Delta) wire this through directly
+                    // when they call init_datasource_exec.
+                    false,
                 )?;
                 Ok((
                     vec![],
@@ -1492,15 +1499,14 @@ impl PhysicalPlanner {
                     )),
                 ))
             }
-            OpStruct::DeltaScan(_scan) => {
+            OpStruct::DeltaScan(scan) => {
                 // Delta Lake scan -- handled by the optional `contrib/delta/` integration.
                 // The dispatcher arm exists unconditionally so a default build that receives
                 // a Delta-shaped plan from a misconfigured driver gets a clear error instead
-                // of a "no match" decode failure. The body is feature-gated; subsequent
-                // commits will fill in the `contrib-delta`-enabled branch by delegating to
-                // `comet_contrib_delta`.
+                // of a "no match" decode failure.
                 #[cfg(not(feature = "contrib-delta"))]
                 {
+                    let _ = scan;
                     Err(GeneralError(
                         "Received a DeltaScan operator but core was built without the \
                          `contrib-delta` Cargo feature. Rebuild with \
@@ -1510,11 +1516,7 @@ impl PhysicalPlanner {
                 }
                 #[cfg(feature = "contrib-delta")]
                 {
-                    // TODO(contrib-delta): wire to `comet_contrib_delta::plan_delta_scan`
-                    // once the implementation lands.
-                    Err(GeneralError(
-                        "comet-contrib-delta: planner not yet implemented".into(),
-                    ))
+                    self.plan_delta_scan(spark_plan, scan)
                 }
             }
             OpStruct::ShuffleWriter(writer) => {
