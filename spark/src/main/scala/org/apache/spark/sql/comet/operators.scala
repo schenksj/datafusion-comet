@@ -90,7 +90,9 @@ private[comet] object PlanDataInjector {
     val builtin: Seq[PlanDataInjector] = Seq(IcebergPlanDataInjector, NativeScanPlanDataInjector)
     val deltaOpt: Option[PlanDataInjector] =
       try {
+        // scalastyle:off classforname
         val cls = Class.forName("org.apache.spark.sql.comet.DeltaPlanDataInjector")
+        // scalastyle:on classforname
         Some(cls.getField("MODULE$").get(null).asInstanceOf[PlanDataInjector])
       } catch {
         case _: ClassNotFoundException => None

@@ -20,17 +20,17 @@
 package org.apache.comet.rules
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.comet.CometScanExec
 import org.apache.spark.sql.execution.{FileSourceScanExec, SparkPlan}
 import org.apache.spark.sql.execution.datasources.HadoopFsRelation
 
 import org.apache.comet.serde.CometOperatorSerde
-import org.apache.spark.sql.comet.CometScanExec
 
 /**
  * Reflection-based bridge to the optional `contrib/delta/` integration.
  *
  * On default builds the contrib classes don't exist on the classpath, so the
- * `Class.forName` lookups fail and every method here returns the "not handled"
+ * reflective class lookups fail and every method here returns the "not handled"
  * sentinel. On builds compiled with `-Pcontrib-delta` (Maven) +
  * `--features contrib-delta` (Cargo), the contrib classes are present and the
  * lookups resolve, dispatching the call into the contrib helpers.
@@ -50,35 +50,30 @@ object DeltaIntegration {
   val DeltaScanImpl: String = "native_delta_compat"
 
   // Lazy class lookups -- single reflection cost per JVM, cached either as the
-  // class handle or as `None` if the contrib was not bundled.
-  @volatile private var scanRuleLookup: Option[Option[Class[_]]] = None
-  @volatile private var serdeLookup: Option[Option[Class[_]]] = None
+  // class handle or as the empty option if the contrib wasn't bundled.
+  @volatile private var scanRuleLookup: Option[Option[Class[AnyRef]]] = None
+  @volatile private var serdeLookup: Option[Option[Class[AnyRef]]] = None
 
-  private def lookupClass(name: String, slot: Option[Option[Class[_]]]): Option[Class[_]] = {
-    slot match {
-      case Some(cached) => cached
-      case None =>
-        val cls =
-          try Some(Class.forName(name))
-          catch { case _: ClassNotFoundException => None }
-        cls
-    }
-  }
-
-  private def scanRuleCls: Option[Class[_]] =
+  private def scanRuleCls: Option[Class[AnyRef]] =
     scanRuleLookup.getOrElse {
       val cls =
-        try Some(Class.forName(ScanRuleClass))
-        catch { case _: ClassNotFoundException => None }
+        try {
+          // scalastyle:off classforname
+          Some(Class.forName(ScanRuleClass).asInstanceOf[Class[AnyRef]])
+          // scalastyle:on classforname
+        } catch { case _: ClassNotFoundException => None }
       scanRuleLookup = Some(cls)
       cls
     }
 
-  private def serdeCls: Option[Class[_]] =
+  private def serdeCls: Option[Class[AnyRef]] =
     serdeLookup.getOrElse {
       val cls =
-        try Some(Class.forName(SerdeClass))
-        catch { case _: ClassNotFoundException => None }
+        try {
+          // scalastyle:off classforname
+          Some(Class.forName(SerdeClass).asInstanceOf[Class[AnyRef]])
+          // scalastyle:on classforname
+        } catch { case _: ClassNotFoundException => None }
       serdeLookup = Some(cls)
       cls
     }
@@ -114,7 +109,9 @@ object DeltaIntegration {
           .map(_.asInstanceOf[Option[SparkPlan]])
           .flatten
       } catch {
+        // scalastyle:off
         case _: Exception => None
+        // scalastyle:on
       }
     }
   }
