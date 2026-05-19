@@ -22,7 +22,8 @@
 //! renamed `object_store_kernel` (object_store 0.12) dependency that kernel
 //! requires. Comet's main `object_store = "0.13"` tree is untouched.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use url::Url;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -34,7 +35,7 @@ use object_store_kernel::ObjectStore;
 
 use super::error::{DeltaError, DeltaResult};
 
-/// Concrete engine type returned by [`create_engine`].
+/// Concrete engine type returned by [`get_or_create_engine`].
 pub type DeltaEngine = DefaultEngine<TokioBackgroundExecutor>;
 
 /// Storage credentials used to construct kernel's engine.
@@ -42,7 +43,7 @@ pub type DeltaEngine = DefaultEngine<TokioBackgroundExecutor>;
 /// Mirrors tantivy4java's `DeltaStorageConfig`. Field-per-knob rather than a
 /// generic map so we can validate at the boundary; the Scala side will
 /// populate this from a Spark options map.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
 pub struct DeltaStorageConfig {
     pub aws_access_key: Option<String>,
     pub aws_secret_key: Option<String>,
@@ -133,8 +134,63 @@ pub fn create_object_store(
     Ok(store)
 }
 
-/// Build a kernel `DefaultEngine` for the given table URL.
+/// Process-wide cache of constructed engines, keyed by (scheme, authority, config).
+///
+/// Each `DefaultEngine` owns a `TokioBackgroundExecutor` which spawns one std::thread
+/// running a current_thread tokio runtime; the runtime's blocking pool (used by
+/// kernel for parquet/object_store IO) holds spawned threads for `thread_keep_alive`
+/// (~10s) after each spawn_blocking call. Constructing a fresh engine per JNI
+/// `planDeltaScan` call therefore accumulates OS threads during regression runs that
+/// hit kernel hundreds of times per minute, eventually tripping the per-process
+/// thread cap (e.g. `pthread_create EAGAIN` aborts on macOS where `ulimit -u`
+/// defaults to ~1300). Sharing one engine per (scheme, authority, config) bounds the
+/// thread count by table-storage diversity instead of by request count.
+///
+/// `Arc<DeltaEngine>` is handed out so callers don't hold the mutex while using the
+/// engine. We never evict — entries are cheap (one Arc per distinct storage target),
+/// and dropping the cache at JVM teardown is acceptable.
+type EngineKey = (String, String, DeltaStorageConfig);
+fn engine_cache() -> &'static Mutex<HashMap<EngineKey, Arc<DeltaEngine>>> {
+    static CACHE: OnceLock<Mutex<HashMap<EngineKey, Arc<DeltaEngine>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn engine_key(url: &Url, config: &DeltaStorageConfig) -> EngineKey {
+    let scheme = url.scheme().to_string();
+    // host+port form the storage target (e.g. S3 bucket, ABFS account); for file://
+    // the authority is empty which collapses every local table to a single entry.
+    let authority = match (url.host_str(), url.port()) {
+        (Some(h), Some(p)) => format!("{h}:{p}"),
+        (Some(h), None) => h.to_string(),
+        _ => String::new(),
+    };
+    (scheme, authority, config.clone())
+}
+
+// Suppress dead_code: the standalone constructor stays useful for tests that want
+// to exercise a fresh engine without polluting the cache.
+#[allow(dead_code)]
 pub fn create_engine(table_url: &Url, config: &DeltaStorageConfig) -> DeltaResult<DeltaEngine> {
     let store = create_object_store(table_url, config)?;
     Ok(DefaultEngine::new(store))
 }
+
+/// Return a shared `DeltaEngine` for the given URL+config, building one on first use.
+pub fn get_or_create_engine(
+    table_url: &Url,
+    config: &DeltaStorageConfig,
+) -> DeltaResult<Arc<DeltaEngine>> {
+    let key = engine_key(table_url, config);
+    // Mutex is held only across the (cheap) HashMap lookup and, on miss, the engine
+    // construction. Multi-threaded JNI callers serialize here on first miss per key
+    // but proceed lock-free on subsequent hits via the returned Arc clone.
+    let mut cache = engine_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = cache.get(&key) {
+        return Ok(Arc::clone(existing));
+    }
+    let store = create_object_store(table_url, config)?;
+    let engine = Arc::new(DefaultEngine::new(store));
+    cache.insert(key, Arc::clone(&engine));
+    Ok(engine)
+}
+

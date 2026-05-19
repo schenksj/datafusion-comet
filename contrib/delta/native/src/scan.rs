@@ -35,7 +35,7 @@ use url::Url;
 
 use delta_kernel::snapshot::Snapshot;
 
-use super::engine::{create_engine, DeltaStorageConfig};
+use super::engine::{get_or_create_engine, DeltaStorageConfig};
 use super::error::{DeltaError, DeltaResult};
 
 /// Metadata for a single active parquet file in a Delta table.
@@ -131,14 +131,14 @@ pub fn plan_delta_scan_with_predicate(
     kernel_predicate: Option<delta_kernel::expressions::Predicate>,
 ) -> DeltaResult<DeltaScanPlan> {
     let url = normalize_url(url_str)?;
-    let engine = create_engine(&url, config)?;
+    let engine = get_or_create_engine(&url, config)?;
 
     let snapshot = {
         let mut builder = Snapshot::builder_for(url);
         if let Some(v) = version {
             builder = builder.at_version(v);
         }
-        builder.build(&engine)?
+        builder.build(&*engine)?
     };
     let actual_version = snapshot.version();
 
@@ -210,7 +210,7 @@ pub fn plan_delta_scan_with_predicate(
     }
 
     let mut raw: Vec<RawEntry> = Vec::new();
-    let scan_metadata = scan.scan_metadata(&engine)?;
+    let scan_metadata = scan.scan_metadata(&*engine)?;
 
     for meta_result in scan_metadata {
         let meta: delta_kernel::scan::ScanMetadata = meta_result?;
@@ -243,7 +243,7 @@ pub fn plan_delta_scan_with_predicate(
     for r in raw {
         let deleted_row_indexes = if r.dv_info.has_vector() {
             r.dv_info
-                .get_row_indexes(&engine, &table_root_url)?
+                .get_row_indexes(&*engine, &table_root_url)?
                 .ok_or_else(|| {
                     DeltaError::Internal(format!(
                         "DV has_vector() true but get_row_indexes() returned None for {}",
