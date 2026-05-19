@@ -261,6 +261,14 @@ case class CometExecRule(session: SparkSession)
       case scan: CometScanExec if scan.scanImpl == CometConf.SCAN_NATIVE_DATAFUSION =>
         convertToComet(scan, CometNativeScan).getOrElse(scan)
 
+      // Delta scan marker stamped by the optional contrib/delta integration.
+      // The handler is resolved via reflection (no compile-time dependency
+      // on the contrib) -- present only when -Pcontrib-delta was activated.
+      case scan: CometScanExec if scan.scanImpl == DeltaIntegration.DeltaScanImpl =>
+        DeltaIntegration.scanHandler
+          .flatMap(handler => convertToComet(scan, handler))
+          .getOrElse(scan)
+
       // Fully native Iceberg scan for V2 (iceberg-rust path)
       // Only handle scans with native metadata; other scans fall through to isCometScan
       // Config checks (COMET_ICEBERG_NATIVE_ENABLED, COMET_EXEC_ENABLED) are done in CometScanRule

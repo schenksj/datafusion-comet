@@ -23,6 +23,9 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution.{FileSourceScanExec, SparkPlan}
 import org.apache.spark.sql.execution.datasources.HadoopFsRelation
 
+import org.apache.comet.serde.CometOperatorSerde
+import org.apache.spark.sql.comet.CometScanExec
+
 /**
  * Reflection-based bridge to the optional `contrib/delta/` integration.
  *
@@ -117,28 +120,18 @@ object DeltaIntegration {
   }
 
   /**
-   * Delta serde dispatch invoked from `CometExecRule` when a Delta-scan marker
-   * (`CometScanExec` with `scanImpl == DeltaScanImpl`) needs converting to its
-   * native operator proto.
-   *
-   * Mirrors `Iceberg`'s shape: a single reflective call resolves to
-   * `CometDeltaNativeScan.convert(scan, builder, childOp*)` in the contrib.
-   * Returns the populated `Operator` (with `OpStruct::DeltaScan` set), or
-   * `None` if the contrib isn't bundled or declined the conversion.
+   * The Delta scan handler, resolved via reflection from the contrib's
+   * `CometDeltaNativeScan` companion object. Returns `None` when the contrib
+   * isn't bundled into this build. `CometExecRule` calls this and passes the
+   * result through the standard `convertToComet(scan, handler)` path so the
+   * Delta scan flows through the same code as `CometNativeScan` etc.
    */
-  def convertScan(scan: Any, builder: Any): Option[Any] = {
-    serdeCls.flatMap { cls =>
-      try {
-        val module = cls.getField("MODULE$").get(null)
-        val m = cls.getMethods.find { m =>
-          m.getName == "convert" && m.getParameterCount == 3
-        }
-        m.flatMap { method =>
-          Option(method.invoke(module, scan, builder, Array.empty[Any]))
-        }
-      } catch {
-        case _: Exception => None
-      }
+  def scanHandler: Option[CometOperatorSerde[CometScanExec]] = serdeCls.flatMap { cls =>
+    try {
+      val module = cls.getField("MODULE$").get(null)
+      Some(module.asInstanceOf[CometOperatorSerde[CometScanExec]])
+    } catch {
+      case _: Exception => None
     }
   }
 }

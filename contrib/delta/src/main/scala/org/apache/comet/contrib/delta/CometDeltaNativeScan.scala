@@ -42,7 +42,7 @@ import org.apache.comet.{CometConf, ConfigEntry}
 // instead of a contrib-private proto package.
 import org.apache.comet.serde.OperatorOuterClass.{DeltaScan, DeltaScanCommon, DeltaScanTaskList}
 import org.apache.comet.objectstore.NativeConfig
-import org.apache.comet.serde.{ExprOuterClass, OperatorOuterClass}
+import org.apache.comet.serde.{CometOperatorSerde, Compatible, ExprOuterClass, OperatorOuterClass, SupportLevel}
 import org.apache.comet.serde.ExprOuterClass.Expr
 import org.apache.comet.serde.OperatorOuterClass.Operator
 import org.apache.comet.serde.QueryPlanSerde.exprToProto
@@ -59,13 +59,14 @@ import org.apache.comet.serde.operator.schema2Proto
  * applied at execution time in the exec's `serializedPartitionData`.
  */
 /**
- * Delta-scan serde + exec factory. Was a `CometOperatorSerde[CometScanExec]` on the
- * rejected PR1 SPI; in the post-PR1 design this is a plain Scala object whose static
- * methods are called from core's CometScanRule (via DeltaIntegration) when a Delta
- * scan is detected. The proto wire format is the typed `OpStruct::DeltaScan` variant
- * core's planner dispatches via `#[cfg(feature = "contrib-delta")] OpStruct::DeltaScan`.
+ * Delta-scan serde + exec factory. Extends Comet's core `CometOperatorSerde` trait so
+ * the existing convertToComet path in `CometExecRule` invokes it just like the
+ * built-in handlers (CometNativeScan, CometIcebergNativeScan, ...). What is NOT here
+ * is any *extension/discovery* SPI -- core's `CometExecRule` resolves this object via
+ * `DeltaIntegration.scanHandler` (one reflective class lookup, no ServiceLoader, no
+ * registry). The wire format is the typed `OpStruct::DeltaScan` variant.
  */
-object CometDeltaNativeScan extends Logging {
+object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Logging {
 
   /**
    * `kind` string for the `ContribOp` envelope this serde produces. The native side's
@@ -107,10 +108,12 @@ object CometDeltaNativeScan extends Logging {
       .get(DeltaConf.NeedsInputFileNameOption)
       .contains("true")
 
-  def enabledConfig: Option[ConfigEntry[Boolean]] = Some(
+  override def enabledConfig: Option[ConfigEntry[Boolean]] = Some(
     DeltaConf.COMET_DELTA_NATIVE_ENABLED)
 
-  def convert(
+  override def getSupportLevel(operator: CometScanExec): SupportLevel = Compatible()
+
+  override def convert(
       scan: CometScanExec,
       builder: Operator.Builder,
       childOp: OperatorOuterClass.Operator*): Option[OperatorOuterClass.Operator] = {
