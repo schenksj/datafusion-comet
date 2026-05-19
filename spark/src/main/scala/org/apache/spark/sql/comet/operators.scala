@@ -81,12 +81,23 @@ private[comet] trait PlanDataInjector {
  */
 private[comet] object PlanDataInjector {
 
-  // Registry of injectors for different operator types
-  private val injectors: Seq[PlanDataInjector] = Seq(
-    IcebergPlanDataInjector,
-    NativeScanPlanDataInjector
-    // Future: DeltaPlanDataInjector, HudiPlanDataInjector, etc.
-  )
+  // Registry of injectors for different operator types. The contrib/delta integration's
+  // DeltaPlanDataInjector is appended via one reflective class lookup -- present only when
+  // the contrib was bundled (i.e. -Pcontrib-delta on the Maven build). Default builds get
+  // the empty Option and an unmodified injectors list, so there's zero contrib surface at
+  // runtime on default builds.
+  private val injectors: Seq[PlanDataInjector] = {
+    val builtin: Seq[PlanDataInjector] = Seq(IcebergPlanDataInjector, NativeScanPlanDataInjector)
+    val deltaOpt: Option[PlanDataInjector] =
+      try {
+        val cls = Class.forName("org.apache.spark.sql.comet.DeltaPlanDataInjector")
+        Some(cls.getField("MODULE$").get(null).asInstanceOf[PlanDataInjector])
+      } catch {
+        case _: ClassNotFoundException => None
+        case _: Exception => None
+      }
+    builtin ++ deltaOpt
+  }
 
   /**
    * Injects planning data into an Operator tree by finding nodes that need injection and applying
