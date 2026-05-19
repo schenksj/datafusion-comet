@@ -175,6 +175,23 @@ case class CometScanRule(session: SparkSession)
         if (!CometScanExec.isFileFormatSupported(r.fileFormat)) {
           return withInfo(scanExec, s"Unsupported file format ${r.fileFormat}")
         }
+        // Filesystem scheme allowlist. Comet's native readers go through object_store,
+        // which only understands a fixed set of URL schemes. Custom Hadoop FileSystems
+        // (e.g. a test FakeFileSystem registered via spark.hadoop.fs.<scheme>.impl) would
+        // surface at execution time as `Generic URL error: Unable to recognise URL "..."`.
+        // Decline here so Spark's reader -- which goes through the Hadoop FS API and can
+        // resolve custom schemes -- handles the scan.
+        val supportedSchemes =
+          Set("file", "s3", "s3a", "gs", "gcs", "oss", "abfss", "abfs", "wasbs", "wasb")
+        val unsupportedFsSchemes = r.location.rootPaths
+          .map(p => p.toUri.getScheme)
+          .filter(s => s != null && !supportedSchemes.contains(s))
+          .toSet
+        if (unsupportedFsSchemes.nonEmpty) {
+          return withInfo(
+            scanExec,
+            s"Unsupported filesystem schemes: ${unsupportedFsSchemes.mkString(", ")}")
+        }
         val hadoopConf = r.sparkSession.sessionState.newHadoopConfWithOptions(r.options)
 
         // TODO is this restriction valid for all native scan types?
