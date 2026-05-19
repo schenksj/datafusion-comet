@@ -101,6 +101,24 @@ private[spark] class CometExecRDD(
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
     val partition = split.asInstanceOf[CometExecPartition]
 
+    // Populate Spark's `InputFileBlockHolder` thread-local so `input_file_name()` and
+    // friends return the correct path for this task's data. Comet's native scan does
+    // not go through Spark's `FileScanRDD` (which is what normally maintains this
+    // thread-local), so without this hook Delta's UPDATE/DELETE/MERGE flows -- which
+    // rely on `input_file_name()` to identify touched files -- silently see an empty
+    // path. Set to the partition's first file: Delta forces one-task-per-partition
+    // when `input_file_name()` is referenced (see DeltaScanRule), so there is exactly
+    // one file in that case. Registers an unset on task completion to avoid leaking
+    // across tasks on the same executor thread.
+    if (partition.filePaths.nonEmpty) {
+      org.apache.spark.rdd.InputFileBlockHolder.set(partition.filePaths.head, 0L, 0L)
+      Option(context).foreach { ctx =>
+        ctx.addTaskCompletionListener[Unit] { _ =>
+          org.apache.spark.rdd.InputFileBlockHolder.unset()
+        }
+      }
+    }
+
     val inputs = inputRDDs.zip(partition.inputPartitions).map { case (rdd, part) =>
       rdd.iterator(part, context)
     }

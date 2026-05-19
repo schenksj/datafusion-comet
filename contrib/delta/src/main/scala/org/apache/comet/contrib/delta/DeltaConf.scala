@@ -71,7 +71,7 @@ object DeltaConf {
    * Relation-options key the contrib reads to know whether the surrounding plan references
    * `input_file_name()` / `input_file_block_*`. When set to `"true"`, the contrib emits
    * `oneTaskPerPartition = true` on the `CometDeltaNativeScanExec` so packTasks keeps each task
-   * in its own partition and `CometExecRDD.setInputFileForDeltaScan` can set
+   * in its own partition and `CometExecRDD.compute` (via `InputFileBlockHolder.set`) can set
    * `InputFileBlockHolder` to the correct path.
    */
   val NeedsInputFileNameOption: String = "comet.contrib.delta.needsInputFileName"

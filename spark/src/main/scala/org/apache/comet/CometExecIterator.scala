@@ -178,8 +178,12 @@ class CometExecIterator(
         // threw the exception, so we log the exception with taskAttemptId here
         logError(s"Native execution for task $taskAttemptId failed", e)
 
+        // `(?s)` so `.` matches across newlines -- native parquet errors sometimes
+        // span multiple lines (footer corruption messages include a hex dump), and a
+        // single-line regex would let those slip past the wrap and surface as bare
+        // CometNativeException to the user.
         val parquetError: scala.util.matching.Regex =
-          """^Parquet error: (?:.*)$""".r
+          """(?s)^Parquet error: (?:.*)$""".r
         e.getMessage match {
           case parquetError() =>
             // Wrap in the FAILED_READ_FILE.NO_HINT SparkException Spark produces when

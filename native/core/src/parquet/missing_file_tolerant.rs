@@ -84,10 +84,17 @@ fn is_not_found(err: &datafusion::error::DataFusionError) -> bool {
         }
     }
     // Display-based fallback for adapters that erase the underlying type
-    // (e.g. parquet's ParquetError -> DataFusionError::External).
+    // (e.g. parquet's ParquetError -> DataFusionError::External). Anchored to
+    // recognised NotFound phrasings only -- a loose substring match on "not found"
+    // would silently swallow unrelated parquet messages like "row group statistics
+    // not found" or "page index not found" and produce wrong empty results.
     let msg = err.to_string();
     matches!(err, DataFusionError::External(_) | DataFusionError::ObjectStore(_))
-        && (msg.contains("NotFound") || msg.contains("not found") || msg.contains("No such file"))
+        && (msg.contains("Object at location")
+            || msg.contains("Generic NotFound")
+            || msg.contains("NoSuchKey")
+            || msg.contains("NoSuchFile")
+            || msg.contains("No such file or directory"))
 }
 
 impl FileOpener for IgnoreMissingFileOpener {

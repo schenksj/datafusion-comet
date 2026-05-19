@@ -63,7 +63,7 @@ case class CometDeltaNativeScanExec(
     partitionSchema: StructType = new StructType(),
     /**
      * #75 design A: when true, `packTasks` emits one group (= one partition) per task so
-     * `CometExecRDD.setInputFileForDeltaScan` correctly sets `InputFileBlockHolder` to the
+     * `CometExecRDD.compute` (via `InputFileBlockHolder.set`) correctly sets `InputFileBlockHolder` to the
      * partition's only file path. Set by `CometDeltaNativeScan.createExec` when the surrounding
      * plan references `input_file_name()` / `input_file_block_*`.
      */
@@ -165,7 +165,7 @@ case class CometDeltaNativeScanExec(
 
   // #75 design A: when input_file_name() is needed (signal threaded from CometScanRule
   // via CometDeltaNativeScan.createExec into `oneTaskPerPartition`), short-circuit
-  // packing so each task gets its own partition. `setInputFileForDeltaScan` reads
+  // packing so each task gets its own partition. `CometExecRDD.compute` reads
   // task[0]'s path; with 1 task per partition that path correctly attributes every row.
   private def packTasks(
       tasks: Seq[OperatorOuterClass.DeltaScanTask]): Seq[Seq[OperatorOuterClass.DeltaScanTask]] = {
@@ -361,7 +361,7 @@ case class CometDeltaNativeScanExec(
       encryptedFilePaths = encryptedFilePaths)
 
     // InputFileBlockHolder for downstream `input_file_name()` is populated in
-    // `CometExecRDD.setInputFileForDeltaScan` so it also fires when this scan
+    // `CometExecRDD.compute` (via `InputFileBlockHolder.set`) so it also fires when this scan
     // is embedded inside a larger Comet native tree (where this exec's own
     // `doExecuteColumnar` is bypassed in favour of the parent's).
     baseRDD

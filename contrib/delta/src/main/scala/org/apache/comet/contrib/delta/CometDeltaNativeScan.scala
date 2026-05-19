@@ -98,7 +98,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
   // `CometScanRule.NeedsInputFileNameOption`. We read it here to (a) skip
   // byte-range splitting in splitTasks and (b) emit `oneTaskPerPartition = true`
   // on the CometDeltaNativeScanExec so packTasks keeps each task in its own
-  // partition. With 1 task per partition, `CometExecRDD.setInputFileForDeltaScan`
+  // partition. With 1 task per partition, `CometExecRDD.compute` (via `InputFileBlockHolder.set`)
   // sets InputFileBlockHolder to the correct path and Spark's JVM-side
   // input_file_name() evaluation (no native serde exists) returns the right
   // value.
@@ -805,7 +805,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       tasks: Seq[OperatorOuterClass.DeltaScanTask]): Seq[OperatorOuterClass.DeltaScanTask] = {
     if (tasks.isEmpty) return tasks
     // #75 design A: when the plan needs input_file_name(), keep each task 1:1 with
-    // a file so `setInputFileForDeltaScan` (which reads only the first task) sets
+    // a file so `CometExecRDD.compute` (which reads only the first task) sets
     // the correct path. Without this, byte-range chunking would create multiple
     // tasks for one file -- still same path -- BUT combined with packTasks below
     // could end up with multiple FILES per partition.

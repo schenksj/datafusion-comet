@@ -144,6 +144,20 @@ impl ExecutionPlan for DeltaDvFilterExec {
         vec![&self.input]
     }
 
+    // DV filtering relies on `current_row_offset` matching the child's physical row
+    // index. That invariant only holds if (a) the child preserves its input order and
+    // (b) DataFusion doesn't slip in a RepartitionExec / SortPreservingMergeExec that
+    // interleaves rows between the parquet scan and this exec. Override both to pin
+    // the contract: if either ever stops being true the optimizer is forced to bail
+    // rather than silently re-order rows.
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
