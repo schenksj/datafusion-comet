@@ -43,6 +43,60 @@ use url::Url;
 
 use crate::proto::DeltaScanTask;
 
+/// Pre-parsed session timezone, computed once per scan and reused across every partition
+/// value parse. Avoids the per-row `chrono_tz::Tz::from_str` lookup
+/// `parse_delta_partition_scalar` would otherwise do for every TIMESTAMP partition value.
+pub enum SessionTimezone {
+    Tz(chrono_tz::Tz),
+    Offset(chrono::FixedOffset),
+    /// `session_tz` didn't parse as either a named TZ or a fixed offset. We defer the
+    /// "invalid session TZ" error to the per-row parse path so callers that don't have any
+    /// TIMESTAMP partitions never see it.
+    Invalid,
+}
+
+impl SessionTimezone {
+    pub fn parse(session_tz: &str) -> Self {
+        if let Ok(tz) = session_tz.parse::<chrono_tz::Tz>() {
+            return Self::Tz(tz);
+        }
+        if let Some(off) = parse_fixed_offset(session_tz) {
+            return Self::Offset(off);
+        }
+        Self::Invalid
+    }
+}
+
+fn parse_fixed_offset(s: &str) -> Option<chrono::FixedOffset> {
+    let trimmed = s.trim();
+    let body = trimmed
+        .strip_prefix("GMT")
+        .or_else(|| trimmed.strip_prefix("UTC"))
+        .unwrap_or(trimmed);
+    if body.is_empty() || body.eq_ignore_ascii_case("Z") {
+        return Some(chrono::FixedOffset::east_opt(0).unwrap());
+    }
+    let (sign, rest) = match body.chars().next()? {
+        '+' => (1, &body[1..]),
+        '-' => (-1, &body[1..]),
+        _ => return None,
+    };
+    let secs = if rest.contains(':') {
+        let mut parts = rest.splitn(2, ':');
+        let h: i32 = parts.next()?.parse().ok()?;
+        let m: i32 = parts.next()?.parse().ok()?;
+        h * 3600 + m * 60
+    } else if rest.len() == 4 {
+        let h: i32 = rest[..2].parse().ok()?;
+        let m: i32 = rest[2..].parse().ok()?;
+        h * 3600 + m * 60
+    } else {
+        let h: i32 = rest.parse().ok()?;
+        h * 3600
+    };
+    chrono::FixedOffset::east_opt(sign * secs)
+}
+
 /// Convert `DeltaScanTask`s into DataFusion `PartitionedFile`s. Delta's add.path is
 /// already an absolute URL once kernel has resolved it on the driver.
 pub fn build_delta_partitioned_files(
@@ -50,6 +104,7 @@ pub fn build_delta_partitioned_files(
     partition_schema: &Schema,
     session_tz: &str,
 ) -> Result<Vec<PartitionedFile>, String> {
+    let parsed_tz = SessionTimezone::parse(session_tz);
     let mut files = Vec::with_capacity(tasks.len());
     for task in tasks {
         let url = Url::parse(task.file_path.as_ref())
@@ -76,7 +131,7 @@ pub fn build_delta_partitioned_files(
                 .iter()
                 .find(|p| p.name == *field.name());
             let scalar = match proto_value.and_then(|p| p.value.clone()) {
-                Some(s) => parse_delta_partition_scalar(&s, field.data_type(), session_tz)
+                Some(s) => parse_delta_partition_scalar(&s, field.data_type(), &parsed_tz, session_tz)
                     .map_err(|e| {
                         format!(
                             "Failed to parse Delta partition value for column '{}': {e}",
@@ -110,12 +165,12 @@ pub fn build_delta_partitioned_files(
 pub fn parse_delta_partition_scalar(
     s: &str,
     dt: &DataType,
+    parsed_tz: &SessionTimezone,
     session_tz: &str,
 ) -> Result<ScalarValue, String> {
     match dt {
         DataType::Timestamp(unit, tz_opt) => {
             use chrono::{DateTime, NaiveDateTime, TimeZone};
-            use chrono_tz::Tz;
             if tz_opt.is_none() {
                 let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
                     .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
@@ -155,52 +210,22 @@ pub fn parse_delta_partition_scalar(
                             .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
                     })
                     .map_err(|e| format!("cannot parse timestamp '{s}': {e}"))?;
-                use chrono::{FixedOffset, LocalResult};
-                fn parse_fixed_offset(s: &str) -> Option<FixedOffset> {
-                    let trimmed = s.trim();
-                    let body = trimmed
-                        .strip_prefix("GMT")
-                        .or_else(|| trimmed.strip_prefix("UTC"))
-                        .unwrap_or(trimmed);
-                    if body.is_empty() || body.eq_ignore_ascii_case("Z") {
-                        return Some(FixedOffset::east_opt(0).unwrap());
-                    }
-                    let (sign, rest) = match body.chars().next()? {
-                        '+' => (1, &body[1..]),
-                        '-' => (-1, &body[1..]),
-                        _ => return None,
-                    };
-                    let secs = if rest.contains(':') {
-                        let mut parts = rest.splitn(2, ':');
-                        let h: i32 = parts.next()?.parse().ok()?;
-                        let m: i32 = parts.next()?.parse().ok()?;
-                        h * 3600 + m * 60
-                    } else if rest.len() == 4 {
-                        let h: i32 = rest[..2].parse().ok()?;
-                        let m: i32 = rest[2..].parse().ok()?;
-                        h * 3600 + m * 60
-                    } else {
-                        let h: i32 = rest.parse().ok()?;
-                        h * 3600
-                    };
-                    FixedOffset::east_opt(sign * secs)
-                }
-
-                if let Ok(tz) = session_tz.parse::<Tz>() {
-                    match tz.from_local_datetime(&naive) {
+                use chrono::LocalResult;
+                match parsed_tz {
+                    SessionTimezone::Tz(tz) => match tz.from_local_datetime(&naive) {
                         LocalResult::Single(dt) => dt.timestamp_micros(),
                         LocalResult::Ambiguous(earlier, _later) => earlier.timestamp_micros(),
                         LocalResult::None => {
                             chrono::Utc.from_utc_datetime(&naive).timestamp_micros()
                         }
-                    }
-                } else if let Some(off) = parse_fixed_offset(session_tz) {
-                    match off.from_local_datetime(&naive) {
+                    },
+                    SessionTimezone::Offset(off) => match off.from_local_datetime(&naive) {
                         LocalResult::Single(dt) => dt.timestamp_micros(),
                         _ => chrono::Utc.from_utc_datetime(&naive).timestamp_micros(),
+                    },
+                    SessionTimezone::Invalid => {
+                        return Err(format!("invalid session TZ '{session_tz}'"));
                     }
-                } else {
-                    return Err(format!("invalid session TZ '{session_tz}'"));
                 }
             };
             match unit {

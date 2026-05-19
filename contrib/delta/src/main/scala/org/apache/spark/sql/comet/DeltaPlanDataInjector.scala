@@ -44,6 +44,8 @@ import org.apache.comet.serde.OperatorOuterClass.Operator
  */
 object DeltaPlanDataInjector extends PlanDataInjector {
 
+  override val opStructCase: Operator.OpStructCase = Operator.OpStructCase.DELTA_SCAN
+
   override def canInject(op: Operator): Boolean = {
     if (!op.hasDeltaScan) return false
     // The common-only proto produced at planning time has zero tasks. After injection
