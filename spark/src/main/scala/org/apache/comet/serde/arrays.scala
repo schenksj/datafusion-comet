@@ -490,6 +490,10 @@ object CometCreateArray extends CometExpressionSerde[CreateArray] {
     // another. Native execution then panics inside `make_array_inner`. Decline here
     // when any pair of children disagree on data type so Spark's JVM evaluator
     // (which doesn't have this strictness) handles it.
+    //
+    // TODO: remove this decline once apache/datafusion#22366 lands. The upstream fix
+    // will widen the element type via nullability-OR-merge and cast each child before
+    // handing to MutableArrayData, eliminating the need for this caller-side workaround.
     val childTypes = children.map(_.dataType)
     if (childTypes.distinct.size > 1) {
       withInfo(
