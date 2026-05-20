@@ -793,6 +793,15 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       .extractMetadataConfiguration(relation)
       .flatMap(_.get("delta.columnMapping.mode"))
       .exists(_.equalsIgnoreCase("id"))
+    // The general-purpose Parquet field-ID read path also drives `use_field_id`: if
+    // the user has enabled `spark.sql.parquet.fieldId.read.enabled` AND the required
+    // schema already carries Spark's `parquet.field.id` metadata, route through the
+    // same native machinery. CM-id mode is the common Delta case; this catches
+    // non-Delta-id tables that nevertheless want field-ID matching.
+    val sparkFieldIdReadEnabled = SQLConf.get.getConf(SQLConf.PARQUET_FIELD_ID_READ_ENABLED) &&
+      org.apache.spark.sql.execution.datasources.parquet.ParquetUtils.hasFieldIds(
+        scan.requiredSchema)
+    val useFieldIdActive = cmModeIsId || sparkFieldIdReadEnabled
     val dataSchemaForProto =
       if (cmModeIsId) {
         physicalFileDataSchemaFields.map(
@@ -848,7 +857,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     commonBuilder.addAllDataSchema(dataSchema.toIterable.asJava)
     commonBuilder.addAllRequiredSchema(requiredSchema.toIterable.asJava)
     commonBuilder.addAllPartitionSchema(partitionSchema.toIterable.asJava)
-    commonBuilder.setUseFieldId(cmModeIsId)
+    commonBuilder.setUseFieldId(useFieldIdActive)
     commonBuilder.setEmitRowIndex(emitRowIndex)
     commonBuilder.setEmitIsRowDeleted(emitIsRowDeleted)
 

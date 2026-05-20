@@ -258,13 +258,13 @@ object DeltaScanRule {
     if (!isSchemaCometCompatible(scanExec, r)) {
       return None
     }
-    if (session.sessionState.conf.getConf(SQLConf.PARQUET_FIELD_ID_READ_ENABLED) &&
-      ParquetUtils.hasFieldIds(scanExec.requiredSchema)) {
-      withInfo(
-        scanExec,
-        s"${CometDeltaNativeScan.ScanImpl} does not support Parquet field ID matching")
-      return None
-    }
+    // General-purpose Parquet field-ID matching is now wired through the same path as
+    // CM-id mode (#142 commit 7ace165e). When `spark.sql.parquet.fieldId.read.enabled`
+    // is true and `scan.requiredSchema` carries the standard `parquet.field.id`
+    // metadata, `CometDeltaNativeScan.convert` propagates field IDs into the proto via
+    // `serializeDataType`'s StructType arm (which reads `ParquetUtils.hasFieldId`).
+    // The convert path also sets `use_field_id=true` so the native parquet reader
+    // matches by ID. No gate needed.
     val cmMode = DeltaReflection
       .extractMetadataConfiguration(r)
       .flatMap(_.get("delta.columnMapping.mode"))
