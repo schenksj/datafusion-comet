@@ -43,8 +43,16 @@ import org.apache.comet.serde.CometOperatorSerde
  */
 object DeltaIntegration {
 
-  private val ScanRuleClass = "org.apache.comet.contrib.delta.DeltaScanRule"
-  private val SerdeClass = "org.apache.comet.contrib.delta.CometDeltaNativeScan"
+  // Scala compiles `object Foo` into BOTH `Foo.class` (a static-forwarder class) AND
+  // `Foo$.class` (the actual module class). Only the latter has the `MODULE$` singleton
+  // field that the reflection bridge dereferences. Looking up the unqualified name
+  // returns the forwarder, where `getField("MODULE$")` throws -- and the surrounding
+  // try/catch silently turns that into `None`, making every Delta scan fall through to
+  // Spark's reader. (This bug shipped silently until the test suite caught it; the Delta
+  // regression suite was passing because Delta's own tests don't depend on Comet
+  // engaging.) The trailing `$` selects the module class explicitly.
+  private val ScanRuleClass = "org.apache.comet.contrib.delta.DeltaScanRule$"
+  private val SerdeClass = "org.apache.comet.contrib.delta.CometDeltaNativeScan$"
 
   /** scanImpl tag the contrib stamps on CometScanExec markers it produces. */
   val DeltaScanImpl: String = "native_delta_compat"
