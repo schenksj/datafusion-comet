@@ -40,7 +40,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::{Int32Array, RecordBatch, UInt64Array};
+use arrow::array::{Int32Array, Int64Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
@@ -56,12 +56,21 @@ use futures::{Stream, StreamExt};
 pub const ROW_INDEX_COLUMN_NAME: &str = "__delta_internal_row_index";
 /// Delta's internal name for the is-row-deleted column.
 pub const IS_ROW_DELETED_COLUMN_NAME: &str = "__delta_internal_is_row_deleted";
+/// Delta's logical row-id column. Synthesised as `baseRowId + physical_row_index`.
+pub const ROW_ID_COLUMN_NAME: &str = "row_id";
+/// Delta's logical row-commit-version column. Constant per file = `defaultRowCommitVersion`.
+pub const ROW_COMMIT_VERSION_COLUMN_NAME: &str = "row_commit_version";
 
-/// Build an output schema = input fields + the appended synthetic columns.
+/// Build an output schema = input fields + the appended synthetic columns. Order is
+/// fixed: row_index, is_row_deleted, row_id, row_commit_version. Scala-side caller
+/// asserts these are a suffix of `scan.requiredSchema` in the same order so the proto
+/// layout aligns with what Spark expects.
 fn build_output_schema(
     input: &SchemaRef,
     emit_row_index: bool,
     emit_is_row_deleted: bool,
+    emit_row_id: bool,
+    emit_row_commit_version: bool,
 ) -> SchemaRef {
     let mut fields: Vec<Arc<Field>> = input.fields().iter().cloned().collect();
     if emit_row_index {
@@ -72,6 +81,16 @@ fn build_output_schema(
             IS_ROW_DELETED_COLUMN_NAME,
             DataType::Int32,
             false,
+        )));
+    }
+    if emit_row_id {
+        fields.push(Arc::new(Field::new(ROW_ID_COLUMN_NAME, DataType::Int64, true)));
+    }
+    if emit_row_commit_version {
+        fields.push(Arc::new(Field::new(
+            ROW_COMMIT_VERSION_COLUMN_NAME,
+            DataType::Int64,
+            true,
         )));
     }
     Arc::new(Schema::new(fields))
@@ -95,36 +114,61 @@ pub struct DeltaSyntheticColumnsExec {
     /// One entry per output partition. Length must match the input's partition count.
     /// Empty vec means no DV for that partition (all rows are kept).
     deleted_row_indexes_by_partition: Vec<Vec<u64>>,
+    /// `AddFile.baseRowId` per partition; `None` when the table doesn't have row
+    /// tracking enabled for this file. Required to be present (Some(_)) on every
+    /// partition when `emit_row_id` is true.
+    base_row_ids_by_partition: Vec<Option<i64>>,
+    /// `AddFile.defaultRowCommitVersion` per partition; same semantics as
+    /// `base_row_ids_by_partition` but for `emit_row_commit_version`.
+    default_row_commit_versions_by_partition: Vec<Option<i64>>,
     emit_row_index: bool,
     emit_is_row_deleted: bool,
+    emit_row_id: bool,
+    emit_row_commit_version: bool,
     output_schema: SchemaRef,
     plan_properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl DeltaSyntheticColumnsExec {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         deleted_row_indexes_by_partition: Vec<Vec<u64>>,
+        base_row_ids_by_partition: Vec<Option<i64>>,
+        default_row_commit_versions_by_partition: Vec<Option<i64>>,
         emit_row_index: bool,
         emit_is_row_deleted: bool,
+        emit_row_id: bool,
+        emit_row_commit_version: bool,
     ) -> DFResult<Self> {
-        if !emit_row_index && !emit_is_row_deleted {
+        if !emit_row_index && !emit_is_row_deleted && !emit_row_id && !emit_row_commit_version {
             return Err(DataFusionError::Internal(
                 "DeltaSyntheticColumnsExec constructed with nothing to emit".to_string(),
             ));
         }
         let input_props = input.properties();
         let num_partitions = input_props.output_partitioning().partition_count();
-        if deleted_row_indexes_by_partition.len() != num_partitions {
+        if deleted_row_indexes_by_partition.len() != num_partitions
+            || base_row_ids_by_partition.len() != num_partitions
+            || default_row_commit_versions_by_partition.len() != num_partitions
+        {
             return Err(DataFusionError::Internal(format!(
-                "DeltaSyntheticColumnsExec: got {} DV entries for {} partitions",
+                "DeltaSyntheticColumnsExec: per-partition vec lengths don't match input partitions \
+                 ({}): dv={}, base_row_ids={}, default_commit_versions={}",
+                num_partitions,
                 deleted_row_indexes_by_partition.len(),
-                num_partitions
+                base_row_ids_by_partition.len(),
+                default_row_commit_versions_by_partition.len()
             )));
         }
-        let output_schema =
-            build_output_schema(&input.schema(), emit_row_index, emit_is_row_deleted);
+        let output_schema = build_output_schema(
+            &input.schema(),
+            emit_row_index,
+            emit_is_row_deleted,
+            emit_row_id,
+            emit_row_commit_version,
+        );
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             input_props.output_partitioning().clone(),
@@ -134,8 +178,12 @@ impl DeltaSyntheticColumnsExec {
         Ok(Self {
             input,
             deleted_row_indexes_by_partition,
+            base_row_ids_by_partition,
+            default_row_commit_versions_by_partition,
             emit_row_index,
             emit_is_row_deleted,
+            emit_row_id,
+            emit_row_commit_version,
             output_schema,
             plan_properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -147,8 +195,11 @@ impl DisplayAs for DeltaSyntheticColumnsExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "DeltaSyntheticColumnsExec: row_index={}, is_row_deleted={}",
-            self.emit_row_index, self.emit_is_row_deleted
+            "DeltaSyntheticColumnsExec: row_index={}, is_row_deleted={}, row_id={}, row_commit_version={}",
+            self.emit_row_index,
+            self.emit_is_row_deleted,
+            self.emit_row_id,
+            self.emit_row_commit_version
         )
     }
 }
@@ -192,8 +243,12 @@ impl ExecutionPlan for DeltaSyntheticColumnsExec {
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
             self.deleted_row_indexes_by_partition.clone(),
+            self.base_row_ids_by_partition.clone(),
+            self.default_row_commit_versions_by_partition.clone(),
             self.emit_row_index,
             self.emit_is_row_deleted,
+            self.emit_row_id,
+            self.emit_row_commit_version,
         )?))
     }
 
@@ -208,6 +263,12 @@ impl ExecutionPlan for DeltaSyntheticColumnsExec {
             .get(partition)
             .cloned()
             .unwrap_or_default();
+        let base_row_id = self.base_row_ids_by_partition.get(partition).copied().flatten();
+        let default_row_commit_version = self
+            .default_row_commit_versions_by_partition
+            .get(partition)
+            .copied()
+            .flatten();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         Ok(Box::pin(DeltaSyntheticColumnsStream {
             inner: child_stream,
@@ -217,6 +278,10 @@ impl ExecutionPlan for DeltaSyntheticColumnsExec {
             output_schema: Arc::clone(&self.output_schema),
             emit_row_index: self.emit_row_index,
             emit_is_row_deleted: self.emit_is_row_deleted,
+            emit_row_id: self.emit_row_id,
+            emit_row_commit_version: self.emit_row_commit_version,
+            base_row_id,
+            default_row_commit_version,
             baseline_metrics: baseline,
         }))
     }
@@ -234,6 +299,10 @@ struct DeltaSyntheticColumnsStream {
     output_schema: SchemaRef,
     emit_row_index: bool,
     emit_is_row_deleted: bool,
+    emit_row_id: bool,
+    emit_row_commit_version: bool,
+    base_row_id: Option<i64>,
+    default_row_commit_version: Option<i64>,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -274,14 +343,49 @@ impl DeltaSyntheticColumnsStream {
             None
         };
 
+        // row_id: baseRowId + physical row index. Nullable because tables without row
+        // tracking won't have baseRowId; in that case we emit a null-valued column so the
+        // schema still matches.
+        let row_id_array: Option<Int64Array> = if self.emit_row_id {
+            match self.base_row_id {
+                Some(base) => {
+                    let values: Vec<i64> = (batch_start..batch_end)
+                        .map(|idx| base.saturating_add(idx as i64))
+                        .collect();
+                    Some(Int64Array::from(values))
+                }
+                None => Some(Int64Array::from(vec![None as Option<i64>; batch_rows as usize])),
+            }
+        } else {
+            None
+        };
+
+        // row_commit_version: defaultRowCommitVersion (constant per file). Same nullable
+        // semantics as row_id.
+        let row_commit_version_array: Option<Int64Array> = if self.emit_row_commit_version {
+            match self.default_row_commit_version {
+                Some(v) => Some(Int64Array::from(vec![v; batch_rows as usize])),
+                None => Some(Int64Array::from(vec![None as Option<i64>; batch_rows as usize])),
+            }
+        } else {
+            None
+        };
+
         self.current_row_offset = batch_end;
 
-        // Append synthetic columns to the batch.
+        // Append synthetic columns to the batch. Order matches build_output_schema:
+        // row_index, is_row_deleted, row_id, row_commit_version.
         let mut columns: Vec<Arc<dyn arrow::array::Array>> = batch.columns().to_vec();
         if let Some(arr) = row_index_array {
             columns.push(Arc::new(arr));
         }
         if let Some(arr) = is_deleted_array {
+            columns.push(Arc::new(arr));
+        }
+        if let Some(arr) = row_id_array {
+            columns.push(Arc::new(arr));
+        }
+        if let Some(arr) = row_commit_version_array {
             columns.push(Arc::new(arr));
         }
         RecordBatch::try_new(Arc::clone(&self.output_schema), columns).map_err(|e| {

@@ -172,14 +172,13 @@ pub unsafe extern "system" fn Java_org_apache_comet_contrib_delta_Native_planDel
                 // `Vec<u64>` of deleted row indexes by `plan_delta_scan`
                 // (which calls `DvInfo::get_row_indexes` on the driver).
                 deleted_row_indexes: entry.deleted_row_indexes,
-                // Row tracking: kernel 0.19.x doesn't yet surface baseRowId /
-                // defaultRowCommitVersion on the ScanFile path (it's read during
-                // log replay but consumed internally for TransformSpec). Leave
-                // unset on the kernel plan path; the pre-materialised-index
-                // path on the Scala side fills these in from AddFile when
-                // rowTracking is enabled.
-                base_row_id: None,
-                default_row_commit_version: None,
+                // Row tracking: extracted from each scan-files RecordBatch's
+                // `fileConstantValues.baseRowId` / `defaultRowCommitVersion` columns
+                // in scan.rs (see `extract_row_tracking_for_selected`). Kernel's
+                // `visit_scan_files` callback doesn't surface these; we read them
+                // directly. `None` when the table doesn't have row tracking enabled.
+                base_row_id: entry.base_row_id,
+                default_row_commit_version: entry.default_row_commit_version,
                 // Splitting is done on the Scala side just before serialization,
                 // not here on the kernel-driver path. Leave unset.
                 byte_range_start: None,

@@ -302,15 +302,22 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       return None
     }
 
-    // Detect Delta synthetic columns (`__delta_internal_row_index` /
-    // `__delta_internal_is_row_deleted`) the surrounding plan requested. We strip them
+    // Detect Delta synthetic columns the surrounding plan requested. We strip them
     // from the proto schemas sent to native so the parquet reader doesn't look for
     // columns that don't exist on disk, and set the proto emit flags so the dispatcher
     // wraps the parquet scan in `DeltaSyntheticColumnsExec` to append them back.
+    //   - `__delta_internal_row_index` / `__delta_internal_is_row_deleted` are
+    //     UPDATE/DELETE/MERGE internals (#144).
+    //   - `row_id` / `row_commit_version` are row-tracking columns when the table has
+    //     `delta.enableRowTracking=true` but no materialised columns -- synthesised
+    //     from baseRowId + physical row index per task.
     val emitRowIndex = scan.requiredSchema.fieldNames.exists(
       _.equalsIgnoreCase(DeltaReflection.RowIndexColumnName))
     val emitIsRowDeleted = scan.requiredSchema.fieldNames.exists(
       _.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName))
+    val emitRowId = scan.requiredSchema.fieldNames.exists(_.equalsIgnoreCase("row_id"))
+    val emitRowCommitVersion = scan.requiredSchema.fieldNames.exists(
+      _.equalsIgnoreCase("row_commit_version"))
 
     val ignoreMissingFiles =
       SQLConf.get.ignoreMissingFiles ||
@@ -826,10 +833,13 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // handle it (correctness over coverage).
     val syntheticNames = Set(
       DeltaReflection.RowIndexColumnName.toLowerCase(Locale.ROOT),
-      DeltaReflection.IsRowDeletedColumnName.toLowerCase(Locale.ROOT))
+      DeltaReflection.IsRowDeletedColumnName.toLowerCase(Locale.ROOT),
+      "row_id",
+      "row_commit_version")
     val isSynthetic = (f: StructField) =>
       syntheticNames.contains(f.name.toLowerCase(Locale.ROOT))
-    val needsSyntheticEmit = emitRowIndex || emitIsRowDeleted
+    val needsSyntheticEmit =
+      emitRowIndex || emitIsRowDeleted || emitRowId || emitRowCommitVersion
     if (needsSyntheticEmit) {
       val firstSyntheticIdx = requiredSchemaForProto.indexWhere(isSynthetic)
       val syntheticContiguousSuffix = firstSyntheticIdx >= 0 &&
@@ -860,6 +870,8 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     commonBuilder.setUseFieldId(useFieldIdActive)
     commonBuilder.setEmitRowIndex(emitRowIndex)
     commonBuilder.setEmitIsRowDeleted(emitIsRowDeleted)
+    commonBuilder.setEmitRowId(emitRowId)
+    commonBuilder.setEmitRowCommitVersion(emitRowCommitVersion)
 
     // Projection vector maps output positions to (file_data_schema ++ partition_schema)
     // indices. Spark's `FileSourceScanExec` splits its visible schema into

@@ -430,11 +430,13 @@ object DeltaScanRule {
     val rowIdPhysical = cfg.get(DeltaReflection.MaterializedRowIdColumnProp)
     val rowVerPhysical = cfg.get(DeltaReflection.MaterializedRowCommitVersionColumnProp)
     if (rowIdPhysical.isEmpty && rowVerPhysical.isEmpty) {
-      withInfo(
-        scanExec,
-        "Native Delta scan: row-tracking columns present but no materialised column " +
-          "names in Delta metadata; synthesis from baseRowId + row_index is Phase 3.")
-      return Some(None)
+      // No materialised columns -- synthesise row_id (= baseRowId + physical row index)
+      // and row_commit_version (= defaultRowCommitVersion) natively via
+      // `DeltaSyntheticColumnsExec`. The synthesis path runs through the normal
+      // CometDeltaNativeScan.convert flow with the standard `nativeDeltaScan` apply
+      // (no rewrite needed here -- convert() detects the row_id / row_commit_version
+      // columns in scan.requiredSchema and sets the proto emit flags).
+      return None
     }
 
     val renames = scala.collection.mutable.ArrayBuffer.empty[(String, String)]

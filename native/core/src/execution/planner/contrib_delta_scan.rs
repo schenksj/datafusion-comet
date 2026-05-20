@@ -158,20 +158,33 @@ impl PhysicalPlanner {
         // Split files by DV presence -- each DV'd file becomes its own FileGroup so the
         // DeltaDvFilterExec's per-partition mapping is 1:1 with one physical parquet
         // file. All non-DV files go in a single combined group.
+        //
+        // EXCEPT when row-id / row-commit-version synthesis is requested: baseRowId is
+        // per-file (row_id = baseRowId + physical_row_index) and the per-partition row
+        // offset counter doesn't reset across files within a FileGroup. So when emit
+        // is on, give each file its own group regardless of DV presence so the per-file
+        // (baseRowId, defaultRowCommitVersion) lookup is well-defined.
+        let need_per_file_groups = common.emit_row_id || common.emit_row_commit_version;
         let mut file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
         let mut deleted_indexes_per_group: Vec<Vec<u64>> = Vec::new();
+        let mut base_row_ids_per_group: Vec<Option<i64>> = Vec::new();
+        let mut default_commit_versions_per_group: Vec<Option<i64>> = Vec::new();
         let mut non_dv_files: Vec<PartitionedFile> = Vec::new();
         for (file, task) in files.into_iter().zip(scan.tasks.iter()) {
-            if task.deleted_row_indexes.is_empty() {
-                non_dv_files.push(file);
-            } else {
+            if !task.deleted_row_indexes.is_empty() || need_per_file_groups {
                 file_groups.push(vec![file]);
                 deleted_indexes_per_group.push(task.deleted_row_indexes.clone());
+                base_row_ids_per_group.push(task.base_row_id);
+                default_commit_versions_per_group.push(task.default_row_commit_version);
+            } else {
+                non_dv_files.push(file);
             }
         }
         if !non_dv_files.is_empty() {
             file_groups.push(non_dv_files);
             deleted_indexes_per_group.push(Vec::new());
+            base_row_ids_per_group.push(None);
+            default_commit_versions_per_group.push(None);
         }
 
         // Pick any one file to register the object store (they all share the same root).
@@ -219,15 +232,22 @@ impl PhysicalPlanner {
         //  - DV present and no synthetics: wrap with DeltaDvFilterExec which DROPS
         //    deleted rows inline (standard read path).
         //  - Neither: pass through (avoids per-batch overhead).
-        let need_synthetics = common.emit_row_index || common.emit_is_row_deleted;
+        let need_synthetics = common.emit_row_index
+            || common.emit_is_row_deleted
+            || common.emit_row_id
+            || common.emit_row_commit_version;
         let final_exec: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if need_synthetics
         {
             Arc::new(
                 comet_contrib_delta::synthetic_columns::DeltaSyntheticColumnsExec::new(
                     delta_exec,
                     deleted_indexes_per_group,
+                    base_row_ids_per_group,
+                    default_commit_versions_per_group,
                     common.emit_row_index,
                     common.emit_is_row_deleted,
+                    common.emit_row_id,
+                    common.emit_row_commit_version,
                 )
                 .map_err(|e| GeneralError(format!("DeltaSyntheticColumnsExec: {e}")))?,
             )

@@ -60,6 +60,13 @@ pub struct DeltaFileEntry {
     /// Sorted ascending; indexes are 0-based into the file's physical parquet
     /// row space, matching `DvInfo::get_row_indexes` semantics.
     pub deleted_row_indexes: Vec<u64>,
+    /// `AddFile.baseRowId` for row-tracking-enabled tables. `None` when the
+    /// table doesn't have row tracking. `row_id` for any row in this file is
+    /// `base_row_id + physical_row_index`.
+    pub base_row_id: Option<i64>,
+    /// `AddFile.defaultRowCommitVersion` for row-tracking-enabled tables.
+    /// `None` when the table doesn't have row tracking. Constant per file.
+    pub default_row_commit_version: Option<i64>,
 }
 
 impl DeltaFileEntry {
@@ -200,6 +207,15 @@ pub fn plan_delta_scan_with_predicate(
     // Temporary collection that keeps the raw kernel `DvInfo` alongside the
     // rest of the metadata. We need the `DvInfo` to materialize the deleted
     // row indexes below; it doesn't escape this function.
+    //
+    // `base_row_id` / `default_row_commit_version` are extracted from each
+    // scan-files batch's underlying RecordBatch via direct column access --
+    // `ScanFile` (what kernel's `visit_scan_files` callback receives) doesn't
+    // surface them. Comet's native synthetic-columns exec uses them to
+    // synthesise Delta's logical `row_id` (= baseRowId + row_index) and
+    // `row_commit_version` (= defaultRowCommitVersion, constant per file) so
+    // row-tracking-enabled tables can stay on the native path instead of
+    // falling back to Spark's Delta reader for these projections.
     struct RawEntry {
         path: String,
         size: i64,
@@ -207,28 +223,57 @@ pub fn plan_delta_scan_with_predicate(
         num_records: Option<u64>,
         partition_values: HashMap<String, String>,
         dv_info: delta_kernel::scan::state::DvInfo,
+        base_row_id: Option<i64>,
+        default_row_commit_version: Option<i64>,
     }
 
-    let mut raw: Vec<RawEntry> = Vec::new();
+    // Kernel's `visit_scan_files` requires a `fn` callback (not `FnMut`), so any
+    // per-call state must live in the `context` we pass in. Use a struct that carries
+    // both the accumulator AND the row-tracking lookup for the current batch.
+    struct RawEntryAcc {
+        entries: Vec<RawEntry>,
+        row_tracking: Vec<(Option<i64>, Option<i64>)>,
+        next_idx: usize,
+    }
+    let mut acc = RawEntryAcc {
+        entries: Vec::new(),
+        row_tracking: Vec::new(),
+        next_idx: 0,
+    };
     let scan_metadata = scan.scan_metadata(&*engine)?;
 
     for meta_result in scan_metadata {
         let meta: delta_kernel::scan::ScanMetadata = meta_result?;
-        raw = meta.visit_scan_files(
-            raw,
-            |acc: &mut Vec<RawEntry>, scan_file: delta_kernel::scan::state::ScanFile| {
+        // Pre-extract baseRowId / defaultRowCommitVersion for the SELECTED rows in
+        // this batch. Kernel's `visit_scan_files` walks selected rows in order; we
+        // build a parallel vec indexed by visit order, so the callback can pull each
+        // row's tracking values via a shared counter.
+        acc.row_tracking = extract_row_tracking_for_selected(&meta)?;
+        acc.next_idx = 0;
+        acc = meta.visit_scan_files(
+            acc,
+            |acc: &mut RawEntryAcc, scan_file: delta_kernel::scan::state::ScanFile| {
                 let num_records = scan_file.stats.as_ref().map(|s| s.num_records);
-                acc.push(RawEntry {
+                let (base_row_id, default_row_commit_version) = acc
+                    .row_tracking
+                    .get(acc.next_idx)
+                    .copied()
+                    .unwrap_or((None, None));
+                acc.next_idx += 1;
+                acc.entries.push(RawEntry {
                     path: scan_file.path,
                     size: scan_file.size,
                     modification_time: scan_file.modification_time,
                     num_records,
                     partition_values: scan_file.partition_values,
                     dv_info: scan_file.dv_info,
+                    base_row_id,
+                    default_row_commit_version,
                 });
             },
         )?;
     }
+    let raw = acc.entries;
 
     // For each file that has a DV attached, ask kernel to materialize the
     // deleted row indexes. Kernel handles inline bitmaps, on-disk DV files,
@@ -260,6 +305,8 @@ pub fn plan_delta_scan_with_predicate(
             num_records: r.num_records,
             partition_values: r.partition_values,
             deleted_row_indexes,
+            base_row_id: r.base_row_id,
+            default_row_commit_version: r.default_row_commit_version,
         });
     }
 
@@ -328,6 +375,63 @@ fn ensure_trailing_slash(url: &mut Url) {
     if !path.ends_with('/') {
         url.set_path(&format!("{path}/"));
     }
+}
+
+/// Extract `(baseRowId, defaultRowCommitVersion)` per SELECTED row from a `ScanMetadata`
+/// batch's underlying `RecordBatch`. Kernel's `visit_scan_files` callback receives a
+/// `ScanFile` that does NOT surface these row-tracking values; they live in the raw
+/// `fileConstantValues` struct column on the underlying arrow batch.
+///
+/// `kernel/src/scan/log_replay.rs::SCAN_ROW_SCHEMA` defines the schema:
+///   { path, size, modificationTime, stats, deletionVector,
+///     fileConstantValues: { partitionValues, baseRowId, defaultRowCommitVersion, tags } }
+/// So the fileConstantValues struct is the 6th top-level field (index 5), and within it
+/// baseRowId is at field index 1 and defaultRowCommitVersion at field index 2.
+///
+/// Returns one `(Option<i64>, Option<i64>)` per SELECTED row, in visit_scan_files order.
+/// Rows where row tracking isn't enabled have `(None, None)`.
+fn extract_row_tracking_for_selected(
+    meta: &delta_kernel::scan::ScanMetadata,
+) -> DeltaResult<Vec<(Option<i64>, Option<i64>)>> {
+    use delta_kernel::arrow::array::{Array, Int64Array, StructArray};
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    let engine_data = meta.scan_files.data();
+    let arrow = match engine_data.any_ref().downcast_ref::<ArrowEngineData>() {
+        Some(a) => a,
+        // Non-Arrow engine (shouldn't happen for our DefaultEngine path); return empty
+        // so downstream sees (None, None) per row and the row-tracking decline gate
+        // takes over.
+        None => return Ok(Vec::new()),
+    };
+    let batch = arrow.record_batch();
+    let total_rows = batch.num_rows();
+
+    let file_constants = batch
+        .column_by_name("fileConstantValues")
+        .and_then(|c| c.as_any().downcast_ref::<StructArray>());
+    let (base_arr, default_arr): (Option<&Int64Array>, Option<&Int64Array>) = match file_constants
+    {
+        Some(s) => (
+            s.column_by_name("baseRowId")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>()),
+            s.column_by_name("defaultRowCommitVersion")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>()),
+        ),
+        None => (None, None),
+    };
+
+    let sel = meta.scan_files.selection_vector();
+    let mut out: Vec<(Option<i64>, Option<i64>)> =
+        Vec::with_capacity(sel.iter().filter(|b| **b).count());
+    for i in 0..total_rows {
+        if !*sel.get(i).unwrap_or(&false) {
+            continue;
+        }
+        let b = base_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
+        let d = default_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
+        out.push((b, d));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

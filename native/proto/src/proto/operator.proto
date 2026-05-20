@@ -316,6 +316,11 @@ message DeltaScanCommon {
   // from row positions / DV bitmaps and inserted after the parquet read.
   bool emit_row_index = 18;
   bool emit_is_row_deleted = 19;
+  // Row-tracking synthesis (row_id = baseRowId + physical_row_index,
+  // row_commit_version = defaultRowCommitVersion). Per-task baseRowId /
+  // defaultRowCommitVersion travel on `DeltaScanTask` (fields 6 + 7).
+  bool emit_row_id = 20;
+  bool emit_row_commit_version = 21;
 }
 
 // Operator payload for a Delta scan.
