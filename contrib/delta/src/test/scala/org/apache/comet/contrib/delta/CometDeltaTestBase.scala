@@ -130,6 +130,28 @@ trait CometDeltaTestBase extends CometTestBase with AdaptiveSparkPlanHelper {
    *   1. The native plan contains `CometDeltaNativeScanExec`
    *   2. The result rows match vanilla Spark's result rows (order-independent)
    */
+  /**
+   * Assert that `df`'s executed plan (after a forced `.collect()` so AQE
+   * materialises rules) contains at least one operator with simple class name
+   * matching each name in `expectedExecs`. Fails with the full plan in the
+   * message when something's missing -- a hard guard against silent
+   * Comet-disengagement bugs like the contrib-delta inert bridge.
+   *
+   * Example:
+   *   assertNativePlanContains(df, "CometDeltaNativeScanExec", "CometFilter")
+   */
+  protected def assertNativePlanContains(df: DataFrame, expectedExecs: String*): Unit = {
+    // Force AQE to materialise so injected QueryStagePrepRule rules fire.
+    df.collect()
+    val plan = df.queryExecution.executedPlan
+    val present = plan.collect { case p => p.getClass.getSimpleName }.toSet
+    val missing = expectedExecs.filterNot(present.contains)
+    assert(
+      missing.isEmpty,
+      s"expected execs missing from plan: ${missing.mkString(", ")}\n" +
+        s"present execs: ${present.mkString(", ")}\nfull plan:\n$plan")
+  }
+
   protected def assertDeltaNativeMatches(
       tablePath: String,
       query: DataFrame => DataFrame): Unit = {
