@@ -96,8 +96,11 @@ private[comet] object PlanDataInjector {
     val builtin: Seq[PlanDataInjector] = Seq(IcebergPlanDataInjector, NativeScanPlanDataInjector)
     val deltaOpt: Option[PlanDataInjector] =
       try {
+        // Scala compiles `object Foo` into BOTH `Foo.class` (a static-forwarder
+        // class with no MODULE$ field) AND `Foo$.class` (the module class that
+        // does have MODULE$). The trailing `$` selects the module class.
         // scalastyle:off classforname
-        val cls = Class.forName("org.apache.spark.sql.comet.DeltaPlanDataInjector")
+        val cls = Class.forName("org.apache.spark.sql.comet.DeltaPlanDataInjector$")
         // scalastyle:on classforname
         Some(cls.getField("MODULE$").get(null).asInstanceOf[PlanDataInjector])
       } catch {
