@@ -41,6 +41,21 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
  */
 trait CometDeltaTestBase extends CometTestBase with AdaptiveSparkPlanHelper {
 
+  /**
+   * True iff the io.delta.spark classes are on the test classpath. When false, the test
+   * harness can `assume(deltaSparkAvailable, ...)` to skip tests rather than throw.
+   * Useful for builds without `-Pcontrib-delta` that still want the test classes to
+   * compile (the contrib's reflective bridge means we don't strictly need delta-spark
+   * at compile time even when we do need it at test runtime).
+   */
+  protected def deltaSparkAvailable: Boolean =
+    try {
+      Class.forName("org.apache.spark.sql.delta.DeltaParquetFileFormat")
+      true
+    } catch {
+      case _: ClassNotFoundException => false
+    }
+
   override protected def sparkConf: SparkConf = {
     val conf = super.sparkConf
     conf.set("spark.comet.scan.deltaNative.enabled", "true")
