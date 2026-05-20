@@ -321,6 +321,14 @@ message DeltaScanCommon {
   // defaultRowCommitVersion travel on `DeltaScanTask` (fields 6 + 7).
   bool emit_row_id = 20;
   bool emit_row_commit_version = 21;
+  // When synthetic columns aren't a contiguous suffix of `required_schema`, this
+  // sequence tells the native dispatcher how to project the final output. Each
+  // entry is an index into [parquet_output, appended_synthetics] -- positive
+  // means a column from the (stripped) parquet read at that index; the synthetic
+  // tail comes after, in the canonical row_index, is_row_deleted, row_id,
+  // row_commit_version order. Empty = synthetics are already a suffix; no
+  // reorder needed.
+  repeated int32 final_output_indices = 22;
 }
 
 // Operator payload for a Delta scan.

@@ -840,18 +840,42 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       syntheticNames.contains(f.name.toLowerCase(Locale.ROOT))
     val needsSyntheticEmit =
       emitRowIndex || emitIsRowDeleted || emitRowId || emitRowCommitVersion
-    if (needsSyntheticEmit) {
+    // When synthetics are NOT a contiguous suffix of required_schema, build a reorder
+    // map: for each original required-schema position, an index into the wrapped exec's
+    // output (parquet output cols followed by appended synthetics in canonical order
+    // row_index, is_row_deleted, row_id, row_commit_version). The native dispatcher
+    // applies a final ProjectionExec to reorder columns to match Spark's expected
+    // output layout. Empty when synthetics ARE a suffix -- already in the right order.
+    val finalOutputIndices: Seq[Int] = if (!needsSyntheticEmit) Seq.empty
+    else {
       val firstSyntheticIdx = requiredSchemaForProto.indexWhere(isSynthetic)
       val syntheticContiguousSuffix = firstSyntheticIdx >= 0 &&
         requiredSchemaForProto.drop(firstSyntheticIdx).forall(isSynthetic)
-      if (!syntheticContiguousSuffix) {
-        import org.apache.comet.CometSparkSessionExtensions.withInfo
-        withInfo(
-          scan,
-          "Native Delta scan declines: Delta synthetic columns are not a suffix of " +
-            "required_schema, so the wrapped DeltaSyntheticColumnsExec output order " +
-            "would not match Spark's expected output.")
-        return None
+      if (syntheticContiguousSuffix) Seq.empty
+      else {
+        // Native synthetic emit order in build_output_schema (synthetic_columns.rs):
+        // row_index, is_row_deleted, row_id, row_commit_version. Skip absent ones.
+        val syntheticEmitOrder: Seq[String] = Seq(
+          (emitRowIndex, DeltaReflection.RowIndexColumnName),
+          (emitIsRowDeleted, DeltaReflection.IsRowDeletedColumnName),
+          (emitRowId, "row_id"),
+          (emitRowCommitVersion, "row_commit_version")).collect {
+          case (true, name) => name.toLowerCase(Locale.ROOT)
+        }
+        val nonSyntheticFields = requiredSchemaForProto.filterNot(isSynthetic)
+        val nonSyntheticIdxByName: Map[String, Int] =
+          nonSyntheticFields.zipWithIndex.map { case (f, i) =>
+            f.name.toLowerCase(Locale.ROOT) -> i
+          }.toMap
+        val syntheticTailStart = nonSyntheticFields.length
+        requiredSchemaForProto.map { f =>
+          val name = f.name.toLowerCase(Locale.ROOT)
+          if (isSynthetic(f)) {
+            syntheticTailStart + syntheticEmitOrder.indexOf(name)
+          } else {
+            nonSyntheticIdxByName(name)
+          }
+        }
       }
     }
     val requiredSchemaForProtoStripped =
@@ -872,6 +896,8 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     commonBuilder.setEmitIsRowDeleted(emitIsRowDeleted)
     commonBuilder.setEmitRowId(emitRowId)
     commonBuilder.setEmitRowCommitVersion(emitRowCommitVersion)
+    commonBuilder.addAllFinalOutputIndices(
+      finalOutputIndices.map(i => Integer.valueOf(i)).asJava)
 
     // Projection vector maps output positions to (file_data_schema ++ partition_schema)
     // indices. Spark's `FileSourceScanExec` splits its visible schema into

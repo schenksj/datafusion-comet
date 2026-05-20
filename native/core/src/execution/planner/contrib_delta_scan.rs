@@ -260,6 +260,31 @@ impl PhysicalPlanner {
             delta_exec
         };
 
+        // If synthetic columns aren't a suffix of the user-visible required_schema,
+        // `final_output_indices` is set and we project to reorder. Each entry is an
+        // index into the wrapped exec's output schema (parquet columns first, then
+        // appended synthetics in the canonical row_index/is_row_deleted/row_id/
+        // row_commit_version order). Empty => already in the right order.
+        let final_exec = if !common.final_output_indices.is_empty() {
+            let wrapped_schema = final_exec.schema();
+            let projections: Vec<(Arc<dyn PhysicalExpr>, String)> = common
+                .final_output_indices
+                .iter()
+                .map(|idx| {
+                    let i = *idx as usize;
+                    let field = wrapped_schema.field(i);
+                    let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), i));
+                    (col, field.name().clone())
+                })
+                .collect();
+            Arc::new(
+                ProjectionExec::try_new(projections, final_exec)
+                    .map_err(|e| GeneralError(format!("final reorder ProjectionExec: {e}")))?,
+            ) as Arc<dyn datafusion::physical_plan::ExecutionPlan>
+        } else {
+            final_exec
+        };
+
         // When column mapping is active, the scan's output schema carries PHYSICAL
         // column names. Upstream operators reference columns by LOGICAL name, so add a
         // ProjectionExec aliasing each physical column back to its logical name.
