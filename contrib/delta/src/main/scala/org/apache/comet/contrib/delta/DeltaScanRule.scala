@@ -80,7 +80,14 @@ object DeltaScanRule {
       session: SparkSession,
       scanExec: FileSourceScanExec,
       relation: HadoopFsRelation): Option[SparkPlan] = {
-    if (!DeltaReflection.isDeltaFileFormat(relation.fileFormat)) return None
+    // Accept either: (a) the relation's fileFormat is DeltaParquetFileFormat, OR (b) the
+    // relation's location is a Delta-internal FileIndex (e.g. PreparedDeltaFileIndex). The
+    // latter shape occurs when Delta's PreprocessTableWithDVs strategy has already rewritten
+    // the scan to plain Parquet over the Delta-internal index -- the underlying table is still
+    // Delta, the contrib still needs to handle it.
+    val isDeltaScan = DeltaReflection.isDeltaFileFormat(relation.fileFormat) ||
+      DeltaReflection.isBatchFileIndex(relation.location)
+    if (!isDeltaScan) return None
     val pre = preTransform(plan, session)
     val target = pre.find(_.fastEquals(scanExec)).getOrElse(scanExec).asInstanceOf[FileSourceScanExec]
     transformV1(pre, target, session)
@@ -107,7 +114,12 @@ object DeltaScanRule {
 
   private def collectDeltaScanBelow(plan: SparkPlan): Option[FileSourceScanExec] = plan match {
     case scan: FileSourceScanExec
-        if DeltaReflection.isDeltaFileFormat(scan.relation.fileFormat) =>
+        if DeltaReflection.isDeltaFileFormat(scan.relation.fileFormat) ||
+          DeltaReflection.isBatchFileIndex(scan.relation.location) =>
+      // Either the fileFormat is `DeltaParquetFileFormat`, OR Delta's
+      // `PreprocessTableWithDVs` strategy has already rewritten the scan to
+      // plain `ParquetFileFormat` over a Delta-internal FileIndex (e.g.
+      // `PreparedDeltaFileIndex`). Both shapes are Delta-originating.
       Some(scan)
     case other if other.children.size == 1 => collectDeltaScanBelow(other.children.head)
     case _ => None
