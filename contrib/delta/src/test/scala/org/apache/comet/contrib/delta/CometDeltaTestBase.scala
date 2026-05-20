@@ -63,6 +63,17 @@ trait CometDeltaTestBase extends CometTestBase with AdaptiveSparkPlanHelper {
     conf.set("spark.comet.scan.deltaNative.enabled", "true")
     conf.set("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
     conf.set("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem")
+    // Comet registers via injectQueryStagePrepRule, which only fires for plans wrapped
+    // in AdaptiveSparkPlanExec. AQE skips simple plans without exchanges; forcing it on
+    // here ensures every test plan goes through query-stage prep and Comet's rules see
+    // every scan. (The regression-script sbt run gets AQE-wrapped plans naturally
+    // because Delta's own queries always include joins/exchanges.)
+    conf.set("spark.sql.adaptive.enabled", "true")
+    conf.set("spark.sql.adaptive.forceApply", "true")
+    // Pin Spark to loopback so the test JVM doesn't try to reach a remote executor at
+    // the host's LAN IP (which may be unreachable when Wi-Fi state is off-network).
+    conf.set("spark.driver.bindAddress", "127.0.0.1")
+    conf.set("spark.driver.host", "localhost")
     conf
   }
 
@@ -123,12 +134,17 @@ trait CometDeltaTestBase extends CometTestBase with AdaptiveSparkPlanHelper {
       tablePath: String,
       query: DataFrame => DataFrame): Unit = {
     val native = query(spark.read.format("delta").load(tablePath))
+    // Materialise first so AQE runs its query-stage prep rules (including
+    // Comet's CometScanRule). Inspecting `executedPlan` BEFORE collect
+    // returns the AdaptiveSparkPlanExec wrapper with isFinalPlan=false and
+    // no rewrites applied -- Comet's rules fire lazily when AQE materialises
+    // a stage. After collect, executedPlan reflects the finalized plan.
+    val nativeRows = native.collect().toSeq.map(normalizeRow)
     val plan = native.queryExecution.executedPlan
     val deltaScans = collect(plan) { case s: CometDeltaNativeScanExec => s }
     assert(
       deltaScans.nonEmpty,
       s"expected CometDeltaNativeScanExec in plan, got:\n$plan")
-    val nativeRows = native.collect().toSeq.map(normalizeRow)
 
     withSQLConf("spark.comet.scan.deltaNative.enabled" -> "false") {
       val vanillaRows = query(spark.read.format("delta").load(tablePath))
