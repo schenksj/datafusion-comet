@@ -69,44 +69,61 @@ targets / Maven invocations that do so).
 
 ## Maven profile
 
-`spark/pom.xml` declares the `contrib-delta` profile:
+`spark/pom.xml` declares the `contrib-delta` profile, which does two things:
+
+1. Adds `io.delta:delta-spark` at provided scope so the contrib's
+   reflective helpers and tests have the Delta types on the classpath at
+   compile time
+2. Adds `contrib/delta/src/main/scala/` as an extra source directory via
+   `build-helper-maven-plugin` so its sources compile into `comet-spark.jar`
 
 ```xml
 <profile>
   <id>contrib-delta</id>
+  <properties>
+    <delta.version>4.1.0</delta.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>io.delta</groupId>
+      <artifactId>delta-spark_${scala.binary.version}</artifactId>
+      <version>${delta.version}</version>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
   <build>
-    <resources>
-      <resource><directory>${project.basedir}/../contrib/delta/src/main/resources</directory></resource>
-    </resources>
     <plugins>
       <plugin>
         <artifactId>build-helper-maven-plugin</artifactId>
         <executions>
           <execution>
-            <id>add-contrib-delta-sources</id>
+            <id>add-contrib-delta-source</id>
+            <phase>generate-sources</phase>
             <goals><goal>add-source</goal></goals>
             <configuration>
               <sources>
-                <source>${project.basedir}/../contrib/delta/src/main/scala</source>
+                <source>${project.parent.basedir}/contrib/delta/src/main/scala</source>
               </sources>
             </configuration>
           </execution>
         </executions>
       </plugin>
     </plugins>
-    <dependencies>
-      <!-- delta-spark, kernel-rs binding (test scope), Hadoop S3A -->
-    </dependencies>
   </build>
 </profile>
 ```
 
-The resources directory contains
-`META-INF/services/org.apache.spark.sql.SparkSessionExtensionsProvider`
-listing the contrib's Spark extension class. With the profile active,
-that resource lands in the JAR and Spark auto-loads the extension when
-`spark.sql.extensions` is set (or, in Delta-aware Spark sessions, when
-Delta itself adds extensions and we register alongside).
+The Maven profile does *not* trigger the native Cargo build — that is a
+separate invocation. Operators must remember to pass
+`--features contrib-delta` to the Cargo command (or set the equivalent
+environment variable used by `make release`) so the dylib and the JAR end
+up consistent. The build invariants section below covers the supported
+combinations.
+
+The contrib registers its Spark extension reflectively from
+`DeltaIntegration` rather than via
+`META-INF/services/SparkSessionExtensionsProvider`, so no service file is
+required.
 
 ## What the `comet-spark` JAR looks like
 
@@ -117,8 +134,6 @@ Delta itself adds extensions and we register alongside).
 | `org.apache.comet.contrib.delta.DeltaScanRule` | absent | present |
 | `org.apache.comet.contrib.delta.CometDeltaNativeScan` | absent | present |
 | `org.apache.comet.contrib.delta.DeltaPlanDataInjector` | absent | present |
-| `META-INF/services/...SparkSessionExtensionsProvider` | absent | present |
-
 A `default` consumer is therefore entirely free of Delta classes. Running
 the default JAR against a Delta workload simply means
 `DeltaIntegration.transformV1IfDelta` returns `None` and Spark's
@@ -154,21 +169,21 @@ For a Comet binary that supports Delta:
 
 ```bash
 # Build the native dylib with the contrib feature
-make release  # or: cargo build -p comet --features contrib-delta --release
+cargo build -p comet --features contrib-delta --release
 
 # Build and install the comet-spark JAR with the contrib profile
 mvn -Pspark-4.1 -Pcontrib-delta -DskipTests install
 ```
 
-The `make release` target reads `COMET_FEATURES` if set; for our case the
-Maven invocation also has to pass the feature, which the `spark` POM
-arranges via `comet.native.features=contrib-delta` when the profile is
-active.
+The two commands are independent — the Maven build doesn't drive the
+Cargo build. The regression script `contrib/delta/dev/run-regression.sh`
+runs both in the right order, which is the easiest way to keep them in
+sync during iteration.
 
 For default (no Delta) builds, omit both switches:
 
 ```bash
-make release
+cargo build -p comet --release
 mvn -Pspark-4.1 -DskipTests install
 ```
 

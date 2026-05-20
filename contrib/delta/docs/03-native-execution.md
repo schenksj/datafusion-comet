@@ -25,18 +25,25 @@ Conceptually:
 
 ```
 DataSourceExec(ParquetSource over the file list)
-    ↓  (optional, if any task has a DV)
-DeltaDvFilterExec
-    ↓  (optional, if column mapping = name)
+    ↓  (optional, if column mapping mode requires it AND physical/logical names differ)
 ProjectionExec  (physical → logical rename)
-    ↓  (optional, if any emit_* flag is set)
-DeltaSyntheticColumnsExec
-    ↓  (optional, if synthetics are not a suffix of required_schema)
+    ↓  (exactly one of the two, depending on what the surrounding plan asks for)
+DeltaSyntheticColumnsExec    ── if any emit_* flag is set
+        ── OR ──
+DeltaDvFilterExec            ── else if any task has a DV
+    ↓  (optional, if synthetics are present and not a suffix of required_schema)
 ProjectionExec  (reorder via final_output_indices)
 ```
 
 Each layer is added only when needed; the simplest case (no DV, no CM, no
 synthetics) is just `DataSourceExec`.
+
+The synthetic-columns exec and the DV-filter exec are **mutually exclusive**.
+This is intentional: when synthetics are emitted, the surrounding Delta plan
+(UPDATE/DELETE/MERGE rewrite) wants `is_row_deleted` populated and ALL rows
+kept so it can decide what to do with each row itself. When synthetics are
+NOT emitted, the standard read path wants deleted rows dropped inline. The
+two needs never coincide.
 
 ### Layer 1: `ParquetSource`
 
@@ -48,21 +55,38 @@ from the per-task file lists, passing:
 - `with_field_id(true)` when `common.use_field_id` is set, so the reader
   matches by `PARQUET:field_id` rather than by name
 
-**FileGroup layout**. When any `emit_*` flag is on, every file gets its own
-`FileGroup`. This matters because `DeltaSyntheticColumnsExec` maintains a
-per-partition row counter and a per-partition DV-walk cursor — both of which
-must reset at file boundaries. If two files shared a group, the counter would
-keep climbing across the boundary and produce wrong `row_index` / `row_id`
-values.
+**FileGroup layout**. When any `emit_*` flag is on (or any task carries a
+DV), every file gets its own `FileGroup`. This matters because both
+`DeltaSyntheticColumnsExec` and `DeltaDvFilterExec` index per-partition
+state vectors (deleted-row indexes, base row IDs, commit versions) by the
+DataFusion partition index passed to `execute()`. Each `FileGroup` becomes
+one partition, so one-file-per-group is what makes "partition index = file
+index" hold.
 
-When no synthetics are emitted, files can pack into shared groups for better
-parallelism.
+When neither synthetics nor DVs are involved, files can pack into shared
+groups for better parallelism.
 
-### Layer 2: `DeltaDvFilterExec`
+### Layer 2: column-mapping rename projection (runs BEFORE either layer 3 or 4)
+
+When `column_mapping_mode = "name"` (or `id` if physical names still differ),
+the parquet read produced columns under their physical names (e.g.
+`col-1a2b3c`). The downstream layers expect *logical* names. We insert a
+`ProjectionExec` that renames physical → logical right after the parquet
+source.
+
+The rename runs before synthetics for two reasons:
+
+- Synthetic columns have fixed names (`row_id`, `__delta_internal_*`)
+  that are never CM-renamed; we want the parquet output already in logical
+  form when we append synthetics
+- The synthetic exec's input-schema check uses logical names; running rename
+  first makes that check correct
+
+### Layer 3a: `DeltaDvFilterExec` (when no synthetics are requested)
 
 If any task in the partition has a non-empty `deleted_row_indexes` (computed
-by kernel-rs on the driver from the DV file), we wrap the parquet output with
-this filter exec. It:
+by kernel-rs on the driver from the DV file) AND no `emit_*` flag is set, we
+wrap with this filter exec. It:
 
 1. Maintains a `current_row_offset: u64` across batches (assumes
    physical-order input)
@@ -82,22 +106,7 @@ parquet source would silently reshuffle rows and the offset-based filter
 would produce garbage. The DV filter would still "work" without errors —
 it'd just delete the wrong rows.
 
-### Layer 3: column-mapping rename projection
-
-When `column_mapping_mode = "name"`, the parquet read produced columns under
-their physical names (e.g. `col-1a2b3c`). The synthetic-column detection
-downstream looks for `row_id` / `__delta_internal_row_index` etc. by *logical*
-name. We insert a `ProjectionExec` that renames physical → logical so the
-downstream layers can see what they expect.
-
-This projection runs BEFORE the synthetic wrap. Two reasons:
-
-- Synthetic columns have fixed names that are never CM-renamed; we want the
-  parquet output already in logical form when we append synthetics
-- The synthetic exec's "is this column already in the input?" check uses
-  logical names; running rename first makes that check correct
-
-### Layer 4: `DeltaSyntheticColumnsExec`
+### Layer 3b: `DeltaSyntheticColumnsExec` (when any emit flag is set)
 
 This is the most Delta-specific piece. Source: `contrib/delta/native/src/synthetic_columns.rs`.
 
@@ -110,16 +119,22 @@ The exec appends up to four columns onto the parquet output:
 | `row_id` | Int64 | `task.base_row_id + physical_row_index` (per file) |
 | `row_commit_version` | Int64 | `task.default_row_commit_version` (constant per file) |
 
-The exec sees task boundaries via `FileGroup` partitioning (see Layer 1 note).
-Inside a task, it processes batches in physical order; the per-task state is
-`{file_row_offset, next_delete_idx}`. After each batch:
+State is per **DataFusion partition**, not per file. Each `FileGroup` becomes
+its own DataFusion partition (because `need_per_file_groups = true` whenever
+any `emit_*` flag is set — see Layer 1), so each file gets its own
+`execute(partition_idx, ...)` call with a fresh `DeltaSyntheticColumnsStream`.
+Inside that stream the state is `{current_row_offset, next_delete_idx,
+base_row_id, default_row_commit_version}`, all looked up by `partition_idx`
+from the per-partition vectors threaded down by the planner. After each
+batch:
 
-- `file_row_offset += batch.num_rows()`
+- `current_row_offset += batch.num_rows()`
 - `next_delete_idx` advances past any DV indexes consumed in this batch
-  (this writeback was a review-fix — earlier versions re-walked from 0 each batch)
+  (this writeback was a review-fix — earlier versions re-walked from 0 each
+  batch)
 
-When a task finishes (the parquet reader signals end-of-file via a stream
-boundary), the per-task state resets.
+There is no explicit "task finished" reset. State doesn't need to reset
+because each partition's stream object only ever sees rows from one file.
 
 **Why we synthesise rather than read from a materialised column**. Delta
 *can* materialise `row_id` / `row_commit_version` into the parquet files at
@@ -131,7 +146,7 @@ cases uniformly: the planner sets `emit_row_id = true` only when materialisation
 is NOT available; when materialisation IS available, the column comes through
 the parquet read like any other column.
 
-### Layer 5: reorder projection
+### Layer 4: reorder projection
 
 `required_schema` might want synthetics in non-suffix positions. The driver
 computed `final_output_indices` (a permutation of `[0..n]`) and put it in the

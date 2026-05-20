@@ -8,42 +8,55 @@ existing `CometScanRule` runs as a strategy rewrite: it looks at each scan
 node and decides whether to replace it with a native equivalent.
 
 The Delta contrib adds one arm to that rule via reflection. From
-`spark/.../CometScanRule.scala`:
+`spark/.../CometScanRule.scala`, inside the per-`FileSourceScanExec` match
+on `HadoopFsRelation`:
 
 ```scala
-DeltaIntegration.transformV1IfDelta(spark, plan).foreach { return _ }
+DeltaIntegration.transformV1IfDelta(plan, session, scanExec, r) match {
+  case Some(handled) => return handled
+  case None          => // proceed with vanilla logic
+}
 ```
 
 `DeltaIntegration` is a thin Scala object in *core* that:
 
 1. On first call, reflectively looks up
    `org.apache.comet.contrib.delta.DeltaScanRule#transformV1IfDelta`
+   with signature `(SparkPlan, SparkSession, FileSourceScanExec, HadoopFsRelation)`
 2. Caches the resolved `Method` handle in a `@volatile var`
-3. Invokes it with `(spark, plan)` and returns `Option[SparkPlan]`
+3. Invokes it and returns `Option[SparkPlan]` — `Some(handled)` if the
+   contrib either claimed the scan or declined it via its own `withInfo`
+   fallback marker; `None` if the relation isn't a Delta relation at all
 
 If the classpath lookup fails (default build, no contrib), the cached value
 is `Some(None)` — a "definitely not present" marker — and subsequent calls
 short-circuit. This is the only point in core that knows about Delta.
 
-`DeltaScanRule.transformV1IfDelta` in the contrib then walks the plan tree
-looking for Delta `LogicalRelation`s and applies a series of gates (covered
-in `06-fallback-and-ops.md`). If all gates pass, it builds a
-`CometDeltaNativeScanExec` and substitutes it.
+`DeltaScanRule.transformV1IfDelta` in the contrib first checks whether the
+relation's `fileFormat` is `DeltaParquetFileFormat` (via reflection, no
+compile-time delta-spark dependency), then applies a series of gates
+(covered in `06-fallback-and-ops.md`). If all gates pass, it returns a
+`CometScanExec` marker that flows through the standard
+`CometExecRule.convertToComet` path and ultimately routes through
+`CometDeltaNativeScan` for proto serialisation.
 
 ## What `CometDeltaNativeScanExec` looks like
 
 It's a `LeafExecNode` with these responsibilities:
 
-- Hold the original `relation`, `output`, `dataFilters`, `partitionFilters`
-- Track DPP partition pruning state (`@transient lazy val selectedPartitions`)
-- At `doExecute()` time, ask `CometDeltaNativeScan.convert` to produce a
-  proto-serialised plan, then delegate to the existing
-  `CometNativeScanExec.compute` path to ship it to executors
+- Hold the original `relation`, `output`, `dataFilters`, `partitionFilters`,
+  plus a `dppFilters: Seq[Expression]` list for DPP
+- Lazily produce `commonBytes` (the common proto block) and `allTasks` (the
+  resolved kernel-rs task list) — both `@transient lazy val`s
+- At `doExecuteColumnar()` time, apply any now-resolved DPP filters against
+  `allTasks`, serialise per-partition task bytes, and route through Comet's
+  existing native exec path
 
-There is no rebuild during normal execution. `selectedPartitions` is a `lazy
-val` that triggers a single kernel-rs scan on first access; the result is
-reused across multiple `doExecute()` calls if Spark re-executes (caching, AQE
-re-plans, etc.).
+The kernel-rs scan runs once on first access of `allTasks`; the result is
+reused. DPP filters are deliberately applied *after* that lazy val (inside
+`doExecuteColumnar`) rather than baked into `allTasks` — at planning time
+the DPP subquery is still a `SubqueryAdaptiveBroadcastExec` placeholder,
+so the actual partition values are not known yet.
 
 ## kernel-rs scan resolution
 
@@ -152,13 +165,11 @@ columns.
 
 If the plan above includes a `DynamicPruningExpression`, the actual partition
 values aren't known at plan time — they arrive after the broadcast side of a
-join finishes. `CometDeltaNativeScanExec` mirrors `FileSourceScanExec`'s
-approach: `selectedPartitions` is a `@transient lazy val` that resolves the
-filter expressions against `BroadcastExchangeExec`'s result, then re-runs the
-kernel scan with the concrete partition predicates.
-
-The result is the same `Vec<RawEntry>` shape as the static case, so the proto
-encoding path is identical.
+join finishes. `CometDeltaNativeScanExec` carries `dppFilters` as a
+constructor field, and re-applies them against `allTasks` inside
+`doExecuteColumnar` (not in a `lazy val`, so the broadcast result is fresh
+on each execution). The resulting per-partition task list is then proto-
+serialised through the same encoding path as the static case.
 
 ## What's serialised vs computed at execute time
 

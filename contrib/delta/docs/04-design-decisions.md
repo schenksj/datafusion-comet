@@ -140,12 +140,12 @@ This applies to the S3A credential bridge as well — we resolve
 **Alternative.** Let the parquet reader pack files into shared groups
 for better parallelism.
 
-**Why not.** `DeltaSyntheticColumnsExec` maintains per-task state:
-`{file_row_offset, next_delete_idx, base_row_id, default_row_commit_version}`.
-That state must reset at file boundaries. If two files shared a group,
-the file_row_offset would keep climbing across the boundary and
-`row_id = base_row_id + file_row_offset` would produce values from
-the wrong file.
+**Why not.** `DeltaSyntheticColumnsExec` indexes per-partition state
+vectors `(deleted_row_indexes, base_row_ids, default_row_commit_versions)`
+by the DataFusion partition index. One file per FileGroup means
+"partition index = file index", which is what makes the index lookup
+correct. With shared groups, multiple files would map to one partition
+index and the lookup would return the wrong file's metadata.
 
 We pay a parallelism cost only when synthetics are emitted (which is a
 minority of queries — primarily MERGE/UPDATE/DELETE rewrite plans and

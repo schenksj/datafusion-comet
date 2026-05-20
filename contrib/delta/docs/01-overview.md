@@ -84,11 +84,11 @@ produced by DataFusion in Rust and shipped to the JVM as Arrow record batches.
 │       │   Builds DataFusion ExecutionPlan tree:                      │
 │       │     ParquetSource (with field_id resolution)                 │
 │       │       ↓                                                      │
-│       │     DeltaDvFilterExec (if any task has DV)                   │
+│       │     ProjectionExec (CM rename, if physical != logical names) │
 │       │       ↓                                                      │
-│       │     ProjectionExec (CM-name rename, if any)                  │
-│       │       ↓                                                      │
-│       │     DeltaSyntheticColumnsExec (if any synthetic emitted)     │
+│       │     DeltaSyntheticColumnsExec    if any emit_* flag          │
+│       │       OR                                                     │
+│       │     DeltaDvFilterExec            else if any task has DV     │
 │       │       ↓                                                      │
 │       │     ProjectionExec (reorder if synthetics not a suffix)      │
 │       ▼                                                              │

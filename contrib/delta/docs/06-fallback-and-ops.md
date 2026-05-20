@@ -103,8 +103,8 @@ mechanism.
 ### Per-driver
 
 - Driver-side engine cache size: not currently exposed; would be a useful
-  follow-up metric. The cache lives in `engine::DELTA_ENGINE_CACHE` (a
-  `OnceCell<Mutex<HashMap<EngineKey, Arc<DefaultEngine<...>>>>>`)
+  follow-up metric. The cache lives behind `engine::engine_cache()` (a
+  `OnceLock<Mutex<HashMap<EngineKey, Arc<DeltaEngine>>>>` static)
 - kernel-rs scan-planning time: implicit in `CometDeltaNativeScanExec`'s
   driver-side latency, not separately reported
 

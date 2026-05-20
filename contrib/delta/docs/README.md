@@ -57,10 +57,11 @@ contrib_delta_scan::build_plan (Rust)
         │
         ▼  builds DataFusion ExecutionPlan tree:
 ParquetSource
-  → DeltaDvFilterExec      [optional, if any DV]
-  → ProjectionExec rename  [optional, if CM=name]
-  → DeltaSyntheticColumnsExec  [optional, if any emit_*]
-  → ProjectionExec reorder [optional, if synthetics not a suffix]
+  → ProjectionExec rename       [optional, if CM physical != logical names]
+  → DeltaSyntheticColumnsExec   [if any emit_*]
+       OR                       (the two are mutually exclusive)
+    DeltaDvFilterExec           [else if any task has DV]
+  → ProjectionExec reorder      [optional, if synthetics not a suffix]
         │
         ▼
 Arrow RecordBatch stream → Spark ColumnarBatch (via Comet's Arrow bridge)
