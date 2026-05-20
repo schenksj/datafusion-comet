@@ -296,6 +296,12 @@ object DeltaScanRule {
           "checkLatestSchemaOnRead is disabled (potential stale-snapshot read)")
       return None
     }
+    // Databricks-proprietary file-index variant. The class is not in OSS Delta -- it
+    // only exists when running against Databricks Runtime's Delta fork. We don't have
+    // an OSS reproducer for its behavior so we conservatively fall back to Spark's
+    // Delta reader rather than risk reading via an unknown index that may rely on
+    // DBR-only cloud-fetch APIs. If/when this variant is upstreamed (or a customer
+    // surfaces a need with adequate test coverage), revisit.
     val fileIndexClassName = r.location.getClass.getName
     if (fileIndexClassName.endsWith(".TahoeLogFileIndexWithCloudFetch")) {
       withInfo(
@@ -344,6 +350,16 @@ object DeltaScanRule {
       a.name.equalsIgnoreCase(DeltaReflection.RowIndexColumnName)
     }
     if (hasDeltaSyntheticCol) {
+      // Delta's reader synthesizes these columns from its DV bitmap (`is_row_deleted`)
+      // and parquet metadata (`row_index`); Comet's native reader has no equivalent
+      // synthesis machinery and DataFusion 53 doesn't expose virtual row-index columns
+      // either. Native synthesis would require: (a) a new ExecutionPlan node that
+      // appends a UInt64 row_index column per batch (similar shape to DeltaDvFilterExec
+      // but adds rather than filters); (b) extending DeltaDvFilterExec to optionally
+      // EMIT the deletion flag instead of filtering. Verified in the recent regression
+      // that Delta's reader handles these flows correctly via the fallback path
+      // (UPDATE/DELETE/MERGE suites passed clean). Tracking in #144 as a perf
+      // optimisation, not a correctness blocker.
       withInfo(
         scanExec,
         "Native Delta scan declines reads that carry Delta's synthetic " +
