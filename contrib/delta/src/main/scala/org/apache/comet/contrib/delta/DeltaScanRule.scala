@@ -273,30 +273,14 @@ object DeltaScanRule {
     // Delta's `delta.columnMapping.id` -> `parquet.field.id` on every StructField and
     // sets `DeltaScanCommon.use_field_id = true`, which routes the native parquet reader
     // through `schema_adapter.rs` field-ID matching. No gate needed.
-    if (cmMode.exists(_.equalsIgnoreCase("name")) &&
-      !session.sessionState.conf
-        .getConfString("spark.databricks.delta.checkLatestSchemaOnRead", "true")
-        .equalsIgnoreCase("true")) {
-      // Load-bearing: Delta's `checkLatestSchemaOnRead` flag validates that the user's
-      // cached DataFrame schema is compatible with the latest snapshot's schema. Disabling
-      // it lets the user proceed with a potentially-stale schema view of the table.
-      //
-      // For CM-`name` reads we serialize a `column_mappings` vec derived from the snapshot
-      // we resolve at planning time (`DeltaReflection.extractSnapshotVersion`), and parquet
-      // files we read may carry physical column names from a *different* snapshot. With the
-      // schema-on-read check ON, Delta enforces consistency before we ever see the scan;
-      // with it OFF, we could end up serializing mappings from snapshot N while the parquet
-      // files reference physical names from snapshot N+1 (e.g. after a concurrent ALTER
-      // TABLE rename). Result: wrong-column reads.
-      //
-      // Fall back to Spark's Delta reader, which has its own per-file schema resolution
-      // that handles this case correctly.
-      withInfo(
-        scanExec,
-        s"${CometDeltaNativeScan.ScanImpl} declines CM-name reads when " +
-          "checkLatestSchemaOnRead is disabled (potential stale-snapshot read)")
-      return None
-    }
+    // `checkLatestSchemaOnRead` controls whether Delta's reader does an at-read-time
+    // consistency check between the cached DataFrame schema and the latest snapshot.
+    // Our native path doesn't do a separate at-read check -- both `column_mappings` and
+    // the parquet reads are pinned to the version we get from
+    // `DeltaReflection.extractSnapshotVersion(relation)` (i.e. the SAME cached snapshot
+    // Spark/Delta used to build scan.requiredSchema). So we're internally consistent
+    // regardless of the flag; the user's choice to disable the check only affects
+    // Delta's own at-read validation, which we don't perform. No gate needed.
     // Databricks-proprietary file-index variant. The class is not in OSS Delta -- it
     // only exists when running against Databricks Runtime's Delta fork. We don't have
     // an OSS reproducer for its behavior so we conservatively fall back to Spark's
