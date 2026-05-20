@@ -417,3 +417,325 @@ impl RecordBatchStream for DeltaSyntheticColumnsStream {
         Arc::clone(&self.output_schema)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, ArrayRef, Int64Array};
+
+    fn input_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]))
+    }
+
+    fn batch(rows: &[i64]) -> RecordBatch {
+        let arr: ArrayRef = Arc::new(Int64Array::from(rows.to_vec()));
+        RecordBatch::try_new(input_schema(), vec![arr]).unwrap()
+    }
+
+    /// Helper: build a `DeltaSyntheticColumnsStream` directly, without an exec, so we
+    /// can drive `augment()` in isolation. Mirrors the real construction path.
+    fn make_stream(
+        emit_row_index: bool,
+        emit_is_row_deleted: bool,
+        emit_row_id: bool,
+        emit_row_commit_version: bool,
+        deleted: Vec<u64>,
+        base_row_id: Option<i64>,
+        default_row_commit_version: Option<i64>,
+    ) -> DeltaSyntheticColumnsStream {
+        let schema = build_output_schema(
+            &input_schema(),
+            emit_row_index,
+            emit_is_row_deleted,
+            emit_row_id,
+            emit_row_commit_version,
+        );
+        let metrics = ExecutionPlanMetricsSet::new();
+        let baseline = BaselineMetrics::new(&metrics, 0);
+        let (_tx, rx) = futures::channel::mpsc::unbounded::<DFResult<RecordBatch>>();
+        let inner: SendableRecordBatchStream = Box::pin(EmptyStream {
+            schema: input_schema(),
+            inner: rx,
+        });
+        DeltaSyntheticColumnsStream {
+            inner,
+            deleted,
+            current_row_offset: 0,
+            next_delete_idx: 0,
+            output_schema: schema,
+            emit_row_index,
+            emit_is_row_deleted,
+            emit_row_id,
+            emit_row_commit_version,
+            base_row_id,
+            default_row_commit_version,
+            baseline_metrics: baseline,
+        }
+    }
+
+    struct EmptyStream {
+        schema: SchemaRef,
+        inner: futures::channel::mpsc::UnboundedReceiver<DFResult<RecordBatch>>,
+    }
+    impl Stream for EmptyStream {
+        type Item = DFResult<RecordBatch>;
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Pin::new(&mut self.inner).poll_next(cx)
+        }
+    }
+    impl RecordBatchStream for EmptyStream {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    // ---- build_output_schema combinations ----
+
+    #[test]
+    fn schema_only_row_index() {
+        let s = build_output_schema(&input_schema(), true, false, false, false);
+        let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["v", ROW_INDEX_COLUMN_NAME]);
+    }
+
+    #[test]
+    fn schema_all_four_in_order() {
+        let s = build_output_schema(&input_schema(), true, true, true, true);
+        let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "v",
+                ROW_INDEX_COLUMN_NAME,
+                IS_ROW_DELETED_COLUMN_NAME,
+                ROW_ID_COLUMN_NAME,
+                ROW_COMMIT_VERSION_COLUMN_NAME,
+            ]
+        );
+        // Nullability: row_id and row_commit_version are nullable; the other two are not.
+        let nullables: Vec<bool> = s.fields().iter().map(|f| f.is_nullable()).collect();
+        assert_eq!(nullables, vec![false, false, false, true, true]);
+    }
+
+    #[test]
+    fn schema_emit_subset_preserves_order() {
+        // Skip row_index, keep is_row_deleted and row_commit_version -> appended in that order.
+        let s = build_output_schema(&input_schema(), false, true, false, true);
+        let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["v", IS_ROW_DELETED_COLUMN_NAME, ROW_COMMIT_VERSION_COLUMN_NAME]
+        );
+    }
+
+    // ---- augment correctness ----
+
+    #[test]
+    fn augment_row_index_single_batch() {
+        let mut s = make_stream(true, false, false, false, vec![], None, None);
+        let out = s.augment(batch(&[10, 20, 30])).unwrap();
+        let idx = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let vals: Vec<u64> = idx.iter().map(Option::unwrap).collect();
+        assert_eq!(vals, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn augment_row_index_multi_batch_monotonic() {
+        let mut s = make_stream(true, false, false, false, vec![], None, None);
+        let out1 = s.augment(batch(&[1, 2, 3])).unwrap();
+        let out2 = s.augment(batch(&[4, 5])).unwrap();
+        let idx1: Vec<u64> = out1
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        let idx2: Vec<u64> = out2
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(idx1, vec![0, 1, 2]);
+        assert_eq!(idx2, vec![3, 4]);
+    }
+
+    #[test]
+    fn augment_is_row_deleted_marks_correct_indexes() {
+        let mut s = make_stream(false, true, false, false, vec![1, 3], None, None);
+        let out = s.augment(batch(&[10, 20, 30, 40, 50])).unwrap();
+        let flags = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let vals: Vec<i32> = flags.iter().map(Option::unwrap).collect();
+        assert_eq!(vals, vec![0, 1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn augment_is_row_deleted_writes_back_next_delete_idx() {
+        // After one batch consuming deletes 0,1,2, the second batch should start with
+        // next_delete_idx already past them — verifying the writeback fix.
+        let mut s = make_stream(false, true, false, false, vec![0, 1, 2, 7], None, None);
+        let _ = s.augment(batch(&[10, 20, 30])).unwrap(); // 0,1,2 deleted, next_delete_idx -> 3
+        assert_eq!(s.next_delete_idx, 3);
+        let out2 = s.augment(batch(&[40, 50, 60, 70, 80])).unwrap(); // covers 3..8; 7 deleted
+        let flags: Vec<i32> = out2
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(flags, vec![0, 0, 0, 0, 1]);
+        assert_eq!(s.next_delete_idx, 4);
+    }
+
+    #[test]
+    fn augment_row_id_with_base() {
+        let mut s = make_stream(false, false, true, false, vec![], Some(1000), None);
+        let out = s.augment(batch(&[10, 20, 30])).unwrap();
+        let ids = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let vals: Vec<i64> = ids.iter().map(Option::unwrap).collect();
+        assert_eq!(vals, vec![1000, 1001, 1002]);
+
+        // Second batch: row_id continues from where current_row_offset left off.
+        let out2 = s.augment(batch(&[40])).unwrap();
+        let v2: Vec<i64> = out2
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(v2, vec![1003]);
+    }
+
+    #[test]
+    fn augment_row_id_without_base_emits_nulls() {
+        let mut s = make_stream(false, false, true, false, vec![], None, None);
+        let out = s.augment(batch(&[10, 20])).unwrap();
+        let ids = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.null_count(), 2);
+    }
+
+    #[test]
+    fn augment_row_commit_version_constant() {
+        let mut s = make_stream(false, false, false, true, vec![], None, Some(7));
+        let out = s.augment(batch(&[10, 20, 30])).unwrap();
+        let v = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let vals: Vec<i64> = v.iter().map(Option::unwrap).collect();
+        assert_eq!(vals, vec![7, 7, 7]);
+    }
+
+    #[test]
+    fn augment_row_commit_version_without_default_emits_nulls() {
+        let mut s = make_stream(false, false, false, true, vec![], None, None);
+        let out = s.augment(batch(&[1, 2])).unwrap();
+        let v = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(v.null_count(), 2);
+    }
+
+    #[test]
+    fn augment_all_four_columns_combined() {
+        let mut s = make_stream(true, true, true, true, vec![1], Some(500), Some(42));
+        let out = s.augment(batch(&[10, 20, 30])).unwrap();
+        assert_eq!(out.schema().fields().len(), 5);
+
+        // col 0: data
+        // col 1: row_index 0,1,2
+        let ri: Vec<u64> = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(ri, vec![0, 1, 2]);
+        // col 2: is_row_deleted 0,1,0
+        let dl: Vec<i32> = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(dl, vec![0, 1, 0]);
+        // col 3: row_id 500,501,502
+        let id: Vec<i64> = out
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(id, vec![500, 501, 502]);
+        // col 4: row_commit_version 42,42,42
+        let cv: Vec<i64> = out
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(cv, vec![42, 42, 42]);
+    }
+
+    #[test]
+    fn augment_empty_batch_preserves_schema() {
+        let mut s = make_stream(true, true, true, true, vec![], Some(0), Some(0));
+        let out = s.augment(batch(&[])).unwrap();
+        assert_eq!(out.schema().fields().len(), 5);
+        assert_eq!(out.num_rows(), 0);
+    }
+
+    #[test]
+    fn new_validates_partition_count_mismatch() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        let inner = Arc::new(EmptyExec::new(input_schema())) as Arc<dyn ExecutionPlan>;
+        // EmptyExec has 1 partition; pass 2 entries.
+        let err = DeltaSyntheticColumnsExec::new(
+            inner,
+            vec![vec![], vec![]],
+            vec![None, None],
+            vec![None, None],
+            true, false, false, false,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("partition count mismatch") || format!("{err}").contains("partitions"));
+    }
+}

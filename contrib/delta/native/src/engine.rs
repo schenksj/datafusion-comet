@@ -194,3 +194,190 @@ pub fn get_or_create_engine(
     Ok(engine)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    fn empty_config() -> DeltaStorageConfig {
+        DeltaStorageConfig::default()
+    }
+
+    #[test]
+    fn create_object_store_local_file() {
+        let store = create_object_store(&url("file:///tmp/x"), &empty_config()).unwrap();
+        // Just verify Arc construction succeeded; LocalFileSystem doesn't expose
+        // anything we can usefully assert on without doing IO.
+        assert!(format!("{store:?}").contains("LocalFileSystem"));
+    }
+
+    #[test]
+    fn create_object_store_empty_scheme_is_local() {
+        // The "file" | "" arm maps the empty-scheme case (URL like `relative/path`
+        // wouldn't actually parse, but the arm exists for code paths that hand us
+        // a Url with an empty scheme).
+        let mut u = url("file:///x");
+        u.set_scheme("").ok(); // best-effort; if it fails, the file:// arm still hits
+        let store = create_object_store(&u, &empty_config()).unwrap();
+        assert!(format!("{store:?}").contains("LocalFileSystem"));
+    }
+
+    #[test]
+    fn create_object_store_s3_requires_bucket() {
+        // `s3://` with empty host is rejected as MissingBucket.
+        // url::Url::parse("s3:///x") gives host=None.
+        let bad = url("s3:///just-a-path");
+        let err = create_object_store(&bad, &empty_config()).unwrap_err();
+        match err {
+            DeltaError::MissingBucket { .. } => {}
+            other => panic!("expected MissingBucket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_object_store_s3_builds_with_full_creds() {
+        let cfg = DeltaStorageConfig {
+            aws_access_key: Some("AKIA…".into()),
+            aws_secret_key: Some("secret".into()),
+            aws_session_token: Some("token".into()),
+            aws_region: Some("us-west-2".into()),
+            aws_endpoint: Some("https://s3.example.com".into()),
+            aws_force_path_style: true,
+            ..Default::default()
+        };
+        let store = create_object_store(&url("s3://my-bucket/path"), &cfg).unwrap();
+        assert!(format!("{store:?}").contains("AmazonS3") || format!("{store:?}").contains("S3"));
+    }
+
+    #[test]
+    fn create_object_store_s3_http_endpoint_allows_http() {
+        let cfg = DeltaStorageConfig {
+            aws_access_key: Some("k".into()),
+            aws_secret_key: Some("s".into()),
+            aws_endpoint: Some("http://localhost:9000".into()),
+            aws_force_path_style: true,
+            ..Default::default()
+        };
+        // MinIO-style: endpoint starts with http:// → builder enables allow_http.
+        // We can't introspect the builder's flag, but ensuring construction
+        // succeeds covers the branch.
+        create_object_store(&url("s3://minio-bucket"), &cfg).unwrap();
+    }
+
+    #[test]
+    fn create_object_store_azure_requires_container() {
+        let bad = url("abfss:///just-a-path");
+        let err = create_object_store(&bad, &empty_config()).unwrap_err();
+        assert!(matches!(err, DeltaError::MissingBucket { .. }));
+    }
+
+    #[test]
+    fn create_object_store_azure_builds_with_creds() {
+        let cfg = DeltaStorageConfig {
+            azure_account_name: Some("myacct".into()),
+            azure_access_key: Some("key".into()),
+            azure_bearer_token: Some("bearer".into()),
+            ..Default::default()
+        };
+        // Either "az://", "azure://", "abfs://" or "abfss://" should work.
+        for scheme in ["az", "azure", "abfs", "abfss"] {
+            let u = url(&format!("{scheme}://my-container/path"));
+            create_object_store(&u, &cfg).unwrap();
+        }
+    }
+
+    #[test]
+    fn create_object_store_unsupported_scheme() {
+        let err = create_object_store(&url("gs://bucket/p"), &empty_config()).unwrap_err();
+        match err {
+            DeltaError::UnsupportedScheme { scheme, .. } => assert_eq!(scheme, "gs"),
+            other => panic!("expected UnsupportedScheme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_key_collapses_local_paths() {
+        let cfg = empty_config();
+        let a = engine_key(&url("file:///tmp/a"), &cfg);
+        let b = engine_key(&url("file:///tmp/b/c/d"), &cfg);
+        assert_eq!(a, b, "all local file:// URLs share one engine entry");
+    }
+
+    #[test]
+    fn engine_key_distinguishes_s3_buckets() {
+        let cfg = empty_config();
+        let a = engine_key(&url("s3://bucket-a/path"), &cfg);
+        let b = engine_key(&url("s3://bucket-b/path"), &cfg);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn engine_key_includes_port() {
+        let cfg = empty_config();
+        let a = engine_key(&url("s3://host:9000/p"), &cfg);
+        let b = engine_key(&url("s3://host:9001/p"), &cfg);
+        let c = engine_key(&url("s3://host/p"), &cfg);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+    }
+
+    #[test]
+    fn engine_key_distinguishes_credentials() {
+        let cfg_a = DeltaStorageConfig {
+            aws_access_key: Some("AKIA1".into()),
+            ..Default::default()
+        };
+        let cfg_b = DeltaStorageConfig {
+            aws_access_key: Some("AKIA2".into()),
+            ..Default::default()
+        };
+        let a = engine_key(&url("s3://bucket/p"), &cfg_a);
+        let b = engine_key(&url("s3://bucket/p"), &cfg_b);
+        assert_ne!(
+            a, b,
+            "different credentials must NOT share a cached engine"
+        );
+    }
+
+    #[test]
+    fn engine_key_path_does_not_affect_key() {
+        let cfg = empty_config();
+        let a = engine_key(&url("s3://bucket/path/a"), &cfg);
+        let b = engine_key(&url("s3://bucket/path/b/c"), &cfg);
+        assert_eq!(a, b, "paths within the same bucket share one engine");
+    }
+
+    #[test]
+    fn get_or_create_engine_returns_same_arc_on_hit() {
+        let cfg = empty_config();
+        let u = url("file:///tmp/cache-test");
+        let e1 = get_or_create_engine(&u, &cfg).unwrap();
+        let e2 = get_or_create_engine(&u, &cfg).unwrap();
+        assert!(
+            Arc::ptr_eq(&e1, &e2),
+            "second call must return the cached Arc, not a fresh engine"
+        );
+    }
+
+    #[test]
+    fn get_or_create_engine_distinct_keys_yield_distinct_engines() {
+        let cfg = empty_config();
+        let e_file = get_or_create_engine(&url("file:///tmp/distinct-a"), &cfg).unwrap();
+        // s3:// would actually try to set up an AWS client; use a different file path
+        // which collapses to the same key per `engine_key_collapses_local_paths`. So we
+        // exercise a distinct-key case via a different cred config.
+        let cfg_b = DeltaStorageConfig {
+            aws_access_key: Some("dummy".into()),
+            ..Default::default()
+        };
+        let e_creds = get_or_create_engine(&url("file:///tmp/distinct-a"), &cfg_b).unwrap();
+        assert!(
+            !Arc::ptr_eq(&e_file, &e_creds),
+            "differing config keys must yield distinct engines"
+        );
+    }
+}

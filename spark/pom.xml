@@ -362,6 +362,18 @@ under the License.
                   </sources>
                 </configuration>
               </execution>
+              <execution>
+                <id>add-contrib-delta-test-source</id>
+                <phase>generate-test-sources</phase>
+                <goals>
+                  <goal>add-test-source</goal>
+                </goals>
+                <configuration>
+                  <sources>
+                    <source>${project.parent.basedir}/contrib/delta/src/test/scala</source>
+                  </sources>
+                </configuration>
+              </execution>
             </executions>
           </plugin>
         </plugins>

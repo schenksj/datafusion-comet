@@ -309,3 +309,192 @@ impl RecordBatchStream for DeltaDvFilterStream {
         Arc::clone(&self.schema)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+    use std::sync::Arc as StdArc;
+
+    fn schema() -> SchemaRef {
+        StdArc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    fn batch(rows: &[i64]) -> RecordBatch {
+        let arr: ArrayRef = StdArc::new(Int64Array::from(rows.to_vec()));
+        RecordBatch::try_new(schema(), vec![arr]).unwrap()
+    }
+
+    fn stream_with(deleted: Vec<u64>) -> DeltaDvFilterStream {
+        // Construct directly without an inner stream — apply() is the unit under test
+        // and inner is never polled in these tests.
+        let (_dummy_tx, dummy_rx) = futures::channel::mpsc::unbounded::<DFResult<RecordBatch>>();
+        let inner: SendableRecordBatchStream = Box::pin(EmptyStream {
+            schema: schema(),
+            inner: dummy_rx,
+        });
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let baseline = BaselineMetrics::new(&metrics_set, 0);
+        let dropped = MetricBuilder::new(&metrics_set).counter("dv_rows_dropped", 0);
+        DeltaDvFilterStream {
+            inner,
+            deleted,
+            current_row_offset: 0,
+            next_delete_idx: 0,
+            schema: schema(),
+            baseline_metrics: baseline,
+            rows_dropped_metric: dropped,
+        }
+    }
+
+    struct EmptyStream {
+        schema: SchemaRef,
+        inner: futures::channel::mpsc::UnboundedReceiver<DFResult<RecordBatch>>,
+    }
+    impl Stream for EmptyStream {
+        type Item = DFResult<RecordBatch>;
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Pin::new(&mut self.inner).poll_next(cx)
+        }
+    }
+    impl RecordBatchStream for EmptyStream {
+        fn schema(&self) -> SchemaRef {
+            StdArc::clone(&self.schema)
+        }
+    }
+
+    #[test]
+    fn apply_empty_batch_passes_through() {
+        let mut s = stream_with(vec![1, 3]);
+        let out = s.apply(batch(&[])).unwrap();
+        assert_eq!(out.num_rows(), 0);
+        assert_eq!(s.current_row_offset, 0);
+        assert_eq!(s.next_delete_idx, 0);
+    }
+
+    #[test]
+    fn apply_no_deletes_is_passthrough() {
+        let mut s = stream_with(vec![]);
+        let b = batch(&[10, 20, 30, 40]);
+        let out = s.apply(b).unwrap();
+        assert_eq!(out.num_rows(), 4);
+        assert_eq!(s.current_row_offset, 4);
+        assert_eq!(s.next_delete_idx, 0);
+    }
+
+    #[test]
+    fn apply_deletes_in_batch() {
+        // Delete rows at indexes 1 and 3 from a 5-row batch -> keep rows 0, 2, 4.
+        let mut s = stream_with(vec![1, 3]);
+        let b = batch(&[10, 20, 30, 40, 50]);
+        let out = s.apply(b).unwrap();
+        let arr = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let kept: Vec<i64> = arr.iter().map(Option::unwrap).collect();
+        assert_eq!(kept, vec![10, 30, 50]);
+        assert_eq!(s.current_row_offset, 5);
+        assert_eq!(s.next_delete_idx, 2);
+    }
+
+    #[test]
+    fn apply_delete_at_batch_boundaries() {
+        // Delete row 0 (batch_start) and row 4 (batch_end-1) from a 5-row batch.
+        let mut s = stream_with(vec![0, 4]);
+        let b = batch(&[10, 20, 30, 40, 50]);
+        let out = s.apply(b).unwrap();
+        let arr = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let kept: Vec<i64> = arr.iter().map(Option::unwrap).collect();
+        assert_eq!(kept, vec![20, 30, 40]);
+    }
+
+    #[test]
+    fn apply_multi_batch_with_deletes_spanning_boundary() {
+        let mut s = stream_with(vec![1, 5, 7]);
+        // First batch: rows 0..4. Deletes index 1 -> keep 10, 30, 40.
+        let out1 = s.apply(batch(&[10, 20, 30, 40])).unwrap();
+        let kept1: Vec<i64> = out1
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(kept1, vec![10, 30, 40]);
+        assert_eq!(s.current_row_offset, 4);
+        assert_eq!(s.next_delete_idx, 1);
+
+        // Second batch: rows 4..8. Deletes index 5 and 7 -> keep 50, 70.
+        let out2 = s.apply(batch(&[50, 60, 70, 80])).unwrap();
+        let kept2: Vec<i64> = out2
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(kept2, vec![50, 70]);
+        assert_eq!(s.current_row_offset, 8);
+        assert_eq!(s.next_delete_idx, 3);
+    }
+
+    #[test]
+    fn apply_deletes_beyond_batch_pass_through() {
+        // All deletes are at indexes 100+ but batch only spans 0..4 -> passthrough.
+        let mut s = stream_with(vec![100, 200]);
+        let b = batch(&[10, 20, 30, 40]);
+        let out = s.apply(b).unwrap();
+        assert_eq!(out.num_rows(), 4);
+        assert_eq!(s.current_row_offset, 4);
+        assert_eq!(s.next_delete_idx, 0);
+    }
+
+    #[test]
+    fn apply_all_rows_deleted() {
+        let mut s = stream_with(vec![0, 1, 2]);
+        let b = batch(&[10, 20, 30]);
+        let out = s.apply(b).unwrap();
+        assert_eq!(out.num_rows(), 0);
+        assert_eq!(s.current_row_offset, 3);
+        assert_eq!(s.next_delete_idx, 3);
+    }
+
+    #[test]
+    fn apply_delete_index_predating_batch_errors() {
+        // Pre-set state: we've already consumed up to row 5, but a stale entry
+        // in `deleted` claims index 3 should be dropped now. That's a contract
+        // violation and we error out rather than silently producing wrong rows.
+        let mut s = stream_with(vec![3]);
+        s.current_row_offset = 5;
+        // next_delete_idx still 0 -> apply will see 3 < 5 = batch_start.
+        let err = s.apply(batch(&[100, 200])).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("predates batch start"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn new_validates_partition_count() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        let inner = StdArc::new(EmptyExec::new(schema())) as Arc<dyn ExecutionPlan>;
+        // EmptyExec has 1 partition; passing 2 DV entries must be rejected.
+        let err =
+            DeltaDvFilterExec::new(inner, vec![vec![1u64], vec![2u64]]).unwrap_err();
+        assert!(format!("{err}").contains("got 2 DV entries for 1 partitions"));
+    }
+}
