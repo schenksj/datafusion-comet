@@ -51,6 +51,11 @@ class CometDeltaNativeSuite extends CometDeltaTestBase {
         .save(tablePath)
 
       assertDeltaNativeMatches(tablePath, identity)
+      // Explicit accelerator-coverage assertion: the contrib's scan exec must be
+      // in the plan. Guards against silent disengagement bugs.
+      assertNativePlanContains(
+        spark.read.format("delta").load(tablePath),
+        "CometDeltaNativeScanExec")
     }
   }
 
