@@ -421,10 +421,15 @@ fn extract_row_tracking_for_selected(
     };
 
     let sel = meta.scan_files.selection_vector();
+    // FilteredEngineData::try_new asserts `sel.len() <= data.len()`; rows beyond
+    // sel.len() are treated as not-selected. visit_scan_files visits only rows that ARE
+    // selected, so any rows past sel.len() won't appear in the callback and our parallel
+    // vec stays aligned. The explicit bound below makes the contract obvious.
+    let bounded_rows = total_rows.min(sel.len());
     let mut out: Vec<(Option<i64>, Option<i64>)> =
         Vec::with_capacity(sel.iter().filter(|b| **b).count());
-    for i in 0..total_rows {
-        if !*sel.get(i).unwrap_or(&false) {
+    for i in 0..bounded_rows {
+        if !sel[i] {
             continue;
         }
         let b = base_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });

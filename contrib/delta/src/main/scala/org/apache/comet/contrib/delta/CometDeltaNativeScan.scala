@@ -315,9 +315,9 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       _.equalsIgnoreCase(DeltaReflection.RowIndexColumnName))
     val emitIsRowDeleted = scan.requiredSchema.fieldNames.exists(
       _.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName))
-    val emitRowId = scan.requiredSchema.fieldNames.exists(_.equalsIgnoreCase("row_id"))
+    val emitRowId = scan.requiredSchema.fieldNames.exists(_.equalsIgnoreCase(DeltaReflection.RowIdColumnName))
     val emitRowCommitVersion = scan.requiredSchema.fieldNames.exists(
-      _.equalsIgnoreCase("row_commit_version"))
+      _.equalsIgnoreCase(DeltaReflection.RowCommitVersionColumnName))
 
     val ignoreMissingFiles =
       SQLConf.get.ignoreMissingFiles ||
@@ -834,8 +834,8 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     val syntheticNames = Set(
       DeltaReflection.RowIndexColumnName.toLowerCase(Locale.ROOT),
       DeltaReflection.IsRowDeletedColumnName.toLowerCase(Locale.ROOT),
-      "row_id",
-      "row_commit_version")
+      DeltaReflection.RowIdColumnName,
+      DeltaReflection.RowCommitVersionColumnName)
     val isSynthetic = (f: StructField) =>
       syntheticNames.contains(f.name.toLowerCase(Locale.ROOT))
     val needsSyntheticEmit =
@@ -858,8 +858,8 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
         val syntheticEmitOrder: Seq[String] = Seq(
           (emitRowIndex, DeltaReflection.RowIndexColumnName),
           (emitIsRowDeleted, DeltaReflection.IsRowDeletedColumnName),
-          (emitRowId, "row_id"),
-          (emitRowCommitVersion, "row_commit_version")).collect {
+          (emitRowId, DeltaReflection.RowIdColumnName),
+          (emitRowCommitVersion, DeltaReflection.RowCommitVersionColumnName)).collect {
           case (true, name) => name.toLowerCase(Locale.ROOT)
         }
         val nonSyntheticFields = requiredSchemaForProto.filterNot(isSynthetic)
@@ -871,7 +871,16 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
         requiredSchemaForProto.map { f =>
           val name = f.name.toLowerCase(Locale.ROOT)
           if (isSynthetic(f)) {
-            syntheticTailStart + syntheticEmitOrder.indexOf(name)
+            val emitIdx = syntheticEmitOrder.indexOf(name)
+            // emit flags are derived from the same scan.requiredSchema field names
+            // (lines above), so any synthetic field here must have its corresponding
+            // emit flag on -- a mismatch would indicate a user column collided with a
+            // reserved synthetic name AND we missed it.
+            assert(
+              emitIdx >= 0,
+              s"synthetic column '$name' in required_schema but no emit flag is set " +
+                s"(emit order: $syntheticEmitOrder)")
+            syntheticTailStart + emitIdx
           } else {
             nonSyntheticIdxByName(name)
           }

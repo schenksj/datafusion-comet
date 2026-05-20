@@ -233,6 +233,15 @@ object DeltaReflection extends Logging {
   val ParquetFieldIdMetadataKey: String = "PARQUET:field_id"
 
   /**
+   * Row-tracking column names. Pinned here so call sites in DeltaScanRule's
+   * `applyRowTrackingRewrite` and CometDeltaNativeScan's synthetic-emit detection
+   * stay in sync with the native exec's `synthetic_columns.rs` `ROW_ID_COLUMN_NAME` /
+   * `ROW_COMMIT_VERSION_COLUMN_NAME`.
+   */
+  val RowIdColumnName: String = "row_id"
+  val RowCommitVersionColumnName: String = "row_commit_version"
+
+  /**
    * Extract the Delta table's Snapshot-level schema (`Metadata.schema()` in Delta terms) via
    * reflection. Unlike the `relation.dataSchema` we get from Spark -- which has its StructField
    * metadata stripped by HadoopFsRelation construction -- the Snapshot's schema preserves the

@@ -331,13 +331,16 @@ impl DeltaSyntheticColumnsStream {
             {
                 self.next_delete_idx += 1;
             }
-            // Mark every deleted index within [batch_start, batch_end).
+            // Mark every deleted index within [batch_start, batch_end). Advance
+            // `self.next_delete_idx` past them so the next batch's skip-before-start
+            // loop is O(1) instead of re-walking the entire prior batch.
             let mut idx = self.next_delete_idx;
             while idx < self.deleted.len() && self.deleted[idx] < batch_end {
                 let local = (self.deleted[idx] - batch_start) as usize;
                 values[local] = 1;
                 idx += 1;
             }
+            self.next_delete_idx = idx;
             Some(Int32Array::from(values))
         } else {
             None

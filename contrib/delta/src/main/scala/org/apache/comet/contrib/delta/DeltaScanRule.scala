@@ -397,8 +397,8 @@ object DeltaScanRule {
       scanExec: FileSourceScanExec,
       r: HadoopFsRelation,
       session: SparkSession): Option[Option[SparkPlan]] = {
-    val RowIdName = "row_id"
-    val RowCommitVersionName = "row_commit_version"
+    val RowIdName = DeltaReflection.RowIdColumnName
+    val RowCommitVersionName = DeltaReflection.RowCommitVersionColumnName
     val hasRowIdField = scanExec.requiredSchema.fieldNames.exists { n =>
       n.equalsIgnoreCase(RowIdName) || n.equalsIgnoreCase(RowCommitVersionName)
     }

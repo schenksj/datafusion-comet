@@ -159,12 +159,17 @@ impl PhysicalPlanner {
         // DeltaDvFilterExec's per-partition mapping is 1:1 with one physical parquet
         // file. All non-DV files go in a single combined group.
         //
-        // EXCEPT when row-id / row-commit-version synthesis is requested: baseRowId is
-        // per-file (row_id = baseRowId + physical_row_index) and the per-partition row
-        // offset counter doesn't reset across files within a FileGroup. So when emit
-        // is on, give each file its own group regardless of DV presence so the per-file
-        // (baseRowId, defaultRowCommitVersion) lookup is well-defined.
-        let need_per_file_groups = common.emit_row_id || common.emit_row_commit_version;
+        // EXCEPT when ANY synthetic column is emitted: the per-partition row offset
+        // counter in DeltaSyntheticColumnsExec doesn't reset across files within a
+        // FileGroup, and every synthetic we emit depends on per-file row position
+        // (row_index is per-file by definition; is_row_deleted uses a per-file DV;
+        // row_id = baseRowId + physical_row_index is per-file; row_commit_version is
+        // per-file constant). So when ANY emit is on, give each file its own group
+        // regardless of DV presence so the per-file lookup is well-defined.
+        let need_per_file_groups = common.emit_row_index
+            || common.emit_is_row_deleted
+            || common.emit_row_id
+            || common.emit_row_commit_version;
         let mut file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
         let mut deleted_indexes_per_group: Vec<Vec<u64>> = Vec::new();
         let mut base_row_ids_per_group: Vec<Option<i64>> = Vec::new();
@@ -236,59 +241,17 @@ impl PhysicalPlanner {
             || common.emit_is_row_deleted
             || common.emit_row_id
             || common.emit_row_commit_version;
-        let final_exec: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if need_synthetics
-        {
-            Arc::new(
-                comet_contrib_delta::synthetic_columns::DeltaSyntheticColumnsExec::new(
-                    delta_exec,
-                    deleted_indexes_per_group,
-                    base_row_ids_per_group,
-                    default_commit_versions_per_group,
-                    common.emit_row_index,
-                    common.emit_is_row_deleted,
-                    common.emit_row_id,
-                    common.emit_row_commit_version,
-                )
-                .map_err(|e| GeneralError(format!("DeltaSyntheticColumnsExec: {e}")))?,
-            )
-        } else if deleted_indexes_per_group.iter().any(|v| !v.is_empty()) {
-            Arc::new(
-                DeltaDvFilterExec::new(delta_exec, deleted_indexes_per_group)
-                    .map_err(|e| GeneralError(format!("DeltaDvFilterExec: {e}")))?,
-            )
-        } else {
-            delta_exec
-        };
 
-        // If synthetic columns aren't a suffix of the user-visible required_schema,
-        // `final_output_indices` is set and we project to reorder. Each entry is an
-        // index into the wrapped exec's output schema (parquet columns first, then
-        // appended synthetics in the canonical row_index/is_row_deleted/row_id/
-        // row_commit_version order). Empty => already in the right order.
-        let final_exec = if !common.final_output_indices.is_empty() {
-            let wrapped_schema = final_exec.schema();
-            let projections: Vec<(Arc<dyn PhysicalExpr>, String)> = common
-                .final_output_indices
-                .iter()
-                .map(|idx| {
-                    let i = *idx as usize;
-                    let field = wrapped_schema.field(i);
-                    let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), i));
-                    (col, field.name().clone())
-                })
-                .collect();
-            Arc::new(
-                ProjectionExec::try_new(projections, final_exec)
-                    .map_err(|e| GeneralError(format!("final reorder ProjectionExec: {e}")))?,
-            ) as Arc<dyn datafusion::physical_plan::ExecutionPlan>
-        } else {
-            final_exec
-        };
-
-        // When column mapping is active, the scan's output schema carries PHYSICAL
-        // column names. Upstream operators reference columns by LOGICAL name, so add a
-        // ProjectionExec aliasing each physical column back to its logical name.
-        let scan_out = final_exec.schema();
+        // Column-mapping rename has to happen BEFORE synthetic emission so that the
+        // synthetic exec sees logical column names in its input schema (matching what
+        // its build_output_schema expects) and so that the (stripped) `required_schema`
+        // we use here for the rename match isn't compared against a schema that already
+        // has synthetics appended. Synthetic columns have FIXED names
+        // (`__delta_internal_*`, `row_id`, `row_commit_version`) and aren't subject to
+        // CM-name physical renames -- so it's correct to apply the rename to the
+        // parquet output BEFORE the append.
+        let delta_exec: Arc<dyn datafusion::physical_plan::ExecutionPlan> = delta_exec;
+        let scan_out = delta_exec.schema();
         let needs_rename = has_column_mapping
             && required_schema.fields().len() == scan_out.fields().len()
             && required_schema
@@ -296,7 +259,7 @@ impl PhysicalPlanner {
                 .iter()
                 .zip(scan_out.fields().iter())
                 .any(|(req, phys)| req.name() != phys.name());
-        let with_rename: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if needs_rename {
+        let after_rename: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if needs_rename {
             let phys_to_logical: HashMap<&str, &str> = scan_out
                 .fields()
                 .iter()
@@ -318,11 +281,64 @@ impl PhysicalPlanner {
                 })
                 .collect();
             Arc::new(
-                ProjectionExec::try_new(projections, final_exec)
+                ProjectionExec::try_new(projections, delta_exec)
                     .map_err(|e| GeneralError(format!("rename ProjectionExec: {e}")))?,
             )
         } else {
-            final_exec
+            delta_exec
+        };
+
+        // After CM-name rename: apply synthetic emission OR DV filter OR passthrough.
+        let after_synthetics: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if need_synthetics
+        {
+            Arc::new(
+                comet_contrib_delta::synthetic_columns::DeltaSyntheticColumnsExec::new(
+                    after_rename,
+                    deleted_indexes_per_group,
+                    base_row_ids_per_group,
+                    default_commit_versions_per_group,
+                    common.emit_row_index,
+                    common.emit_is_row_deleted,
+                    common.emit_row_id,
+                    common.emit_row_commit_version,
+                )
+                .map_err(|e| GeneralError(format!("DeltaSyntheticColumnsExec: {e}")))?,
+            )
+        } else if deleted_indexes_per_group.iter().any(|v| !v.is_empty()) {
+            Arc::new(
+                DeltaDvFilterExec::new(after_rename, deleted_indexes_per_group)
+                    .map_err(|e| GeneralError(format!("DeltaDvFilterExec: {e}")))?,
+            )
+        } else {
+            after_rename
+        };
+
+        // If synthetic columns aren't a suffix of the user-visible required_schema,
+        // `final_output_indices` is set and we project to reorder. Each entry is an
+        // index into the wrapped exec's output schema (parquet columns first, then
+        // appended synthetics in the canonical row_index/is_row_deleted/row_id/
+        // row_commit_version order). Empty => already in the right order.
+        let with_rename: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if !common
+            .final_output_indices
+            .is_empty()
+        {
+            let wrapped_schema = after_synthetics.schema();
+            let projections: Vec<(Arc<dyn PhysicalExpr>, String)> = common
+                .final_output_indices
+                .iter()
+                .map(|idx| {
+                    let i = *idx as usize;
+                    let field = wrapped_schema.field(i);
+                    let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), i));
+                    (col, field.name().clone())
+                })
+                .collect();
+            Arc::new(
+                ProjectionExec::try_new(projections, after_synthetics)
+                    .map_err(|e| GeneralError(format!("final reorder ProjectionExec: {e}")))?,
+            )
+        } else {
+            after_synthetics
         };
 
         Ok((
