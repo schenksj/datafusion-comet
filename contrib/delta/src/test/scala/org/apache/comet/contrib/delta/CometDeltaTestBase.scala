@@ -22,10 +22,12 @@ package org.apache.comet.contrib.delta
 import java.nio.file.Files
 
 import org.apache.spark.SparkConf
-import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.CometTestBase
 import org.apache.spark.sql.comet.CometDeltaNativeScanExec
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+
+import org.apache.comet.CometSparkSessionExtensions
 
 /**
  * Base trait for unit-testing the contrib-delta native scan.
@@ -59,10 +61,37 @@ trait CometDeltaTestBase extends CometTestBase with AdaptiveSparkPlanHelper {
   override protected def sparkConf: SparkConf = {
     val conf = super.sparkConf
     conf.set("spark.comet.scan.deltaNative.enabled", "true")
-    conf.set("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
     conf.set("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
     conf.set("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem")
     conf
+  }
+
+  /**
+   * Override to chain Delta's session extension after Comet's. `withExtensions` is
+   * additive, so the chain becomes: Comet rules + Delta rules. Setting
+   * `spark.sql.extensions` via config would also work but interacts unpredictably
+   * with Spark's own `WITH_EXTENSIONS` env wiring in test JVMs.
+   */
+  override protected def createSparkSession: SparkSessionType = {
+    SparkSession.clearActiveSession()
+    SparkSession.clearDefaultSession()
+
+    val deltaExt: org.apache.spark.sql.SparkSessionExtensions => Unit =
+      try {
+        val cls = Class.forName("io.delta.sql.DeltaSparkSessionExtension")
+        val instance = cls.getDeclaredConstructor().newInstance()
+        instance.asInstanceOf[org.apache.spark.sql.SparkSessionExtensions => Unit]
+      } catch {
+        case _: ClassNotFoundException =>
+          (_: org.apache.spark.sql.SparkSessionExtensions) => ()
+      }
+
+    org.apache.spark.sql.classic.SparkSession
+      .builder()
+      .config(sparkContext.getConf)
+      .withExtensions(new CometSparkSessionExtensions)
+      .withExtensions(deltaExt)
+      .getOrCreate()
   }
 
   override protected def beforeAll(): Unit = {

@@ -112,6 +112,18 @@ under the License.
         </exclusion>
       </exclusions>
     </dependency>
+    <!-- failureaccess: Guava's companion artifact (split out at Guava 27).
+         Guava's transitive deps are wildcard-excluded above to keep the
+         shaded production JAR small, which strips failureaccess too. At
+         test runtime any Guava call into futures (e.g. via Hadoop or
+         Spark internals) needs InternalFutureFailureAccess on the
+         classpath — explicitly pull it in here at test scope. -->
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>failureaccess</artifactId>
+      <version>1.0.2</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.codehaus.jackson</groupId>
       <artifactId>jackson-mapper-asl</artifactId>
