@@ -738,11 +738,18 @@ abstract class CometNativeExec extends CometExec {
           (Map.empty, Map.empty)
         }
 
-      case nativeScan: CometNativeScanExec =>
-        nativeScan.ensureSubqueriesResolved()
+      // Generic path for leaf scans that surface planning data via the
+      // `CometScanWithPlanData` trait. Catches `CometNativeScanExec` and any contrib
+      // leaf scan (e.g. the Delta contrib's `CometDeltaNativeScanExec`) without
+      // requiring core to compile-time reference contrib classes.
+      case s: CometScanWithPlanData =>
+        s match {
+          case leaf: CometLeafExec => leaf.ensureSubqueriesResolved()
+          case _ => // no DPP lifecycle to drive
+        }
         (
-          Map(nativeScan.sourceKey -> nativeScan.commonData),
-          Map(nativeScan.sourceKey -> nativeScan.perPartitionData))
+          Map(s.sourceKey -> s.commonData),
+          Map(s.sourceKey -> s.perPartitionData))
 
       // Broadcast stages are boundaries - don't collect per-partition data from inside them.
       // After DPP filtering, broadcast scans may have different partition counts than the
@@ -851,6 +858,24 @@ abstract class CometLeafExec extends CometNativeExec with LeafExecNode {
     prepare()
     waitForSubqueries()
   }
+}
+
+/**
+ * Marker trait for scan execs that surface planning data (a `commonData` block + per-partition
+ * task bytes keyed by `sourceKey`) so that a parent `CometNativeExec` can find and inject the
+ * data when the scan is fused into a larger native subtree.
+ *
+ * Implemented by `CometNativeScanExec`, `CometIcebergNativeScanExec`, and the contrib's
+ * `CometDeltaNativeScanExec` -- without it, [[PlanDataInjector.findAllPlanData]] cannot collect
+ * the per-partition tasks and the parent's native execution receives an empty input.
+ *
+ * Each implementation also resolves its own DPP subqueries via `ensureSubqueriesResolved`
+ * (overridden from [[CometLeafExec]]) before `commonData`/`perPartitionData` are read.
+ */
+trait CometScanWithPlanData {
+  def sourceKey: String
+  def commonData: Array[Byte]
+  def perPartitionData: Array[Array[Byte]]
 }
 
 abstract class CometUnaryExec extends CometNativeExec with UnaryExecNode

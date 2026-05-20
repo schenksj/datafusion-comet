@@ -68,7 +68,8 @@ case class CometDeltaNativeScanExec(
      * plan references `input_file_name()` / `input_file_block_*`.
      */
     oneTaskPerPartition: Boolean = false)
-    extends CometLeafExec {
+    extends CometLeafExec
+    with org.apache.spark.sql.comet.CometScanWithPlanData {
 
   // Per-partition task list bytes are exposed via the public accessors below; core's
   // CometExecRDD reads them directly when serialising the Comet plan for execution.
