@@ -302,16 +302,15 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       return None
     }
 
-    // Belt-and-suspenders DV-rewrite gate. The primary gate runs earlier in
-    // CometScanRule so the scan never becomes a CometScanExec in the first place.
-    // This is a defensive check in case a caller constructs a DV-rewritten
-    // CometScanExec by some other path.
-    if (scan.requiredSchema.fieldNames.contains(DeltaReflection.IsRowDeletedColumnName)) {
-      logWarning(
-        "CometDeltaNativeScan: DV-rewritten schema reached serde; this should have " +
-          "been caught in CometScanRule. Falling back.")
-      return None
-    }
+    // Detect Delta synthetic columns (`__delta_internal_row_index` /
+    // `__delta_internal_is_row_deleted`) the surrounding plan requested. We strip them
+    // from the proto schemas sent to native so the parquet reader doesn't look for
+    // columns that don't exist on disk, and set the proto emit flags so the dispatcher
+    // wraps the parquet scan in `DeltaSyntheticColumnsExec` to append them back.
+    val emitRowIndex = scan.requiredSchema.fieldNames.exists(
+      _.equalsIgnoreCase(DeltaReflection.RowIndexColumnName))
+    val emitIsRowDeleted = scan.requiredSchema.fieldNames.exists(
+      _.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName))
 
     val ignoreMissingFiles =
       SQLConf.get.ignoreMissingFiles ||
@@ -809,13 +808,49 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
           CometDeltaNativeScan.translateDeltaFieldIdToParquet)
       } else relation.partitionSchema.fields
 
-    val dataSchema = schema2Proto(dataSchemaForProto)
-    val requiredSchema = schema2Proto(requiredSchemaForProto)
+    // Strip Delta synthetic columns from the proto schemas. They're not on disk so the
+    // native parquet reader must not look for them; `DeltaSyntheticColumnsExec` appends
+    // them back after the scan. Required precondition: synthetics must be a SUFFIX of
+    // scan.requiredSchema -- otherwise the appended order wouldn't match Spark's
+    // expected output. The standard Delta DV-rewrite path satisfies this; anything else
+    // falls back. If we detect the suffix doesn't hold, decline and let Spark's reader
+    // handle it (correctness over coverage).
+    val syntheticNames = Set(
+      DeltaReflection.RowIndexColumnName.toLowerCase(Locale.ROOT),
+      DeltaReflection.IsRowDeletedColumnName.toLowerCase(Locale.ROOT))
+    val isSynthetic = (f: StructField) =>
+      syntheticNames.contains(f.name.toLowerCase(Locale.ROOT))
+    val needsSyntheticEmit = emitRowIndex || emitIsRowDeleted
+    if (needsSyntheticEmit) {
+      val firstSyntheticIdx = requiredSchemaForProto.indexWhere(isSynthetic)
+      val syntheticContiguousSuffix = firstSyntheticIdx >= 0 &&
+        requiredSchemaForProto.drop(firstSyntheticIdx).forall(isSynthetic)
+      if (!syntheticContiguousSuffix) {
+        import org.apache.comet.CometSparkSessionExtensions.withInfo
+        withInfo(
+          scan,
+          "Native Delta scan declines: Delta synthetic columns are not a suffix of " +
+            "required_schema, so the wrapped DeltaSyntheticColumnsExec output order " +
+            "would not match Spark's expected output.")
+        return None
+      }
+    }
+    val requiredSchemaForProtoStripped =
+      if (needsSyntheticEmit) requiredSchemaForProto.filterNot(isSynthetic)
+      else requiredSchemaForProto
+    val dataSchemaForProtoStripped =
+      if (needsSyntheticEmit) dataSchemaForProto.filterNot(isSynthetic)
+      else dataSchemaForProto
+
+    val dataSchema = schema2Proto(dataSchemaForProtoStripped)
+    val requiredSchema = schema2Proto(requiredSchemaForProtoStripped)
     val partitionSchema = schema2Proto(partitionSchemaForProto)
     commonBuilder.addAllDataSchema(dataSchema.toIterable.asJava)
     commonBuilder.addAllRequiredSchema(requiredSchema.toIterable.asJava)
     commonBuilder.addAllPartitionSchema(partitionSchema.toIterable.asJava)
     commonBuilder.setUseFieldId(cmModeIsId)
+    commonBuilder.setEmitRowIndex(emitRowIndex)
+    commonBuilder.setEmitIsRowDeleted(emitIsRowDeleted)
 
     // Projection vector maps output positions to (file_data_schema ++ partition_schema)
     // indices. Spark's `FileSourceScanExec` splits its visible schema into
@@ -835,7 +870,12 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       relation.partitionSchema.fields.zipWithIndex.map { case (f, i) =>
         f.name.toLowerCase(Locale.ROOT) -> i
       }.toMap
-    val requiredIndexes: Seq[Int] = scan.requiredSchema.fields.map { field =>
+    // Skip synthetic columns when building projection_vector: they aren't in
+    // file_data_schema OR partition_schema, so any attempt to map them produces -1
+    // (out of bounds for native usize). DeltaSyntheticColumnsExec appends them after
+    // the parquet read, satisfying the suffix-precondition asserted above.
+    val requiredIndexes: Seq[Int] = scan.requiredSchema.fields.filterNot(f =>
+      needsSyntheticEmit && isSynthetic(f)).map { field =>
       val nameLower = field.name.toLowerCase(Locale.ROOT)
       val dataIdx =
         fileDataSchemaFields.indexWhere(_.name.toLowerCase(Locale.ROOT) == nameLower)

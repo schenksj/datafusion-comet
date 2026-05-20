@@ -345,28 +345,10 @@ object DeltaScanRule {
       }
     }
     val scanWithMappedSchema = withDeltaColumnMappingMetadata(scanExec)
-    val hasDeltaSyntheticCol = scanExec.output.exists { a =>
-      a.name.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName) ||
-      a.name.equalsIgnoreCase(DeltaReflection.RowIndexColumnName)
-    }
-    if (hasDeltaSyntheticCol) {
-      // Delta's reader synthesizes these columns from its DV bitmap (`is_row_deleted`)
-      // and parquet metadata (`row_index`); Comet's native reader has no equivalent
-      // synthesis machinery and DataFusion 53 doesn't expose virtual row-index columns
-      // either. Native synthesis would require: (a) a new ExecutionPlan node that
-      // appends a UInt64 row_index column per batch (similar shape to DeltaDvFilterExec
-      // but adds rather than filters); (b) extending DeltaDvFilterExec to optionally
-      // EMIT the deletion flag instead of filtering. Verified in the recent regression
-      // that Delta's reader handles these flows correctly via the fallback path
-      // (UPDATE/DELETE/MERGE suites passed clean). Tracking in #144 as a perf
-      // optimisation, not a correctness blocker.
-      withInfo(
-        scanExec,
-        "Native Delta scan declines reads that carry Delta's synthetic " +
-          "__delta_internal_is_row_deleted / __delta_internal_row_index columns in their " +
-          "output -- those are produced only by Delta's reader.")
-      return None
-    }
+    // Delta's `__delta_internal_row_index` / `__delta_internal_is_row_deleted` synthetic
+    // columns are now synthesised natively via `DeltaSyntheticColumnsExec` -- see
+    // CometDeltaNativeScan.convert for the schema stripping + proto emit flags, and
+    // contrib/delta/native/src/synthetic_columns.rs for the exec.
     applyRowTrackingRewrite(scanWithMappedSchema, r, session).getOrElse {
       Some(CometScanExec(scanWithMappedSchema, session, CometDeltaNativeScan.ScanImpl))
     }
