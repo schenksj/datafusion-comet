@@ -54,7 +54,7 @@ short-circuit. This is the only point in core that knows about Delta.
 `DeltaScanRule.transformV1IfDelta` in the contrib first checks whether the
 relation's `fileFormat` is `DeltaParquetFileFormat` (via reflection, no
 compile-time delta-spark dependency), then applies a series of gates
-(covered in `06-fallback-and-ops.md`). If all gates pass, it returns a
+(covered in [06-fallback-and-ops.md](06-fallback-and-ops.md)). If all gates pass, it returns a
 `CometScanExec` marker that flows through the standard
 `CometExecRule.convertToComet` path and ultimately routes through
 `CometDeltaNativeScan` for proto serialisation.
@@ -146,7 +146,7 @@ Delta's "synthetic" columns by name:
 
 For each detected synthetic, an `emit_*` flag goes into `DeltaScanCommon`. The
 native side reads these flags to decide whether to wrap the parquet output
-with `DeltaSyntheticColumnsExec` (see `03-native-execution.md`).
+with `DeltaSyntheticColumnsExec` (see [03-native-execution.md](03-native-execution.md)).
 
 When synthetics ARE detected but are NOT a contiguous suffix of
 `requiredSchema` (e.g. caller wants `[col_a, row_id, col_b]` not
@@ -202,3 +202,7 @@ serialised through the same encoding path as the static case.
 
 Nothing in this list happens per-batch on the executor; the executor's only
 job is to deserialise the proto and run the resulting DataFusion plan.
+
+---
+
+**Navigation** · [← 01 Overview](01-overview.md) · [↑ Index](README.md) · Next → [03 Native execution](03-native-execution.md)

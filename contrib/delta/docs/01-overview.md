@@ -117,8 +117,9 @@ produced by DataFusion in Rust and shipped to the JVM as Arrow record batches.
 
 The two non-obvious pieces are **the proto split** (a single "common" block
 plus per-partition task arrays) and the **native wrapping stack** (DV /
-rename / synthetics / reorder). Both are covered in `02-planning.md` and
-`03-native-execution.md`.
+rename / synthetics / reorder). Both are covered in
+[02-planning.md](02-planning.md) and
+[03-native-execution.md](03-native-execution.md).
 
 ## Two deployment modes from the same codebase
 
@@ -141,8 +142,9 @@ Delta-enabled builds (`-Pcontrib-delta` + `contrib-delta` Cargo feature):
 - The reflection bridge resolves on first call and caches the result
 
 This is the same shape as the Iceberg contrib in this repo. The motivation is
-explained in `04-design-decisions.md`; the operational implications are in
-`05-build-and-deploy.md`.
+explained in [04-design-decisions.md](04-design-decisions.md); the
+operational implications are in
+[05-build-and-deploy.md](05-build-and-deploy.md).
 
 ## What this contrib does NOT touch
 
@@ -162,11 +164,16 @@ To keep the integration scope tight, this PR deliberately avoids:
 
 | Topic | Document |
 |---|---|
-| The planning rule, proto layout, kernel-rs interaction | `02-planning.md` |
-| The native execution plan tree and synthetic columns | `03-native-execution.md` |
-| Why an extension rule (not DSv2), why contrib (not core), why kernel-rs | `04-design-decisions.md` |
-| Maven profile, Cargo feature, the publishing dance | `05-build-and-deploy.md` |
-| Failure handling, Spark fallback, observability | `06-fallback-and-ops.md` |
+| The planning rule, proto layout, kernel-rs interaction | [02-planning.md](02-planning.md) |
+| The native execution plan tree and synthetic columns | [03-native-execution.md](03-native-execution.md) |
+| Why an extension rule (not DSv2), why contrib (not core), why kernel-rs | [04-design-decisions.md](04-design-decisions.md) |
+| Maven profile, Cargo feature, the publishing dance | [05-build-and-deploy.md](05-build-and-deploy.md) |
+| Failure handling, Spark fallback, observability | [06-fallback-and-ops.md](06-fallback-and-ops.md) |
 
-If you only have time for one more document, read `04-design-decisions.md` —
-it answers the "why didn't you just…" questions that come up first in review.
+If you only have time for one more document, read
+[04-design-decisions.md](04-design-decisions.md) — it answers the "why didn't
+you just…" questions that come up first in review.
+
+---
+
+**Navigation** · [↑ Index](README.md) · Next → [02 Planning](02-planning.md)

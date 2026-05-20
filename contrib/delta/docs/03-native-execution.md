@@ -201,7 +201,7 @@ parquet read failures.
 If the failure happens at the kernel-rs layer on the driver (during plan
 construction), we never get to native execution. The planner catches the
 error, calls `withInfo(plan, "delta-kernel-rs error: …")`, and falls back
-to Spark's Delta reader. See `06-fallback-and-ops.md` for the full
+to Spark's Delta reader. See [06-fallback-and-ops.md](06-fallback-and-ops.md) for the full
 catalogue.
 
 ## What this stack does NOT do
@@ -215,3 +215,7 @@ catalogue.
 - **No streaming-source semantics.** Each plan invocation resolves to a
   single Delta snapshot version. Structured Streaming's
   `DeltaSource`/`DeltaSink` paths fall back to Spark.
+
+---
+
+**Navigation** · [← 02 Planning](02-planning.md) · [↑ Index](README.md) · Next → [04 Design decisions](04-design-decisions.md)

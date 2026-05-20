@@ -262,7 +262,7 @@ and surface only Arrow C Data Interface pointers across the boundary.
 
 The cost is that you can't `cargo build` from the root and get the
 contrib; you build core (with `--features contrib-delta`) and it
-re-exports the contrib via static linking. See `05-build-and-deploy.md`.
+re-exports the contrib via static linking. See [05-build-and-deploy.md](05-build-and-deploy.md).
 
 ## Why is `CometCreateArray` declined for type mismatches?
 
@@ -275,3 +275,7 @@ agreement (`apache/datafusion#22366`). Without the decline, valid
 Spark queries that build mixed-type arrays would crash native execution.
 
 We will remove this decline once the upstream issue lands.
+
+---
+
+**Navigation** · [← 03 Native execution](03-native-execution.md) · [↑ Index](README.md) · Next → [05 Build and deploy](05-build-and-deploy.md)

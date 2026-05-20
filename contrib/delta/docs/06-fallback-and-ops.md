@@ -138,7 +138,7 @@ mechanism.
   `comet-spark` JAR being used by the JVM doesn't match the `libcomet`
   dylib being loaded — usually caused by partial upgrades or stale
   classpaths during iteration. The build invariants in
-  `05-build-and-deploy.md` cover the correct combinations
+  [05-build-and-deploy.md](05-build-and-deploy.md) cover the correct combinations
 
 ## Known-safe configuration changes operators can make
 
@@ -179,3 +179,7 @@ The regression diff in `contrib/delta/dev/diffs/delta/4.1.0.diff` is the
 canonical reference for "what should work" — if a Delta upstream test
 isn't in the diff and isn't passing with the contrib enabled, that's
 either a missed decline gate or a real bug.
+
+---
+
+**Navigation** · [← 05 Build and deploy](05-build-and-deploy.md) · [↑ Index](README.md)

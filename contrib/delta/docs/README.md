@@ -28,18 +28,18 @@ scan integration in Comet. It is written for engineers who:
 - Have *not* worked with `delta-kernel-rs` before
 - Want to understand the *design*, not just the *code*
 
-If you only have ten minutes, read `01-overview.md`.
+If you only have ten minutes, read [01-overview.md](01-overview.md).
 
 ## Reading order
 
 | # | Document | Audience |
 |---|---|---|
-| 01 | `01-overview.md` | Everyone — start here |
-| 02 | `02-planning.md` | Engineers reviewing the Scala-side planning rule and proto serde |
-| 03 | `03-native-execution.md` | Engineers reviewing the Rust-side execution plan tree |
-| 04 | `04-design-decisions.md` | Reviewers asking "why didn't you just…" — read after 01 |
-| 05 | `05-build-and-deploy.md` | Operators packaging and deploying Comet with Delta support |
-| 06 | `06-fallback-and-ops.md` | Operators investigating fallbacks and observability |
+| 01 | [Overview](01-overview.md) | Everyone — start here |
+| 02 | [Planning](02-planning.md) | Engineers reviewing the Scala-side planning rule and proto serde |
+| 03 | [Native execution](03-native-execution.md) | Engineers reviewing the Rust-side execution plan tree |
+| 04 | [Design decisions](04-design-decisions.md) | Reviewers asking "why didn't you just…" — read after 01 |
+| 05 | [Build and deploy](05-build-and-deploy.md) | Operators packaging and deploying Comet with Delta support |
+| 06 | [Fallback and ops](06-fallback-and-ops.md) | Operators investigating fallbacks and observability |
 
 ## One-paragraph summary
 
@@ -128,8 +128,8 @@ lines of net new logic plus the proto variant.
 If you are reviewing the PR that introduces this contrib (PR #4366), the
 suggested reading sequence is:
 
-1. `01-overview.md` here
-2. `04-design-decisions.md` here — answers most "why" questions
+1. [01-overview.md](01-overview.md) here
+2. [04-design-decisions.md](04-design-decisions.md) here — answers most "why" questions
 3. The Code review strategy in the PR body
 4. Selected source files per the strategy
 

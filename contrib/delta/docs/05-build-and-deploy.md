@@ -225,3 +225,7 @@ under that matrix entry.
 
 The regression script `contrib/delta/dev/run-regression.sh` handles all of
 this from scratch but is slow (full install + sbt + JVM forks).
+
+---
+
+**Navigation** · [← 04 Design decisions](04-design-decisions.md) · [↑ Index](README.md) · Next → [06 Fallback and ops](06-fallback-and-ops.md)
