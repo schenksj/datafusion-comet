@@ -123,16 +123,20 @@ object DeltaScanRule {
     def check(p: SparkPlan): Boolean = p match {
       case scan: FileSourceScanExec
           if DeltaReflection.isDeltaFileFormat(scan.relation.fileFormat) =>
+        // Pre-materialised batch indexes that carry DV info inline -- our native path
+        // doesn't extract from these, so the DV-aware projection above us has to keep
+        // running on Spark's reader.
         val batchFallback =
           DeltaReflection.isBatchFileIndex(scan.relation.location) &&
             DeltaReflection
               .extractBatchAddFiles(scan.relation.location)
               .exists(_.exists(_.hasDeletionVector))
-        val outputHasIsRowDeleted =
-          scan.output.exists(_.name.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName)) ||
-            scan.requiredSchema.fieldNames.exists(
-              _.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName))
-        batchFallback || outputHasIsRowDeleted
+        // The `outputHasIsRowDeleted` case used to force a decline here too. With
+        // native synthesis of `__delta_internal_is_row_deleted` wired in #144
+        // (CometDeltaNativeScan.convert detects the column and sets the
+        // `emit_is_row_deleted` proto flag), Comet can handle this projection
+        // natively -- no fallback needed.
+        batchFallback
       case other if other.children.size == 1 => check(other.children.head)
       case _ => false
     }
