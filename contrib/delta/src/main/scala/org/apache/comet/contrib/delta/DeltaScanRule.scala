@@ -421,12 +421,15 @@ object DeltaScanRule {
     if (!hasRowIdField) return None
 
     val cfg = DeltaReflection.extractMetadataConfiguration(r).getOrElse(Map.empty)
+    // When `delta.enableRowTracking=false`, the table doesn't track rows so
+    // AddFile.baseRowId and AddFile.defaultRowCommitVersion are absent. Our native
+    // synthesis path (DeltaSyntheticColumnsExec) handles this by emitting NULL row_id
+    // and row_commit_version columns when the per-file base_row_id is None. That
+    // matches Delta's own behaviour for these tables -- the column is queryable but
+    // returns null. So we just fall through to nativeDeltaScan; CometDeltaNativeScan.convert
+    // will detect the columns in scan.requiredSchema and set emit flags.
     if (cfg.get("delta.enableRowTracking").exists(_.equalsIgnoreCase("false"))) {
-      withInfo(
-        scanExec,
-        "Native Delta scan: row-tracking columns requested but table has " +
-          "delta.enableRowTracking=false; falling back.")
-      return Some(None)
+      return None
     }
     val rowIdPhysical = cfg.get(DeltaReflection.MaterializedRowIdColumnProp)
     val rowVerPhysical = cfg.get(DeltaReflection.MaterializedRowCommitVersionColumnProp)
