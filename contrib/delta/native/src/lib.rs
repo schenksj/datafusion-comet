@@ -40,6 +40,7 @@ pub mod jni;
 pub mod planner;
 pub mod predicate;
 pub mod scan;
+pub mod synthetic_columns;
 
 /// Re-export of the Delta proto messages, named so module paths inside this crate
 /// can keep their original `use crate::proto::Delta...` form. The messages

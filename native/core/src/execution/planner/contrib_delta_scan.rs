@@ -210,17 +210,35 @@ impl PhysicalPlanner {
             common.ignore_missing_files,
         )?;
 
-        // Wrap in a DV filter when any partition has a DV. Skip the wrapper otherwise
-        // to avoid the per-batch pass-through cost in the common "no DVs" case.
-        let final_exec: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
-            if deleted_indexes_per_group.iter().any(|v| !v.is_empty()) {
-                Arc::new(
-                    DeltaDvFilterExec::new(delta_exec, deleted_indexes_per_group)
-                        .map_err(|e| GeneralError(format!("DeltaDvFilterExec: {e}")))?,
+        // Three mutually-exclusive wrap modes based on what the surrounding plan asks
+        // for:
+        //  - Delta synthetic columns requested (row_index and/or is_row_deleted): wrap
+        //    with DeltaSyntheticColumnsExec which keeps all rows and APPENDS the
+        //    columns. The outer Delta plan (typically UPDATE/DELETE/MERGE) decides
+        //    what to do with the deletion flag.
+        //  - DV present and no synthetics: wrap with DeltaDvFilterExec which DROPS
+        //    deleted rows inline (standard read path).
+        //  - Neither: pass through (avoids per-batch overhead).
+        let need_synthetics = common.emit_row_index || common.emit_is_row_deleted;
+        let final_exec: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if need_synthetics
+        {
+            Arc::new(
+                comet_contrib_delta::synthetic_columns::DeltaSyntheticColumnsExec::new(
+                    delta_exec,
+                    deleted_indexes_per_group,
+                    common.emit_row_index,
+                    common.emit_is_row_deleted,
                 )
-            } else {
-                delta_exec
-            };
+                .map_err(|e| GeneralError(format!("DeltaSyntheticColumnsExec: {e}")))?,
+            )
+        } else if deleted_indexes_per_group.iter().any(|v| !v.is_empty()) {
+            Arc::new(
+                DeltaDvFilterExec::new(delta_exec, deleted_indexes_per_group)
+                    .map_err(|e| GeneralError(format!("DeltaDvFilterExec: {e}")))?,
+            )
+        } else {
+            delta_exec
+        };
 
         // When column mapping is active, the scan's output schema carries PHYSICAL
         // column names. Upstream operators reference columns by LOGICAL name, so add a

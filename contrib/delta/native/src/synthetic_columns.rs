@@ -1,0 +1,312 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Delta synthetic column emitters.
+//!
+//! Delta's `DeltaParquetFileFormat` injects two parquet-virtual columns into the scan
+//! output for UPDATE/DELETE/MERGE flows:
+//!
+//!   - `__delta_internal_row_index` (Long): the physical row position within the file
+//!   - `__delta_internal_is_row_deleted` (Int): 0 = keep, nonzero = drop (from the DV)
+//!
+//! Delta's reader synthesizes these from parquet row positions + the DV bitmap. Comet's
+//! native parquet path (DataFusion 53) doesn't expose virtual row-index columns; this
+//! module provides equivalent synthesis as small `ExecutionPlan` wrappers that sit
+//! between the inner parquet scan and the rest of the plan.
+//!
+//! Same physical-order invariant as `DeltaDvFilterExec` — these execs rely on one file
+//! per partition and the parquet scan emitting rows in file row order. Both
+//! `maintains_input_order() = [true]` and `benefits_from_input_partitioning() = [false]`
+//! are overridden to pin the contract so future optimizer rewrites are forced to bail
+//! rather than silently re-order rows out from under the row-index emit.
+
+use std::any::Any;
+use std::fmt;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use arrow::array::{Int32Array, RecordBatch, UInt64Array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::{DataFusionError, Result as DFResult};
+use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet,
+};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use futures::{Stream, StreamExt};
+
+/// Delta's internal name for the row-index column.
+pub const ROW_INDEX_COLUMN_NAME: &str = "__delta_internal_row_index";
+/// Delta's internal name for the is-row-deleted column.
+pub const IS_ROW_DELETED_COLUMN_NAME: &str = "__delta_internal_is_row_deleted";
+
+/// Build an output schema = input fields + the appended synthetic columns.
+fn build_output_schema(
+    input: &SchemaRef,
+    emit_row_index: bool,
+    emit_is_row_deleted: bool,
+) -> SchemaRef {
+    let mut fields: Vec<Arc<Field>> = input.fields().iter().cloned().collect();
+    if emit_row_index {
+        fields.push(Arc::new(Field::new(ROW_INDEX_COLUMN_NAME, DataType::UInt64, false)));
+    }
+    if emit_is_row_deleted {
+        fields.push(Arc::new(Field::new(
+            IS_ROW_DELETED_COLUMN_NAME,
+            DataType::Int32,
+            false,
+        )));
+    }
+    Arc::new(Schema::new(fields))
+}
+
+/// `ExecutionPlan` wrapper that appends Delta's synthetic `__delta_internal_row_index`
+/// (UInt64) and/or `__delta_internal_is_row_deleted` (Int32) columns to its child's
+/// output batches.
+///
+/// `deleted_row_indexes_by_partition[i]` is the sorted DV for partition `i`. When
+/// `emit_is_row_deleted` is true, each row's is-deleted column is computed by checking
+/// membership in this list. When `emit_row_index` is true, each row's row_index column
+/// is set to its physical position within the file (running offset across batches).
+///
+/// Unlike `DeltaDvFilterExec`, this exec does NOT filter rows — it surfaces the
+/// information for an outer operator (e.g. Delta's MERGE/UPDATE writer) to decide what
+/// to do.
+#[derive(Debug)]
+pub struct DeltaSyntheticColumnsExec {
+    input: Arc<dyn ExecutionPlan>,
+    /// One entry per output partition. Length must match the input's partition count.
+    /// Empty vec means no DV for that partition (all rows are kept).
+    deleted_row_indexes_by_partition: Vec<Vec<u64>>,
+    emit_row_index: bool,
+    emit_is_row_deleted: bool,
+    output_schema: SchemaRef,
+    plan_properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl DeltaSyntheticColumnsExec {
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        deleted_row_indexes_by_partition: Vec<Vec<u64>>,
+        emit_row_index: bool,
+        emit_is_row_deleted: bool,
+    ) -> DFResult<Self> {
+        if !emit_row_index && !emit_is_row_deleted {
+            return Err(DataFusionError::Internal(
+                "DeltaSyntheticColumnsExec constructed with nothing to emit".to_string(),
+            ));
+        }
+        let input_props = input.properties();
+        let num_partitions = input_props.output_partitioning().partition_count();
+        if deleted_row_indexes_by_partition.len() != num_partitions {
+            return Err(DataFusionError::Internal(format!(
+                "DeltaSyntheticColumnsExec: got {} DV entries for {} partitions",
+                deleted_row_indexes_by_partition.len(),
+                num_partitions
+            )));
+        }
+        let output_schema =
+            build_output_schema(&input.schema(), emit_row_index, emit_is_row_deleted);
+        let plan_properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&output_schema)),
+            input_props.output_partitioning().clone(),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Ok(Self {
+            input,
+            deleted_row_indexes_by_partition,
+            emit_row_index,
+            emit_is_row_deleted,
+            output_schema,
+            plan_properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        })
+    }
+}
+
+impl DisplayAs for DeltaSyntheticColumnsExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "DeltaSyntheticColumnsExec: row_index={}, is_row_deleted={}",
+            self.emit_row_index, self.emit_is_row_deleted
+        )
+    }
+}
+
+impl ExecutionPlan for DeltaSyntheticColumnsExec {
+    fn name(&self) -> &str {
+        "DeltaSyntheticColumnsExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.plan_properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    // Same physical-order invariant as DeltaDvFilterExec.
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "DeltaSyntheticColumnsExec takes exactly one child, got {}",
+                children.len()
+            )));
+        }
+        Ok(Arc::new(Self::new(
+            Arc::clone(&children[0]),
+            self.deleted_row_indexes_by_partition.clone(),
+            self.emit_row_index,
+            self.emit_is_row_deleted,
+        )?))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let child_stream = self.input.execute(partition, context)?;
+        let deleted = self
+            .deleted_row_indexes_by_partition
+            .get(partition)
+            .cloned()
+            .unwrap_or_default();
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        Ok(Box::pin(DeltaSyntheticColumnsStream {
+            inner: child_stream,
+            deleted,
+            current_row_offset: 0,
+            next_delete_idx: 0,
+            output_schema: Arc::clone(&self.output_schema),
+            emit_row_index: self.emit_row_index,
+            emit_is_row_deleted: self.emit_is_row_deleted,
+            baseline_metrics: baseline,
+        }))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+}
+
+struct DeltaSyntheticColumnsStream {
+    inner: SendableRecordBatchStream,
+    deleted: Vec<u64>,
+    current_row_offset: u64,
+    next_delete_idx: usize,
+    output_schema: SchemaRef,
+    emit_row_index: bool,
+    emit_is_row_deleted: bool,
+    baseline_metrics: BaselineMetrics,
+}
+
+impl DeltaSyntheticColumnsStream {
+    fn augment(&mut self, batch: RecordBatch) -> DFResult<RecordBatch> {
+        let batch_rows = batch.num_rows() as u64;
+        let batch_start = self.current_row_offset;
+        let batch_end = batch_start + batch_rows;
+
+        // Build the row_index column: monotonically increasing UInt64 starting at
+        // batch_start.
+        let row_index_array: Option<UInt64Array> = if self.emit_row_index {
+            Some(UInt64Array::from_iter_values(batch_start..batch_end))
+        } else {
+            None
+        };
+
+        // Build the is_row_deleted column: walk the deleted indexes alongside the batch
+        // row range, advancing `next_delete_idx` as we go. Both arrays share the same
+        // O(rows + deletes) sweep; allocation is one Int32Array of length batch_rows.
+        let is_deleted_array: Option<Int32Array> = if self.emit_is_row_deleted {
+            let mut values = vec![0i32; batch_rows as usize];
+            // Skip deleted entries that fall before this batch.
+            while self.next_delete_idx < self.deleted.len()
+                && self.deleted[self.next_delete_idx] < batch_start
+            {
+                self.next_delete_idx += 1;
+            }
+            // Mark every deleted index within [batch_start, batch_end).
+            let mut idx = self.next_delete_idx;
+            while idx < self.deleted.len() && self.deleted[idx] < batch_end {
+                let local = (self.deleted[idx] - batch_start) as usize;
+                values[local] = 1;
+                idx += 1;
+            }
+            Some(Int32Array::from(values))
+        } else {
+            None
+        };
+
+        self.current_row_offset = batch_end;
+
+        // Append synthetic columns to the batch.
+        let mut columns: Vec<Arc<dyn arrow::array::Array>> = batch.columns().to_vec();
+        if let Some(arr) = row_index_array {
+            columns.push(Arc::new(arr));
+        }
+        if let Some(arr) = is_deleted_array {
+            columns.push(Arc::new(arr));
+        }
+        RecordBatch::try_new(Arc::clone(&self.output_schema), columns).map_err(|e| {
+            DataFusionError::Internal(format!(
+                "DeltaSyntheticColumnsExec: failed to append synthetic columns: {e}"
+            ))
+        })
+    }
+}
+
+impl Stream for DeltaSyntheticColumnsStream {
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let poll = self.inner.poll_next_unpin(cx);
+        let result = match poll {
+            Poll::Ready(Some(Ok(batch))) => Poll::Ready(Some(self.augment(batch))),
+            other => other,
+        };
+        self.baseline_metrics.record_poll(result)
+    }
+}
+
+impl RecordBatchStream for DeltaSyntheticColumnsStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.output_schema)
+    }
+}

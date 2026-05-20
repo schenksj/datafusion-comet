@@ -310,6 +310,12 @@ message DeltaScanCommon {
   // Delta tables with `delta.columnMapping.mode = id` (the contrib copies
   // `delta.columnMapping.id` to `PARQUET:field_id` on each schema field).
   bool use_field_id = 17;
+  // Delta synthetic columns to append to the scan output via
+  // `DeltaSyntheticColumnsExec`. The corresponding columns must NOT appear in
+  // `data_schema` or `required_schema` -- they're synthesised at exec time
+  // from row positions / DV bitmaps and inserted after the parquet read.
+  bool emit_row_index = 18;
+  bool emit_is_row_deleted = 19;
 }
 
 // Operator payload for a Delta scan.
