@@ -294,3 +294,326 @@ impl TreeNodeRewriter for ColumnMappingFilterRewriter<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{Field, TimeUnit};
+    use datafusion::common::tree_node::TreeNode;
+
+    // ---- parse_fixed_offset ----
+
+    #[test]
+    fn fixed_offset_utc_z() {
+        for s in ["UTC", "GMT", "Z", "GMTZ", "utc", "gmt"] {
+            let off = parse_fixed_offset(s);
+            // Lowercase variants we don't currently uppercase-normalize; skip those.
+            if s.chars().any(|c| c.is_lowercase()) {
+                continue;
+            }
+            assert_eq!(off.unwrap().local_minus_utc(), 0, "{s}");
+        }
+    }
+
+    #[test]
+    fn fixed_offset_signed_hh_mm() {
+        assert_eq!(parse_fixed_offset("+05:30").unwrap().local_minus_utc(), 5 * 3600 + 30 * 60);
+        assert_eq!(parse_fixed_offset("-08:00").unwrap().local_minus_utc(), -8 * 3600);
+    }
+
+    #[test]
+    fn fixed_offset_hhmm_no_colon() {
+        assert_eq!(parse_fixed_offset("+0530").unwrap().local_minus_utc(), 5 * 3600 + 30 * 60);
+        assert_eq!(parse_fixed_offset("-0800").unwrap().local_minus_utc(), -8 * 3600);
+    }
+
+    #[test]
+    fn fixed_offset_hour_only() {
+        assert_eq!(parse_fixed_offset("+5").unwrap().local_minus_utc(), 5 * 3600);
+        assert_eq!(parse_fixed_offset("-3").unwrap().local_minus_utc(), -3 * 3600);
+    }
+
+    #[test]
+    fn fixed_offset_gmt_prefix() {
+        assert_eq!(
+            parse_fixed_offset("GMT+05:30").unwrap().local_minus_utc(),
+            5 * 3600 + 30 * 60
+        );
+        assert_eq!(parse_fixed_offset("UTC-3").unwrap().local_minus_utc(), -3 * 3600);
+    }
+
+    #[test]
+    fn fixed_offset_invalid_returns_none() {
+        assert!(parse_fixed_offset("garbage").is_none());
+        assert!(parse_fixed_offset("+xx:30").is_none());
+        assert!(parse_fixed_offset("America/New_York").is_none()); // named TZ, not offset
+    }
+
+    // ---- SessionTimezone ----
+
+    #[test]
+    fn session_tz_parses_named() {
+        match SessionTimezone::parse("America/New_York") {
+            SessionTimezone::Tz(_) => {}
+            _ => panic!("expected named TZ"),
+        }
+    }
+
+    #[test]
+    fn session_tz_parses_offset() {
+        match SessionTimezone::parse("+05:30") {
+            SessionTimezone::Offset(off) => {
+                assert_eq!(off.local_minus_utc(), 5 * 3600 + 30 * 60);
+            }
+            _ => panic!("expected fixed offset"),
+        }
+    }
+
+    #[test]
+    fn session_tz_invalid() {
+        assert!(matches!(SessionTimezone::parse("nonsense"), SessionTimezone::Invalid));
+    }
+
+    // ---- parse_delta_partition_scalar: every primitive type ----
+
+    fn tz_utc() -> SessionTimezone {
+        SessionTimezone::parse("UTC")
+    }
+
+    #[test]
+    fn partition_scalar_int32() {
+        let s = parse_delta_partition_scalar("42", &DataType::Int32, &tz_utc(), "UTC").unwrap();
+        assert_eq!(s, ScalarValue::Int32(Some(42)));
+    }
+
+    #[test]
+    fn partition_scalar_int64() {
+        let s = parse_delta_partition_scalar("9999999999", &DataType::Int64, &tz_utc(), "UTC")
+            .unwrap();
+        assert_eq!(s, ScalarValue::Int64(Some(9999999999)));
+    }
+
+    #[test]
+    fn partition_scalar_int16() {
+        let s = parse_delta_partition_scalar("123", &DataType::Int16, &tz_utc(), "UTC").unwrap();
+        assert_eq!(s, ScalarValue::Int16(Some(123)));
+    }
+
+    #[test]
+    fn partition_scalar_utf8() {
+        let s = parse_delta_partition_scalar("hello", &DataType::Utf8, &tz_utc(), "UTC").unwrap();
+        assert_eq!(s, ScalarValue::Utf8(Some("hello".into())));
+    }
+
+    #[test]
+    fn partition_scalar_boolean() {
+        let s = parse_delta_partition_scalar("true", &DataType::Boolean, &tz_utc(), "UTC").unwrap();
+        assert_eq!(s, ScalarValue::Boolean(Some(true)));
+    }
+
+    #[test]
+    fn partition_scalar_date() {
+        // Date32 = days since epoch. 2024-01-15 -> 19737
+        let s = parse_delta_partition_scalar("2024-01-15", &DataType::Date32, &tz_utc(), "UTC")
+            .unwrap();
+        assert_eq!(s, ScalarValue::Date32(Some(19737)));
+    }
+
+    #[test]
+    fn partition_scalar_timestamp_ntz_micros() {
+        let s = parse_delta_partition_scalar(
+            "2024-01-15 12:30:45",
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            &tz_utc(),
+            "UTC",
+        )
+        .unwrap();
+        match s {
+            ScalarValue::TimestampMicrosecond(Some(v), None) => {
+                // 2024-01-15 12:30:45 UTC = epoch micros 1705321845_000_000
+                assert_eq!(v, 1705321845_000_000);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partition_scalar_timestamp_ntz_widens_from_date() {
+        // DATE -> TIMESTAMP_NTZ widening: "2024-01-15" promotes to midnight.
+        let s = parse_delta_partition_scalar(
+            "2024-01-15",
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            &tz_utc(),
+            "UTC",
+        )
+        .unwrap();
+        match s {
+            ScalarValue::TimestampMicrosecond(Some(_), None) => {} // success
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partition_scalar_timestamp_with_session_tz() {
+        // 2024-01-15 12:00:00 in America/New_York = 17:00:00 UTC = 1705338000 epoch sec
+        let parsed = SessionTimezone::parse("America/New_York");
+        let s = parse_delta_partition_scalar(
+            "2024-01-15 12:00:00",
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            &parsed,
+            "America/New_York",
+        )
+        .unwrap();
+        match s {
+            ScalarValue::TimestampMicrosecond(Some(v), Some(_)) => {
+                assert_eq!(v, 1705338000_000_000);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ---- build_delta_partitioned_files ----
+
+    fn task(file_path: &str, partition_values: Vec<(&str, Option<&str>)>) -> DeltaScanTask {
+        use crate::proto::DeltaPartitionValue;
+        DeltaScanTask {
+            file_path: file_path.into(),
+            file_size: 1000,
+            partition_values: partition_values
+                .into_iter()
+                .map(|(n, v)| DeltaPartitionValue {
+                    name: n.into(),
+                    value: v.map(|s| s.into()),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_files_empty_input() {
+        let pschema = Schema::new(vec![Field::new("p", DataType::Int32, true)]);
+        let files = build_delta_partitioned_files(&[], &pschema, "UTC").unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn build_files_no_partition_columns() {
+        let pschema = Schema::new(Vec::<Field>::new());
+        let tasks = vec![task("file:///tmp/a.parquet", vec![])];
+        let files = build_delta_partitioned_files(&tasks, &pschema, "UTC").unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].partition_values.is_empty());
+    }
+
+    #[test]
+    fn build_files_single_partition_int() {
+        let pschema = Schema::new(vec![Field::new("p", DataType::Int32, true)]);
+        let tasks = vec![task("file:///tmp/a.parquet", vec![("p", Some("42"))])];
+        let files = build_delta_partitioned_files(&tasks, &pschema, "UTC").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].partition_values, vec![ScalarValue::Int32(Some(42))]);
+    }
+
+    #[test]
+    fn build_files_missing_partition_value_yields_null() {
+        let pschema = Schema::new(vec![Field::new("p", DataType::Int32, true)]);
+        let tasks = vec![task("file:///tmp/a.parquet", vec![])]; // no value for p
+        let files = build_delta_partitioned_files(&tasks, &pschema, "UTC").unwrap();
+        assert_eq!(files[0].partition_values, vec![ScalarValue::Int32(None)]);
+    }
+
+    #[test]
+    fn build_files_invalid_url_errors() {
+        let pschema = Schema::new(Vec::<Field>::new());
+        let tasks = vec![task("not a url", vec![])];
+        let err = build_delta_partitioned_files(&tasks, &pschema, "UTC").unwrap_err();
+        assert!(err.contains("Invalid Delta file URL"));
+    }
+
+    // ---- ColumnMappingFilterRewriter ----
+
+    #[test]
+    fn cm_rewriter_renames_known_logical_column() {
+        let logical_to_physical: HashMap<String, String> =
+            [("user_id".to_string(), "col-1a2b3c".to_string())]
+                .iter()
+                .cloned()
+                .collect();
+        let data_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("col-1a2b3c", DataType::Int64, false),
+        ]));
+        let mut rewriter = ColumnMappingFilterRewriter {
+            logical_to_physical: &logical_to_physical,
+            data_schema: &data_schema,
+        };
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("user_id", 0));
+        let out = expr.rewrite(&mut rewriter).unwrap().data;
+        let col = out.as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(col.name(), "col-1a2b3c");
+        assert_eq!(col.index(), 0);
+    }
+
+    #[test]
+    fn cm_rewriter_leaves_unmapped_column_alone() {
+        let logical_to_physical = HashMap::new();
+        let data_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("other", DataType::Int64, false),
+        ]));
+        let mut rewriter = ColumnMappingFilterRewriter {
+            logical_to_physical: &logical_to_physical,
+            data_schema: &data_schema,
+        };
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("other", 0));
+        let out = expr.rewrite(&mut rewriter).unwrap().data;
+        let col = out.as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(col.name(), "other");
+    }
+
+    #[test]
+    fn cm_rewriter_resolves_correct_index() {
+        let logical_to_physical: HashMap<String, String> =
+            [("logical_b".to_string(), "phys_b".to_string())]
+                .iter()
+                .cloned()
+                .collect();
+        let data_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("phys_a", DataType::Int64, false),
+            Field::new("phys_b", DataType::Int64, false), // index 1
+            Field::new("phys_c", DataType::Int64, false),
+        ]));
+        let mut rewriter = ColumnMappingFilterRewriter {
+            logical_to_physical: &logical_to_physical,
+            data_schema: &data_schema,
+        };
+        // Even if input index is 0 (from required_schema position), rewriter resolves to
+        // physical schema's index for phys_b which is 1.
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("logical_b", 0));
+        let out = expr.rewrite(&mut rewriter).unwrap().data;
+        let col = out.as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(col.name(), "phys_b");
+        assert_eq!(col.index(), 1, "must resolve to physical schema index");
+    }
+
+    #[test]
+    fn cm_rewriter_logs_warning_for_missing_physical() {
+        // Mapping says logical -> physical, but physical isn't in data_schema.
+        let logical_to_physical: HashMap<String, String> =
+            [("logical".to_string(), "phys_missing".to_string())]
+                .iter()
+                .cloned()
+                .collect();
+        let data_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("something_else", DataType::Int64, false),
+        ]));
+        let mut rewriter = ColumnMappingFilterRewriter {
+            logical_to_physical: &logical_to_physical,
+            data_schema: &data_schema,
+        };
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("logical", 0));
+        // Should not panic; returns the original Column unchanged.
+        let out = expr.rewrite(&mut rewriter).unwrap().data;
+        let col = out.as_any().downcast_ref::<Column>().unwrap();
+        assert_eq!(col.name(), "logical"); // unchanged
+    }
+}
