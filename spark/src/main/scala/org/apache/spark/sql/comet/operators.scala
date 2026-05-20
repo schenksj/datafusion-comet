@@ -747,9 +747,7 @@ abstract class CometNativeExec extends CometExec {
           case leaf: CometLeafExec => leaf.ensureSubqueriesResolved()
           case _ => // no DPP lifecycle to drive
         }
-        (
-          Map(s.sourceKey -> s.commonData),
-          Map(s.sourceKey -> s.perPartitionData))
+        (Map(s.sourceKey -> s.commonData), Map(s.sourceKey -> s.perPartitionData))
 
       // Broadcast stages are boundaries - don't collect per-partition data from inside them.
       // After DPP filtering, broadcast scans may have different partition counts than the
