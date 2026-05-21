@@ -125,12 +125,15 @@ case class CometScanRule(session: SparkSession)
       case scan if !CometConf.COMET_NATIVE_SCAN_ENABLED.get(conf) =>
         withInfo(scan, "Comet Scan is not enabled")
 
-      case scan if hasMetadataCol(scan) =>
-        withInfo(scan, "Metadata column is not supported")
-
-      // data source V1
+      // V1 scans go through `transformV1Scan` which itself first delegates to any
+      // available V1 contrib (today: Delta) and only then applies generic Comet
+      // bailouts like the metadata-column rejection. This keeps the metadata-col
+      // guard in place for V2 and non-contrib V1 paths without referencing any
+      // specific contrib class from this outer match.
       case scanExec: FileSourceScanExec =>
         transformV1Scan(fullPlan, scanExec)
+      case scan if hasMetadataCol(scan) =>
+        withInfo(scan, "Metadata column is not supported")
 
       // data source V2
       case scanExec: BatchScanExec =>
@@ -171,6 +174,15 @@ case class CometScanRule(session: SparkSession)
         DeltaIntegration.transformV1IfDelta(plan, session, scanExec, r) match {
           case Some(handled) => return handled
           case None => // proceed with vanilla logic
+        }
+        // Metadata-col bailout moved here so V1 contribs (Delta) get first crack
+        // at scans with synthetic metadata columns before generic Comet rejects
+        // them. For non-contrib V1 scans this is equivalent to the outer check.
+        if (scanExec.expressions.exists(_.exists {
+          case a: Attribute => a.isMetadataCol
+          case _ => false
+        })) {
+          return withInfo(scanExec, "Metadata column is not supported")
         }
         if (!CometScanExec.isFileFormatSupported(r.fileFormat)) {
           return withInfo(scanExec, s"Unsupported file format ${r.fileFormat}")

@@ -48,7 +48,8 @@ class CometDeltaColumnMappingSuite extends CometDeltaTestBase {
 
       spark.sql(s"DELETE FROM delta.`$tablePath` WHERE id % 3 = 0")
 
-      val df = spark.read.format("delta").load(tablePath)
+      // orderBy forces AQE wrapping so Comet's prep rules see the plan.
+      val df = spark.read.format("delta").load(tablePath).orderBy("id")
       val plan = df.queryExecution.executedPlan
       val deltaScans = collect(plan) { case s: CometDeltaNativeScanExec => s }
       assert(

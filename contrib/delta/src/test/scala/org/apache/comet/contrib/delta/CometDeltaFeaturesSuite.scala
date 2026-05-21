@@ -87,17 +87,18 @@ class CometDeltaFeaturesSuite extends CometDeltaTestBase {
         .option("delta.minWriterVersion", "7")
         .save(tablePath)
 
+      // orderBy forces a shuffle -> AQE wraps -> Comet's prep rules fire
       val df = spark.read
         .format("delta")
         .load(tablePath)
         .selectExpr("id", "_metadata.row_id AS rid")
         .orderBy("id")
+      val rows = df.collect().toSeq
       val plan = df.queryExecution.executedPlan
       assert(
         collect(plan) { case s: CometDeltaNativeScanExec => s }.nonEmpty,
         s"expected Comet to accelerate rowTracking scan:\n$plan")
 
-      val rows = df.collect().toSeq
       assert(rows.size == 12)
       rows.zipWithIndex.foreach { case (row, idx) =>
         assert(row.getLong(1) == idx.toLong, s"row $idx: rid mismatch")
@@ -123,8 +124,10 @@ class CometDeltaFeaturesSuite extends CometDeltaTestBase {
         .option("delta.minWriterVersion", "7")
         .save(tablePath)
 
+      // orderBy forces AQE wrapping so Comet's prep rules see this plan.
       val df = spark.read.format("delta").load(tablePath)
         .selectExpr("id", "_metadata.row_index AS ri")
+        .orderBy("id")
       val rows = df.collect()
       val plan = df.queryExecution.executedPlan
       assert(rows.length === 6, s"expected 6 rows, got ${rows.length}")
@@ -147,8 +150,10 @@ class CometDeltaFeaturesSuite extends CometDeltaTestBase {
       (5 until 10).map(i => (i.toLong, "b"))
         .toDF("id", "src").repartition(1).write.format("delta").mode("append").save(tablePath)
 
+      // orderBy forces AQE wrapping for Comet's rules to fire.
       val df = spark.read.format("delta").load(tablePath)
         .withColumn("ifn", input_file_name())
+        .orderBy("id")
       val rows = df.collect()
       assert(rows.length === 10)
       val distinctPaths = rows.map(_.getString(2)).toSet
