@@ -55,7 +55,6 @@ class CometDeltaColumnMappingSuite extends CometDeltaTestBase {
       assert(
         deltaScans.nonEmpty,
         s"expected Comet to accelerate a DV-in-use table:\n$plan")
-
       val nativeRows = df.collect().toSeq.map(normalizeRow)
       withSQLConf("spark.comet.scan.deltaNative.enabled" -> "false") {
         val vanillaRows = spark.read

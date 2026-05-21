@@ -944,7 +944,32 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       val firstSyntheticIdx = requiredSchemaForProto.indexWhere(isSynthetic)
       val syntheticContiguousSuffix = firstSyntheticIdx >= 0 &&
         requiredSchemaForProto.drop(firstSyntheticIdx).forall(isSynthetic)
-      if (syntheticContiguousSuffix) Seq.empty
+      // Synthetic suffix is necessary but NOT sufficient: the order of synthetics
+      // within the suffix must also match the canonical emission order
+      // (row_index, is_row_deleted, row_id, row_commit_version, then metadata names
+      // in `metadataColumnNamesEmitted` order). When the upstream Filter / Project
+      // binds attributes by ordinal (Delta's PreprocessTableWithDVs adds
+      // `Filter(__delta_internal_is_row_deleted = 0)` directly above the scan),
+      // an order mismatch silently misreads one synthetic as another. Force a
+      // reorder Projection in that case.
+      val canonicalSyntheticEmitOrder: Seq[String] = (Seq(
+        (emitRowIndex,
+          (if (rowIndexColumnAlias.nonEmpty) rowIndexColumnAlias
+           else DeltaReflection.RowIndexColumnName).toLowerCase(Locale.ROOT)),
+        (emitIsRowDeleted,
+          DeltaReflection.IsRowDeletedColumnName.toLowerCase(Locale.ROOT)),
+        (emitRowId, DeltaReflection.RowIdColumnName.toLowerCase(Locale.ROOT)),
+        (emitRowCommitVersion,
+          DeltaReflection.RowCommitVersionColumnName.toLowerCase(Locale.ROOT))).collect {
+        case (true, name) => name
+      }) ++ metadataColumnNamesEmitted
+      val suffixSyntheticNames = requiredSchemaForProto
+        .drop(firstSyntheticIdx)
+        .map(_.name.toLowerCase(Locale.ROOT))
+        .toSeq
+      val syntheticSuffixOrderMatches =
+        syntheticContiguousSuffix && suffixSyntheticNames == canonicalSyntheticEmitOrder
+      if (syntheticSuffixOrderMatches) Seq.empty
       else {
         // Native synthetic emit order in build_output_schema (synthetic_columns.rs):
         // row_index, is_row_deleted, row_id, row_commit_version, then any
