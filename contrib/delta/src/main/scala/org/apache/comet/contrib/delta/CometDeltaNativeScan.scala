@@ -311,8 +311,22 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     //   - `row_id` / `row_commit_version` are row-tracking columns when the table has
     //     `delta.enableRowTracking=true` but no materialised columns -- synthesised
     //     from baseRowId + physical row index per task.
-    val emitRowIndex = scan.requiredSchema.fieldNames.exists(
+    // Row index can appear under either name in the scan output: the canonical
+    // `__delta_internal_row_index` (Delta synthetic-column path), or the
+    // intermediate `_tmp_metadata_row_index` (Delta's
+    // `DeltaParquetFileFormat.TMP_METADATA_ROW_INDEX_COLUMN_NAME`, used for plans
+    // that read `_metadata.row_index` from row-tracking-enabled tables before
+    // Delta projects the alias). Both cases go through the same native synthesis
+    // -- just with a different output column name.
+    val rowIndexCanonicalPresent = scan.requiredSchema.fieldNames.exists(
       _.equalsIgnoreCase(DeltaReflection.RowIndexColumnName))
+    val rowIndexTmpMetadataPresent = scan.requiredSchema.fieldNames.exists(
+      _.equalsIgnoreCase(DeltaReflection.TmpMetadataRowIndexColumnName))
+    val emitRowIndex = rowIndexCanonicalPresent || rowIndexTmpMetadataPresent
+    val rowIndexColumnAlias: String =
+      if (rowIndexTmpMetadataPresent && !rowIndexCanonicalPresent)
+        DeltaReflection.TmpMetadataRowIndexColumnName
+      else ""
     val emitIsRowDeleted = scan.requiredSchema.fieldNames.exists(
       _.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName))
     val emitRowId = scan.requiredSchema.fieldNames.exists(_.equalsIgnoreCase(DeltaReflection.RowIdColumnName))
@@ -833,6 +847,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // handle it (correctness over coverage).
     val syntheticNames = Set(
       DeltaReflection.RowIndexColumnName.toLowerCase(Locale.ROOT),
+      DeltaReflection.TmpMetadataRowIndexColumnName.toLowerCase(Locale.ROOT),
       DeltaReflection.IsRowDeletedColumnName.toLowerCase(Locale.ROOT),
       DeltaReflection.RowIdColumnName,
       DeltaReflection.RowCommitVersionColumnName)
@@ -905,6 +920,9 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     commonBuilder.setEmitIsRowDeleted(emitIsRowDeleted)
     commonBuilder.setEmitRowId(emitRowId)
     commonBuilder.setEmitRowCommitVersion(emitRowCommitVersion)
+    if (rowIndexColumnAlias.nonEmpty) {
+      commonBuilder.setRowIndexColumnAlias(rowIndexColumnAlias)
+    }
     commonBuilder.addAllFinalOutputIndices(
       finalOutputIndices.map(i => Integer.valueOf(i)).asJava)
 

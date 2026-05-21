@@ -291,6 +291,11 @@ impl PhysicalPlanner {
         // After CM-name rename: apply synthetic emission OR DV filter OR passthrough.
         let after_synthetics: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if need_synthetics
         {
+            let row_index_alias = if common.row_index_column_alias.is_empty() {
+                comet_contrib_delta::synthetic_columns::ROW_INDEX_COLUMN_NAME
+            } else {
+                common.row_index_column_alias.as_str()
+            };
             Arc::new(
                 comet_contrib_delta::synthetic_columns::DeltaSyntheticColumnsExec::new(
                     after_rename,
@@ -301,6 +306,7 @@ impl PhysicalPlanner {
                     common.emit_is_row_deleted,
                     common.emit_row_id,
                     common.emit_row_commit_version,
+                    row_index_alias,
                 )
                 .map_err(|e| GeneralError(format!("DeltaSyntheticColumnsExec: {e}")))?,
             )

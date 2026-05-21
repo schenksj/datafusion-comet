@@ -329,6 +329,13 @@ message DeltaScanCommon {
   // row_commit_version order. Empty = synthetics are already a suffix; no
   // reorder needed.
   repeated int32 final_output_indices = 22;
+  // Override for the row_index column name. Defaults to "__delta_internal_row_index"
+  // when empty. Delta plans that read `_metadata.row_index` from row-tracking-enabled
+  // tables expose the row index as `_tmp_metadata_row_index` (the Delta-internal
+  // physical name from `DeltaParquetFileFormat.TMP_METADATA_ROW_INDEX_COLUMN_NAME`)
+  // rather than the canonical `__delta_internal_row_index`. Setting this lets the
+  // contrib produce a column with the alternate name from the same native synthesis.
+  string row_index_column_alias = 23;
 }
 
 // Operator payload for a Delta scan.

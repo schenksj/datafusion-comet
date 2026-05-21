@@ -71,10 +71,11 @@ fn build_output_schema(
     emit_is_row_deleted: bool,
     emit_row_id: bool,
     emit_row_commit_version: bool,
+    row_index_column_name: &str,
 ) -> SchemaRef {
     let mut fields: Vec<Arc<Field>> = input.fields().iter().cloned().collect();
     if emit_row_index {
-        fields.push(Arc::new(Field::new(ROW_INDEX_COLUMN_NAME, DataType::UInt64, false)));
+        fields.push(Arc::new(Field::new(row_index_column_name, DataType::UInt64, false)));
     }
     if emit_is_row_deleted {
         fields.push(Arc::new(Field::new(
@@ -125,6 +126,10 @@ pub struct DeltaSyntheticColumnsExec {
     emit_is_row_deleted: bool,
     emit_row_id: bool,
     emit_row_commit_version: bool,
+    /// Column name to emit for the row_index synthetic. Stored so with_new_children
+    /// can reconstruct correctly. Defaults to ROW_INDEX_COLUMN_NAME but DV-aware
+    /// Delta plans may use `_tmp_metadata_row_index` instead.
+    row_index_column_name: String,
     output_schema: SchemaRef,
     plan_properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -141,6 +146,7 @@ impl DeltaSyntheticColumnsExec {
         emit_is_row_deleted: bool,
         emit_row_id: bool,
         emit_row_commit_version: bool,
+        row_index_column_name: &str,
     ) -> DFResult<Self> {
         if !emit_row_index && !emit_is_row_deleted && !emit_row_id && !emit_row_commit_version {
             return Err(DataFusionError::Internal(
@@ -168,6 +174,7 @@ impl DeltaSyntheticColumnsExec {
             emit_is_row_deleted,
             emit_row_id,
             emit_row_commit_version,
+            row_index_column_name,
         );
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
@@ -184,6 +191,7 @@ impl DeltaSyntheticColumnsExec {
             emit_is_row_deleted,
             emit_row_id,
             emit_row_commit_version,
+            row_index_column_name: row_index_column_name.to_string(),
             output_schema,
             plan_properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -249,6 +257,7 @@ impl ExecutionPlan for DeltaSyntheticColumnsExec {
             self.emit_is_row_deleted,
             self.emit_row_id,
             self.emit_row_commit_version,
+            &self.row_index_column_name,
         )?))
     }
 
@@ -449,6 +458,7 @@ mod tests {
             emit_is_row_deleted,
             emit_row_id,
             emit_row_commit_version,
+            ROW_INDEX_COLUMN_NAME,
         );
         let metrics = ExecutionPlanMetricsSet::new();
         let baseline = BaselineMetrics::new(&metrics, 0);
