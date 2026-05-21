@@ -781,11 +781,27 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       relation.partitionSchema.fields.filterNot(f =>
         haveLc.contains(f.name.toLowerCase(Locale.ROOT)))
     }
+    // Spark `_metadata.*` virtual columns that appear in scan.output but not
+    // scan.requiredSchema. They are synthesised natively below (via
+    // metadataColumnNamesEmitted) and must appear in the wrapped exec output schema for
+    // downstream attribute resolution.
+    val sparkMetadataNameSet = Set(
+      "file_path",
+      "file_name",
+      "file_size",
+      "file_block_start",
+      "file_block_length",
+      "file_modification_time")
+    val extraMetadataFields: Array[StructField] = scan.output.toArray.collect {
+      case a if sparkMetadataNameSet.contains(a.name.toLowerCase(Locale.ROOT)) &&
+        !scan.requiredSchema.fieldNames.exists(_.equalsIgnoreCase(a.name)) =>
+        StructField(a.name, a.dataType, a.nullable)
+    }
     val requiredSchemaFields = {
       val base =
         if (columnMappingActive) scan.requiredSchema.fields.map(physicaliseRequiredField)
         else scan.requiredSchema.fields
-      base ++ partitionFieldsForRequired
+      base ++ partitionFieldsForRequired ++ extraMetadataFields
     }
     val physicalFileDataSchemaFields = if (columnMappingActive) {
       val requiredByName = requiredSchemaFields
@@ -874,6 +890,11 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       "file_modification_time")
     val requiredFieldNamesLower: Set[String] =
       scan.requiredSchema.fields.map(_.name.toLowerCase(Locale.ROOT)).toSet
+    // Spark also appends `_metadata.*` columns to scan.output (not requiredSchema) when
+    // downstream operators (e.g. Delta's PreprocessTableWithDVs) bind to them by name.
+    // The wrapped exec's output schema must include them so attribute resolution works.
+    val outputFieldNamesLower: Set[String] =
+      scan.output.map(_.name.toLowerCase(Locale.ROOT)).toSet
     val metadataColumnNamesEmitted: Seq[String] = Seq(
       "file_path",
       "file_name",
@@ -881,7 +902,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       "file_block_start",
       "file_block_length",
       "file_modification_time"
-    ).filter(requiredFieldNamesLower.contains)
+    ).filter(n => requiredFieldNamesLower.contains(n) || outputFieldNamesLower.contains(n))
     val needsMetadataEmit = metadataColumnNamesEmitted.nonEmpty
     val needsSyntheticEmit =
       emitRowIndex || emitIsRowDeleted || emitRowId || emitRowCommitVersion || needsMetadataEmit
@@ -1040,13 +1061,24 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
         case _ => false
       }
       val dataFilters = new ListBuffer[Expr]()
+      // Filters bind by position into the schema we hand to exprToProto. The native
+      // scan's `required_schema` strips synthetic emit columns -- it's just the
+      // non-synthetic, non-metadata data fields. Bind against that same layout so
+      // Bound indices line up; binding against `scan.output` (which carries appended
+      // _metadata.* attributes) would silently misalign whenever the prefix doesn't
+      // match.
+      val filterBindingInputs: Seq[org.apache.spark.sql.catalyst.expressions.Attribute] =
+        scan.requiredSchema.fields.collect {
+          case f if !isSynthetic(f) =>
+            scan.output.find(_.name.equalsIgnoreCase(f.name)).orNull
+        }.filter(_ != null).toSeq
       scan.supportedDataFilters.foreach { filter =>
         if (referencesNestedAccess(filter)) {
           logInfo(s"CometDeltaNativeScan: skipping pushdown of nested-access filter $filter")
         } else if (referencesPartitionColumn(filter)) {
           logInfo(s"CometDeltaNativeScan: skipping pushdown of partition-column filter $filter")
         } else {
-          exprToProto(filter, scan.output) match {
+          exprToProto(filter, filterBindingInputs) match {
             case Some(proto) => dataFilters += proto
             case _ => logWarning(s"CometDeltaNativeScan: unsupported data filter $filter")
           }
