@@ -309,7 +309,16 @@ impl PhysicalPlanner {
             delta_exec
         };
 
-        // After CM-name rename: apply synthetic emission OR DV filter OR passthrough.
+        // After CM-name rename: apply synthetic emission and/or DV filter.
+        //   - When synthetics are emitted: chain `synthetic` first (so row_index is
+        //     populated with original-file offsets) then DV filter (which uses its own
+        //     row counter to drop deleted rows; emitted columns ride along).
+        //   - When `emit_is_row_deleted` is on, the upstream (UPDATE/DELETE/MERGE
+        //     writer) consumes the flag itself; DON'T filter here -- the writer needs
+        //     to see every row to decide what to do.
+        //   - When only DV filtering is needed (no synthetic emission): use
+        //     `DeltaDvFilterExec` directly.
+        let has_dv = deleted_indexes_per_group.iter().any(|v| !v.is_empty());
         let after_synthetics: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if need_synthetics
         {
             let row_index_alias = if common.row_index_column_alias.is_empty() {
@@ -317,10 +326,18 @@ impl PhysicalPlanner {
             } else {
                 common.row_index_column_alias.as_str()
             };
-            Arc::new(
+            // Pre-build the DV partition list -- if we'll wrap with DvFilterExec next
+            // we still need a per-partition vector; otherwise pass empty so the
+            // synthetic exec doesn't try to use stale indexes for is_row_deleted.
+            let synthetic_dv_indexes = if common.emit_is_row_deleted {
+                deleted_indexes_per_group.clone()
+            } else {
+                vec![Vec::new(); deleted_indexes_per_group.len()]
+            };
+            let synth: Arc<dyn datafusion::physical_plan::ExecutionPlan> = Arc::new(
                 comet_contrib_delta::synthetic_columns::DeltaSyntheticColumnsExec::new(
                     after_rename,
-                    deleted_indexes_per_group,
+                    synthetic_dv_indexes,
                     base_row_ids_per_group,
                     default_commit_versions_per_group,
                     common.emit_row_index,
@@ -332,8 +349,18 @@ impl PhysicalPlanner {
                     task_metadata_per_group,
                 )
                 .map_err(|e| GeneralError(format!("DeltaSyntheticColumnsExec: {e}")))?,
-            )
-        } else if deleted_indexes_per_group.iter().any(|v| !v.is_empty()) {
+            );
+            // Apply DV filter on top of synthetic emission, EXCEPT when the upstream
+            // is consuming is_row_deleted -- then it needs every row.
+            if has_dv && !common.emit_is_row_deleted {
+                Arc::new(
+                    DeltaDvFilterExec::new(synth, deleted_indexes_per_group)
+                        .map_err(|e| GeneralError(format!("DeltaDvFilterExec: {e}")))?,
+                )
+            } else {
+                synth
+            }
+        } else if has_dv {
             Arc::new(
                 DeltaDvFilterExec::new(after_rename, deleted_indexes_per_group)
                     .map_err(|e| GeneralError(format!("DeltaDvFilterExec: {e}")))?,
