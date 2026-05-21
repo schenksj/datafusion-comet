@@ -166,14 +166,21 @@ impl PhysicalPlanner {
         // row_id = baseRowId + physical_row_index is per-file; row_commit_version is
         // per-file constant). So when ANY emit is on, give each file its own group
         // regardless of DV presence so the per-file lookup is well-defined.
+        // When metadata columns are requested they're per-file constants too, so
+        // need_per_file_groups must include that case to keep partition-index =
+        // file-index alignment in DeltaSyntheticColumnsExec.
         let need_per_file_groups = common.emit_row_index
             || common.emit_is_row_deleted
             || common.emit_row_id
-            || common.emit_row_commit_version;
+            || common.emit_row_commit_version
+            || !common.metadata_column_names.is_empty();
         let mut file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
         let mut deleted_indexes_per_group: Vec<Vec<u64>> = Vec::new();
         let mut base_row_ids_per_group: Vec<Option<i64>> = Vec::new();
         let mut default_commit_versions_per_group: Vec<Option<i64>> = Vec::new();
+        let mut task_metadata_per_group: Vec<
+            comet_contrib_delta::synthetic_columns::TaskMetadata,
+        > = Vec::new();
         let mut non_dv_files: Vec<PartitionedFile> = Vec::new();
         for (file, task) in files.into_iter().zip(scan.tasks.iter()) {
             if !task.deleted_row_indexes.is_empty() || need_per_file_groups {
@@ -181,6 +188,15 @@ impl PhysicalPlanner {
                 deleted_indexes_per_group.push(task.deleted_row_indexes.clone());
                 base_row_ids_per_group.push(task.base_row_id);
                 default_commit_versions_per_group.push(task.default_row_commit_version);
+                task_metadata_per_group.push(
+                    comet_contrib_delta::synthetic_columns::TaskMetadata {
+                        file_path: Some(task.file_path.clone()),
+                        file_size: Some(task.file_size as i64),
+                        byte_range_start: task.byte_range_start.map(|v| v as i64),
+                        byte_range_end: task.byte_range_end.map(|v| v as i64),
+                        modification_time_millis: task.modification_time,
+                    },
+                );
             } else {
                 non_dv_files.push(file);
             }
@@ -190,6 +206,9 @@ impl PhysicalPlanner {
             deleted_indexes_per_group.push(Vec::new());
             base_row_ids_per_group.push(None);
             default_commit_versions_per_group.push(None);
+            task_metadata_per_group.push(
+                comet_contrib_delta::synthetic_columns::TaskMetadata::default(),
+            );
         }
 
         // Pick any one file to register the object store (they all share the same root).
@@ -240,7 +259,8 @@ impl PhysicalPlanner {
         let need_synthetics = common.emit_row_index
             || common.emit_is_row_deleted
             || common.emit_row_id
-            || common.emit_row_commit_version;
+            || common.emit_row_commit_version
+            || !common.metadata_column_names.is_empty();
 
         // Column-mapping rename has to happen BEFORE synthetic emission so that the
         // synthetic exec sees logical column names in its input schema (matching what
@@ -307,6 +327,8 @@ impl PhysicalPlanner {
                     common.emit_row_id,
                     common.emit_row_commit_version,
                     row_index_alias,
+                    common.metadata_column_names.clone(),
+                    task_metadata_per_group,
                 )
                 .map_err(|e| GeneralError(format!("DeltaSyntheticColumnsExec: {e}")))?,
             )

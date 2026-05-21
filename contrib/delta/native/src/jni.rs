@@ -183,6 +183,13 @@ pub unsafe extern "system" fn Java_org_apache_comet_contrib_delta_Native_planDel
                 // not here on the kernel-driver path. Leave unset.
                 byte_range_start: None,
                 byte_range_end: None,
+                // kernel-driver path doesn't surface modification_time today; the
+                // BatchFileIndex path (`buildTaskListFromAddFiles` on the Scala side)
+                // does set it from AddFile.modificationTime. None here is fine for
+                // tables read via kernel log replay -- callers that need
+                // `_metadata.file_modification_time` get null (which is what Spark
+                // would produce for unknown modification time anyway).
+                modification_time: None,
             })
             .collect();
 

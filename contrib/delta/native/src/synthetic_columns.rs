@@ -40,8 +40,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::{Int32Array, Int64Array, RecordBatch, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{
+    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array,
+};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -61,10 +63,50 @@ pub const ROW_ID_COLUMN_NAME: &str = "row_id";
 /// Delta's logical row-commit-version column. Constant per file = `defaultRowCommitVersion`.
 pub const ROW_COMMIT_VERSION_COLUMN_NAME: &str = "row_commit_version";
 
+// Spark `_metadata.*` virtual column names. Delta's planning strategies flatten the
+// `_metadata` struct into these top-level columns in the FileScan output; a wrapping
+// Project re-assembles the struct above the scan.
+pub const META_FILE_PATH: &str = "file_path";
+pub const META_FILE_NAME: &str = "file_name";
+pub const META_FILE_SIZE: &str = "file_size";
+pub const META_FILE_BLOCK_START: &str = "file_block_start";
+pub const META_FILE_BLOCK_LENGTH: &str = "file_block_length";
+pub const META_FILE_MODIFICATION_TIME: &str = "file_modification_time";
+
+/// Per-task metadata pulled from `DeltaScanTask`. One entry per DataFusion partition;
+/// values are constant for every row in that file (except `byte_range_start` which is
+/// used to compute `file_block_start`).
+#[derive(Clone, Debug, Default)]
+pub struct TaskMetadata {
+    pub file_path: Option<String>,
+    pub file_size: Option<i64>,
+    pub byte_range_start: Option<i64>,
+    pub byte_range_end: Option<i64>,
+    /// Modification time in epoch milliseconds (`DeltaScanTask.modification_time`).
+    /// Converted to microseconds in the emitted `TimestampMicrosecondArray`.
+    pub modification_time_millis: Option<i64>,
+}
+
+fn metadata_field(name: &str) -> Field {
+    match name {
+        META_FILE_PATH | META_FILE_NAME => Field::new(name, DataType::Utf8, false),
+        META_FILE_SIZE | META_FILE_BLOCK_START | META_FILE_BLOCK_LENGTH => {
+            Field::new(name, DataType::Int64, false)
+        }
+        META_FILE_MODIFICATION_TIME => Field::new(
+            name,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        _ => Field::new(name, DataType::Utf8, true),
+    }
+}
+
 /// Build an output schema = input fields + the appended synthetic columns. Order is
 /// fixed: row_index, is_row_deleted, row_id, row_commit_version. Scala-side caller
 /// asserts these are a suffix of `scan.requiredSchema` in the same order so the proto
 /// layout aligns with what Spark expects.
+#[allow(clippy::too_many_arguments)]
 fn build_output_schema(
     input: &SchemaRef,
     emit_row_index: bool,
@@ -72,6 +114,7 @@ fn build_output_schema(
     emit_row_id: bool,
     emit_row_commit_version: bool,
     row_index_column_name: &str,
+    metadata_column_names: &[String],
 ) -> SchemaRef {
     let mut fields: Vec<Arc<Field>> = input.fields().iter().cloned().collect();
     if emit_row_index {
@@ -93,6 +136,9 @@ fn build_output_schema(
             DataType::Int64,
             true,
         )));
+    }
+    for name in metadata_column_names {
+        fields.push(Arc::new(metadata_field(name)));
     }
     Arc::new(Schema::new(fields))
 }
@@ -130,6 +176,14 @@ pub struct DeltaSyntheticColumnsExec {
     /// can reconstruct correctly. Defaults to ROW_INDEX_COLUMN_NAME but DV-aware
     /// Delta plans may use `_tmp_metadata_row_index` instead.
     row_index_column_name: String,
+    /// Names of Spark `_metadata.*` virtual columns to emit, in order, after the
+    /// canonical synthetics. Empty if none. Each name maps to a per-task constant
+    /// value sourced from `task_metadata_by_partition`.
+    metadata_column_names: Vec<String>,
+    /// Per-partition file metadata (one entry per DataFusion partition, indexed
+    /// the same way `deleted_row_indexes_by_partition` etc. are). Values come
+    /// from the corresponding `DeltaScanTask`.
+    task_metadata_by_partition: Vec<TaskMetadata>,
     output_schema: SchemaRef,
     plan_properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -147,8 +201,15 @@ impl DeltaSyntheticColumnsExec {
         emit_row_id: bool,
         emit_row_commit_version: bool,
         row_index_column_name: &str,
+        metadata_column_names: Vec<String>,
+        task_metadata_by_partition: Vec<TaskMetadata>,
     ) -> DFResult<Self> {
-        if !emit_row_index && !emit_is_row_deleted && !emit_row_id && !emit_row_commit_version {
+        if !emit_row_index
+            && !emit_is_row_deleted
+            && !emit_row_id
+            && !emit_row_commit_version
+            && metadata_column_names.is_empty()
+        {
             return Err(DataFusionError::Internal(
                 "DeltaSyntheticColumnsExec constructed with nothing to emit".to_string(),
             ));
@@ -158,14 +219,16 @@ impl DeltaSyntheticColumnsExec {
         if deleted_row_indexes_by_partition.len() != num_partitions
             || base_row_ids_by_partition.len() != num_partitions
             || default_row_commit_versions_by_partition.len() != num_partitions
+            || task_metadata_by_partition.len() != num_partitions
         {
             return Err(DataFusionError::Internal(format!(
                 "DeltaSyntheticColumnsExec: per-partition vec lengths don't match input partitions \
-                 ({}): dv={}, base_row_ids={}, default_commit_versions={}",
+                 ({}): dv={}, base_row_ids={}, default_commit_versions={}, task_metadata={}",
                 num_partitions,
                 deleted_row_indexes_by_partition.len(),
                 base_row_ids_by_partition.len(),
-                default_row_commit_versions_by_partition.len()
+                default_row_commit_versions_by_partition.len(),
+                task_metadata_by_partition.len()
             )));
         }
         let output_schema = build_output_schema(
@@ -175,6 +238,7 @@ impl DeltaSyntheticColumnsExec {
             emit_row_id,
             emit_row_commit_version,
             row_index_column_name,
+            &metadata_column_names,
         );
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
@@ -192,6 +256,8 @@ impl DeltaSyntheticColumnsExec {
             emit_row_id,
             emit_row_commit_version,
             row_index_column_name: row_index_column_name.to_string(),
+            metadata_column_names,
+            task_metadata_by_partition,
             output_schema,
             plan_properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -258,6 +324,8 @@ impl ExecutionPlan for DeltaSyntheticColumnsExec {
             self.emit_row_id,
             self.emit_row_commit_version,
             &self.row_index_column_name,
+            self.metadata_column_names.clone(),
+            self.task_metadata_by_partition.clone(),
         )?))
     }
 
@@ -278,6 +346,11 @@ impl ExecutionPlan for DeltaSyntheticColumnsExec {
             .get(partition)
             .copied()
             .flatten();
+        let task_meta = self
+            .task_metadata_by_partition
+            .get(partition)
+            .cloned()
+            .unwrap_or_default();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         Ok(Box::pin(DeltaSyntheticColumnsStream {
             inner: child_stream,
@@ -291,6 +364,8 @@ impl ExecutionPlan for DeltaSyntheticColumnsExec {
             emit_row_commit_version: self.emit_row_commit_version,
             base_row_id,
             default_row_commit_version,
+            metadata_column_names: self.metadata_column_names.clone(),
+            task_metadata: task_meta,
             baseline_metrics: baseline,
         }))
     }
@@ -312,6 +387,8 @@ struct DeltaSyntheticColumnsStream {
     emit_row_commit_version: bool,
     base_row_id: Option<i64>,
     default_row_commit_version: Option<i64>,
+    metadata_column_names: Vec<String>,
+    task_metadata: TaskMetadata,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -400,6 +477,73 @@ impl DeltaSyntheticColumnsStream {
         if let Some(arr) = row_commit_version_array {
             columns.push(Arc::new(arr));
         }
+        // Append `_metadata.*` columns. All except path-derived names are per-task
+        // constants from `task_metadata`; `file_name` is derived from `file_path`'s
+        // basename (matches Spark's behaviour).
+        for name in &self.metadata_column_names {
+            let rows = batch_rows as usize;
+            let arr: Arc<dyn arrow::array::Array> = match name.as_str() {
+                META_FILE_PATH => {
+                    let value = self.task_metadata.file_path.clone().unwrap_or_default();
+                    Arc::new(StringArray::from(vec![value; rows]))
+                }
+                META_FILE_NAME => {
+                    let value = self
+                        .task_metadata
+                        .file_path
+                        .as_deref()
+                        .map(|p| {
+                            // file_name = portion after the last '/'. Spark uses
+                            // `new Path(...).getName` which is path-style basename.
+                            match p.rfind('/') {
+                                Some(i) => p[i + 1..].to_string(),
+                                None => p.to_string(),
+                            }
+                        })
+                        .unwrap_or_default();
+                    Arc::new(StringArray::from(vec![value; rows]))
+                }
+                META_FILE_SIZE => {
+                    let value = self.task_metadata.file_size.unwrap_or(0);
+                    Arc::new(Int64Array::from(vec![value; rows]))
+                }
+                META_FILE_BLOCK_START => {
+                    let value = self.task_metadata.byte_range_start.unwrap_or(0);
+                    Arc::new(Int64Array::from(vec![value; rows]))
+                }
+                META_FILE_BLOCK_LENGTH => {
+                    let value = match (
+                        self.task_metadata.byte_range_start,
+                        self.task_metadata.byte_range_end,
+                    ) {
+                        (Some(start), Some(end)) => end - start,
+                        _ => self.task_metadata.file_size.unwrap_or(0),
+                    };
+                    Arc::new(Int64Array::from(vec![value; rows]))
+                }
+                META_FILE_MODIFICATION_TIME => {
+                    // Delta stores modification time in epoch milliseconds; Spark's
+                    // `_metadata.file_modification_time` is TimestampType with
+                    // microsecond precision. Convert ms -> us.
+                    let micros = self.task_metadata.modification_time_millis.unwrap_or(0) * 1000;
+                    let mut arr =
+                        TimestampMicrosecondArray::from(vec![micros; rows]);
+                    arr = arr.with_timezone("UTC");
+                    Arc::new(arr)
+                }
+                other => {
+                    // Unknown name -- emit nulls so column count still matches
+                    // (better diagnosability than crashing). Caller side validates
+                    // names; this branch is defense-in-depth.
+                    let nulls: Vec<Option<&str>> = vec![None; rows];
+                    Arc::new(StringArray::from(nulls)) as Arc<dyn arrow::array::Array>;
+                    return Err(DataFusionError::Internal(format!(
+                        "DeltaSyntheticColumnsExec: unknown metadata column name '{other}'"
+                    )));
+                }
+            };
+            columns.push(arr);
+        }
         RecordBatch::try_new(Arc::clone(&self.output_schema), columns).map_err(|e| {
             DataFusionError::Internal(format!(
                 "DeltaSyntheticColumnsExec: failed to append synthetic columns: {e}"
@@ -459,6 +603,7 @@ mod tests {
             emit_row_id,
             emit_row_commit_version,
             ROW_INDEX_COLUMN_NAME,
+            &[],
         );
         let metrics = ExecutionPlanMetricsSet::new();
         let baseline = BaselineMetrics::new(&metrics, 0);
@@ -479,6 +624,8 @@ mod tests {
             emit_row_commit_version,
             base_row_id,
             default_row_commit_version,
+            metadata_column_names: Vec::new(),
+            task_metadata: TaskMetadata::default(),
             baseline_metrics: baseline,
         }
     }
@@ -506,14 +653,16 @@ mod tests {
 
     #[test]
     fn schema_only_row_index() {
-        let s = build_output_schema(&input_schema(), true, false, false, false);
+        let s =
+            build_output_schema(&input_schema(), true, false, false, false, ROW_INDEX_COLUMN_NAME, &[]);
         let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["v", ROW_INDEX_COLUMN_NAME]);
     }
 
     #[test]
     fn schema_all_four_in_order() {
-        let s = build_output_schema(&input_schema(), true, true, true, true);
+        let s =
+            build_output_schema(&input_schema(), true, true, true, true, ROW_INDEX_COLUMN_NAME, &[]);
         let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
             names,
@@ -533,7 +682,15 @@ mod tests {
     #[test]
     fn schema_emit_subset_preserves_order() {
         // Skip row_index, keep is_row_deleted and row_commit_version -> appended in that order.
-        let s = build_output_schema(&input_schema(), false, true, false, true);
+        let s = build_output_schema(
+            &input_schema(),
+            false,
+            true,
+            false,
+            true,
+            ROW_INDEX_COLUMN_NAME,
+            &[],
+        );
         let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
             names,
@@ -743,7 +900,13 @@ mod tests {
             vec![vec![], vec![]],
             vec![None, None],
             vec![None, None],
-            true, false, false, false,
+            true,
+            false,
+            false,
+            false,
+            ROW_INDEX_COLUMN_NAME,
+            Vec::new(),
+            vec![TaskMetadata::default(), TaskMetadata::default()],
         )
         .unwrap_err();
         assert!(format!("{err}").contains("partition count mismatch") || format!("{err}").contains("partitions"));

@@ -417,7 +417,13 @@ object DeltaReflection extends Logging {
        * table where row tracking was just enabled).
        */
       baseRowId: Option[Long],
-      defaultRowCommitVersion: Option[Long])
+      defaultRowCommitVersion: Option[Long],
+      /**
+       * Modification time of the underlying parquet file as recorded on the AddFile action
+       * (`AddFile.modificationTime`). Epoch milliseconds. Surfaced through Spark's
+       * `_metadata.file_modification_time` column when the contrib synthesises it.
+       */
+      modificationTime: Option[Long] = None)
 
   /**
    * Is this FileIndex a pre-materialized Delta index (batch or CDC)?
@@ -495,6 +501,7 @@ object DeltaReflection extends Logging {
           val dv = findAccessor(addFile, Seq("deletionVector")).orNull
           val baseRowId = optionLongMember(addFile, "baseRowId")
           val defaultRowCommitVersion = optionLongMember(addFile, "defaultRowCommitVersion")
+          val modificationTime = longMember(addFile, "modificationTime")
           out += ExtractedAddFile(
             path,
             size,
@@ -503,7 +510,8 @@ object DeltaReflection extends Logging {
             hasDeletionVector = dv != null,
             dvDescriptor = dv,
             baseRowId = baseRowId,
-            defaultRowCommitVersion = defaultRowCommitVersion)
+            defaultRowCommitVersion = defaultRowCommitVersion,
+            modificationTime = modificationTime)
         }
         Some(out.toSeq)
       }

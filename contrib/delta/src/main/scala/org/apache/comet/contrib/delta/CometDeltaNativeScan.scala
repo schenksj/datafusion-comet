@@ -850,11 +850,33 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       DeltaReflection.TmpMetadataRowIndexColumnName.toLowerCase(Locale.ROOT),
       DeltaReflection.IsRowDeletedColumnName.toLowerCase(Locale.ROOT),
       DeltaReflection.RowIdColumnName,
-      DeltaReflection.RowCommitVersionColumnName)
+      DeltaReflection.RowCommitVersionColumnName,
+      // Spark `_metadata.*` virtual columns synthesised natively per-task.
+      "file_path",
+      "file_name",
+      "file_size",
+      "file_block_start",
+      "file_block_length",
+      "file_modification_time")
     val isSynthetic = (f: StructField) =>
       syntheticNames.contains(f.name.toLowerCase(Locale.ROOT))
+    // metadataColumnNames includes the Spark `_metadata.*` virtual columns (file_path,
+    // file_name, file_size, file_block_start, file_block_length, file_modification_time)
+    // that Delta's strategies inject. These are synthesised per-task in
+    // `DeltaSyntheticColumnsExec`, so when any are required we need the synthetic-emit
+    // path even without emit_row_index/is_row_deleted/row_id/row_commit_version set.
+    val sparkMetadataNames = Set(
+      "file_path",
+      "file_name",
+      "file_size",
+      "file_block_start",
+      "file_block_length",
+      "file_modification_time")
+    val needsMetadataEmit = scan.requiredSchema.fields.exists { f =>
+      sparkMetadataNames.contains(f.name.toLowerCase(Locale.ROOT))
+    }
     val needsSyntheticEmit =
-      emitRowIndex || emitIsRowDeleted || emitRowId || emitRowCommitVersion
+      emitRowIndex || emitIsRowDeleted || emitRowId || emitRowCommitVersion || needsMetadataEmit
     // When synthetics are NOT a contiguous suffix of required_schema, build a reorder
     // map: for each original required-schema position, an index into the wrapped exec's
     // output (parquet output cols followed by appended synthetics in canonical order
@@ -922,6 +944,23 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     commonBuilder.setEmitRowCommitVersion(emitRowCommitVersion)
     if (rowIndexColumnAlias.nonEmpty) {
       commonBuilder.setRowIndexColumnAlias(rowIndexColumnAlias)
+    }
+    // Detect Spark `_metadata.*` virtual columns Delta's strategies inject as flat
+    // top-level columns. Each is sourced per-task from `DeltaScanTask` data
+    // (file_path / file_size / modification_time) or derived (file_name from
+    // file_path basename, file_block_start/length from byte_range).
+    val metadataColumnNames = Seq(
+      "file_path",
+      "file_name",
+      "file_size",
+      "file_block_start",
+      "file_block_length",
+      "file_modification_time")
+    val requiredMetadataNames = scan.requiredSchema.fields
+      .map(_.name.toLowerCase(Locale.ROOT))
+      .toSet
+    metadataColumnNames.foreach { n =>
+      if (requiredMetadataNames.contains(n)) commonBuilder.addMetadataColumnNames(n)
     }
     commonBuilder.addAllFinalOutputIndices(
       finalOutputIndices.map(i => Integer.valueOf(i)).asJava)
@@ -1249,6 +1288,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       }
       af.baseRowId.foreach(taskBuilder.setBaseRowId)
       af.defaultRowCommitVersion.foreach(taskBuilder.setDefaultRowCommitVersion)
+      af.modificationTime.foreach(taskBuilder.setModificationTime)
       deletedRowIndexesByPath.get(af.path).foreach { rowIndexes =>
         var i = 0
         while (i < rowIndexes.length) {
