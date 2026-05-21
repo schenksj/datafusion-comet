@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow::array::{
-    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::common::{DataFusionError, Result as DFResult};
@@ -148,9 +148,14 @@ fn build_output_schema(
         fields.push(Arc::new(Field::new(row_index_column_name, DataType::Int64, false)));
     }
     if emit_is_row_deleted {
+        // Delta declares `__delta_internal_is_row_deleted` as `ByteType` (signed
+        // Int8). Emitting Int32 here trips DataFusion's interval propagator with
+        // `Only intervals with the same data type are intersectable, lhs:Int32,
+        // rhs:Int8` whenever the upstream Filter (added by PreprocessTableWithDVs)
+        // is compared against a literal that Spark types as Byte.
         fields.push(Arc::new(Field::new(
             IS_ROW_DELETED_COLUMN_NAME,
-            DataType::Int32,
+            DataType::Int8,
             false,
         )));
     }
@@ -437,9 +442,10 @@ impl DeltaSyntheticColumnsStream {
 
         // Build the is_row_deleted column: walk the deleted indexes alongside the batch
         // row range, advancing `next_delete_idx` as we go. Both arrays share the same
-        // O(rows + deletes) sweep; allocation is one Int32Array of length batch_rows.
-        let is_deleted_array: Option<Int32Array> = if self.emit_is_row_deleted {
-            let mut values = vec![0i32; batch_rows as usize];
+        // O(rows + deletes) sweep; allocation is one Int8Array (Delta schema = Byte)
+        // of length batch_rows.
+        let is_deleted_array: Option<Int8Array> = if self.emit_is_row_deleted {
+            let mut values = vec![0i8; batch_rows as usize];
             // Skip deleted entries that fall before this batch.
             while self.next_delete_idx < self.deleted.len()
                 && self.deleted[self.next_delete_idx] < batch_start
@@ -456,7 +462,7 @@ impl DeltaSyntheticColumnsStream {
                 idx += 1;
             }
             self.next_delete_idx = idx;
-            Some(Int32Array::from(values))
+            Some(Int8Array::from(values))
         } else {
             None
         };

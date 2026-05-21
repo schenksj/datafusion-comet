@@ -1124,11 +1124,27 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
           case f if !isSynthetic(f) =>
             scan.output.find(_.name.equalsIgnoreCase(f.name)).orNull
         }.filter(_ != null).toSeq
+      // Skip filters that reference any synthetic column (`__delta_internal_*`,
+      // `_tmp_metadata_row_index`, `_metadata.*`, row-tracking helpers, ...). They
+      // aren't present in the parquet file so the pushed-down evaluation would
+      // either error out ("column N out of bounds") or, worse, evaluate against
+      // unrelated parquet stats and prune rows incorrectly. Spark / Delta's Filter
+      // above the scan handles them after the synthetic exec emits them.
+      def referencesSyntheticColumn(e: Expression): Boolean = e.exists {
+        case a: org.apache.spark.sql.catalyst.expressions.AttributeReference =>
+          val lc = a.name.toLowerCase(Locale.ROOT)
+          syntheticNames.contains(lc) ||
+            lc.startsWith("_row-id-col-") ||
+            lc.startsWith("_row-commit-version-col-")
+        case _ => false
+      }
       scan.supportedDataFilters.foreach { filter =>
         if (referencesNestedAccess(filter)) {
           logInfo(s"CometDeltaNativeScan: skipping pushdown of nested-access filter $filter")
         } else if (referencesPartitionColumn(filter)) {
           logInfo(s"CometDeltaNativeScan: skipping pushdown of partition-column filter $filter")
+        } else if (referencesSyntheticColumn(filter)) {
+          logInfo(s"CometDeltaNativeScan: skipping pushdown of synthetic-column filter $filter")
         } else {
           exprToProto(filter, filterBindingInputs) match {
             case Some(proto) => dataFilters += proto
