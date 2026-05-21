@@ -169,7 +169,8 @@ object DeltaScanRule {
       plan: SparkPlan,
       userOutput: Seq[Attribute]): Option[SparkPlan] = plan match {
     case scan: FileSourceScanExec
-        if DeltaReflection.isDeltaFileFormat(scan.relation.fileFormat) &&
+        if (DeltaReflection.isDeltaFileFormat(scan.relation.fileFormat) ||
+          DeltaReflection.isBatchFileIndex(scan.relation.location)) &&
           scan.output.exists(_.name.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName)) =>
       Some(rebuildDeltaScanWithoutDvColumn(scan, userOutput))
     case other if other.children.size == 1 =>
