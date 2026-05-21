@@ -202,7 +202,8 @@ object CometExecRDD {
       subqueries: Seq[ScalarSubquery],
       broadcastedHadoopConfForEncryption: Option[Broadcast[SerializableConfiguration]] = None,
       encryptedFilePaths: Seq[String] = Seq.empty,
-      shuffleScanIndices: Set[Int] = Set.empty): CometExecRDD = {
+      shuffleScanIndices: Set[Int] = Set.empty,
+      perPartitionFilePaths: Array[Seq[String]] = Array.empty): CometExecRDD = {
     // scalastyle:on
 
     new CometExecRDD(
@@ -217,6 +218,7 @@ object CometExecRDD {
       subqueries,
       broadcastedHadoopConfForEncryption,
       encryptedFilePaths,
-      shuffleScanIndices)
+      shuffleScanIndices,
+      perPartitionFilePaths)
   }
 }

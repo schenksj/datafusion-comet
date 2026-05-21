@@ -348,6 +348,14 @@ case class CometDeltaNativeScanExec(
       } else {
         (None, Seq.empty[String])
       }
+    // Per-partition file paths so `CometExecRDD.compute` can populate
+    // `InputFileBlockHolder` for `input_file_name()` lookups. With
+    // `oneTaskPerPartition` enforced by `DeltaScanRule` whenever
+    // `input_file_name()` is referenced, each partition holds a single file.
+    val perPartitionFilePaths: Array[Seq[String]] = execPerPartitionBytes.map { bytes =>
+      OperatorOuterClass.DeltaScan.parseFrom(bytes)
+        .getTasksList.asScala.map(_.getFilePath).toSeq
+    }
     val baseRDD = CometExecRDD(
       sparkContext,
       inputRDDs = Seq.empty,
@@ -359,7 +367,8 @@ case class CometDeltaNativeScanExec(
       nativeMetrics = nativeMetrics,
       subqueries = Seq.empty,
       broadcastedHadoopConfForEncryption = broadcastedHadoopConfForEncryption,
-      encryptedFilePaths = encryptedFilePaths)
+      encryptedFilePaths = encryptedFilePaths,
+      perPartitionFilePaths = perPartitionFilePaths)
 
     // InputFileBlockHolder for downstream `input_file_name()` is populated in
     // `CometExecRDD.compute` (via `InputFileBlockHolder.set`) so it also fires when this scan
