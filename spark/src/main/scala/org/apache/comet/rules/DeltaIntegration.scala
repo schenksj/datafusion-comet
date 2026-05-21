@@ -142,7 +142,6 @@ object DeltaIntegration {
     }
   }
 
-
   /**
    * The Delta scan handler, resolved via reflection from the contrib's `CometDeltaNativeScan`
    * companion object. Returns `None` when the contrib isn't bundled into this build.

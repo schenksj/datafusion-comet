@@ -179,9 +179,9 @@ case class CometScanRule(session: SparkSession)
         // at scans with synthetic metadata columns before generic Comet rejects
         // them. For non-contrib V1 scans this is equivalent to the outer check.
         if (scanExec.expressions.exists(_.exists {
-          case a: Attribute => a.isMetadataCol
-          case _ => false
-        })) {
+            case a: Attribute => a.isMetadataCol
+            case _ => false
+          })) {
           return withInfo(scanExec, "Metadata column is not supported")
         }
         if (!CometScanExec.isFileFormatSupported(r.fileFormat)) {
