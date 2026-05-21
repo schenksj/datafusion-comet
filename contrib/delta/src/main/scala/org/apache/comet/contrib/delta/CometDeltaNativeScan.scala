@@ -1260,7 +1260,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       _.exists(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.PlanExpression[_]]))
     val partitionSchema = op.relation.partitionSchema
 
-    CometDeltaNativeScanExec(
+    val exec = CometDeltaNativeScanExec(
       nativeOp,
       op.output,
       org.apache.spark.sql.comet.SerializedPlan(None),
@@ -1270,5 +1270,14 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       dppFilters,
       partitionSchema,
       oneTaskPerPartition = oneTaskPerPartition)
+    // Propagate logicalLink from the source scanExec to the contrib's exec, mirroring
+    // what CometNativeScanExec/CometScanExec/CometIcebergNativeScanExec do for built-in
+    // scans. AdaptiveSparkPlanExec.setLogicalLinkForNewQueryStage asserts every new
+    // query-stage node has a logicalLink set; without this, AQE plans containing a
+    // CometDeltaNativeScanExec hit the assertion when the AQE optimizer tries to wrap
+    // them (especially under spark.sql.adaptive.forceApply and on column-mapping
+    // rewritten plans).
+    op.wrapped.logicalLink.foreach(exec.setLogicalLink)
+    exec
   }
 }
