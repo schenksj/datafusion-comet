@@ -461,14 +461,22 @@ object DeltaReflection extends Logging {
    */
   def extractBatchAddFiles(location: Any): Option[Seq[ExtractedAddFile]] = {
     try {
-      // PreparedDeltaFileIndex carries the pre-skipped scan result -- using
-      // `matchingFiles(Nil, Nil)` on it falls into Delta's "Reselecting files
-      // to query" branch (different filter set) and returns the FULL snapshot
-      // of files (no stats-based skipping), which breaks tests like
-      // StatsCollectionSuite "gather stats" that expect file-level pruning.
-      // Read `preparedScan.files` directly to honour the prepared skipping.
-      val preparedFiles: Option[AnyRef] =
+      // PreparedDeltaFileIndex carries the pre-skipped scan result. Reading the
+      // cached `preparedScan.files` returns whatever the FileIndex captured at
+      // construction time -- problematic when the same FileIndex is reused
+      // across DML statements (e.g. consecutive DELETEs against the same path)
+      // because the DV descriptor on the AddFile is frozen at the first
+      // construction. Prefer the live `matchingFiles(Nil, Nil)` call when
+      // available -- it asks Delta for the current snapshot's matching files
+      // and picks up updated DV descriptors. Fall back to the cached
+      // `preparedScan.files` only when `matchingFiles` isn't accessible.
+      val matchingFilesLive: Option[AnyRef] =
         if (location.getClass.getName.contains("PreparedDeltaFileIndex")) {
+          callMatchingFiles(location)
+        } else None
+      val preparedFiles: Option[AnyRef] =
+        if (matchingFilesLive.isEmpty &&
+          location.getClass.getName.contains("PreparedDeltaFileIndex")) {
           findAccessor(location, Seq("preparedScan"))
             .flatMap(ps => findAccessor(ps, Seq("files")))
         } else None
@@ -476,7 +484,8 @@ object DeltaReflection extends Logging {
       // AddFiles on CDC indexes and the plain list on TahoeBatchFileIndex.
       // Fall back to the raw `addFiles`/`filesList` accessors for indexes that
       // don't expose a no-arg-safe matchingFiles.
-      val addFilesOpt = preparedFiles
+      val addFilesOpt = matchingFilesLive
+        .orElse(preparedFiles)
         .orElse(callMatchingFiles(location))
         .orElse(findAccessor(location, Seq("addFiles", "filesList")))
       addFilesOpt.flatMap { addFilesAny =>
