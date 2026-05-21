@@ -781,10 +781,10 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       relation.partitionSchema.fields.filterNot(f =>
         haveLc.contains(f.name.toLowerCase(Locale.ROOT)))
     }
-    // Spark `_metadata.*` virtual columns that appear in scan.output but not
-    // scan.requiredSchema. They are synthesised natively below (via
-    // metadataColumnNamesEmitted) and must appear in the wrapped exec output schema for
-    // downstream attribute resolution.
+    // Spark `_metadata.*` virtual columns plus Delta row-tracking synthetics that
+    // appear in scan.output but not scan.requiredSchema. They are synthesised natively
+    // below (via metadataColumnNamesEmitted) and must appear in the wrapped exec
+    // output schema for downstream attribute resolution.
     val sparkMetadataNameSet = Set(
       "file_path",
       "file_name",
@@ -792,8 +792,15 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       "file_block_start",
       "file_block_length",
       "file_modification_time")
+    def isExtraSyntheticName(name: String): Boolean = {
+      val lc = name.toLowerCase(Locale.ROOT)
+      sparkMetadataNameSet.contains(lc) ||
+        lc == "base_row_id" ||
+        lc.startsWith("_row-id-col-") ||
+        lc.startsWith("_row-commit-version-col-")
+    }
     val extraMetadataFields: Array[StructField] = scan.output.toArray.collect {
-      case a if sparkMetadataNameSet.contains(a.name.toLowerCase(Locale.ROOT)) &&
+      case a if isExtraSyntheticName(a.name) &&
         !scan.requiredSchema.fieldNames.exists(_.equalsIgnoreCase(a.name)) =>
         StructField(a.name, a.dataType, a.nullable)
     }
@@ -873,9 +880,17 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       "file_size",
       "file_block_start",
       "file_block_length",
-      "file_modification_time")
-    val isSynthetic = (f: StructField) =>
-      syntheticNames.contains(f.name.toLowerCase(Locale.ROOT))
+      "file_modification_time",
+      // Delta row-tracking columns synthesised natively (base_row_id is per-file
+      // constant from AddFile.baseRowId; the materialised columns are null when the
+      // parquet file doesn't carry them).
+      "base_row_id")
+    val isSynthetic = (f: StructField) => {
+      val lc = f.name.toLowerCase(Locale.ROOT)
+      syntheticNames.contains(lc) ||
+        lc.startsWith("_row-id-col-") ||
+        lc.startsWith("_row-commit-version-col-")
+    }
     // metadataColumnNames includes the Spark `_metadata.*` virtual columns (file_path,
     // file_name, file_size, file_block_start, file_block_length, file_modification_time)
     // that Delta's strategies inject. These are synthesised per-task in
@@ -895,14 +910,26 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // The wrapped exec's output schema must include them so attribute resolution works.
     val outputFieldNamesLower: Set[String] =
       scan.output.map(_.name.toLowerCase(Locale.ROOT)).toSet
-    val metadataColumnNamesEmitted: Seq[String] = Seq(
+    val fixedMetadataNames = Set(
       "file_path",
       "file_name",
       "file_size",
       "file_block_start",
       "file_block_length",
-      "file_modification_time"
-    ).filter(n => requiredFieldNamesLower.contains(n) || outputFieldNamesLower.contains(n))
+      "file_modification_time",
+      "base_row_id")
+    // The wrapped exec output is `parquet projection ++ row_index/is_row_deleted/...
+    // ++ metadata_column_names` in the order metadata names are emitted. To make the
+    // post-synthesis layout match scan.output WITHOUT a final reorder Project, walk
+    // scan.output and pick out the metadata-style columns in the order they appear.
+    val metadataColumnNamesEmitted: Seq[String] = scan.output.flatMap { attr =>
+      val lc = attr.name.toLowerCase(Locale.ROOT)
+      if (fixedMetadataNames.contains(lc) ||
+        lc.startsWith("_row-id-col-") ||
+        lc.startsWith("_row-commit-version-col-")) {
+        Some(lc)
+      } else None
+    }.distinct
     val needsMetadataEmit = metadataColumnNamesEmitted.nonEmpty
     val needsSyntheticEmit =
       emitRowIndex || emitIsRowDeleted || emitRowId || emitRowCommitVersion || needsMetadataEmit

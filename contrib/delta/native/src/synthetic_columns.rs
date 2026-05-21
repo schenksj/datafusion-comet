@@ -72,6 +72,19 @@ pub const META_FILE_SIZE: &str = "file_size";
 pub const META_FILE_BLOCK_START: &str = "file_block_start";
 pub const META_FILE_BLOCK_LENGTH: &str = "file_block_length";
 pub const META_FILE_MODIFICATION_TIME: &str = "file_modification_time";
+/// Delta's per-file `AddFile.baseRowId` surfaced as an attribute. Plans that read
+/// `_metadata.row_id` for row-tracking-enabled tables before materialisation rely on
+/// `row_id = base_row_id + row_index`; the upstream Project does the addition, so this
+/// column carries the per-file constant.
+pub const META_BASE_ROW_ID: &str = "base_row_id";
+/// Prefix for Delta's materialised row-id columns (`_row-id-col-<uuid>`). Present in
+/// `scan.requiredSchema` whenever row tracking is enabled but the parquet file may not
+/// contain the column (unmaterialised row IDs). Emit as null so the upstream Project
+/// falls back to `base_row_id + row_index`.
+pub const ROW_ID_MATERIALISED_PREFIX: &str = "_row-id-col-";
+/// Prefix for Delta's materialised row-commit-version columns. Same null-emission
+/// semantics as `ROW_ID_MATERIALISED_PREFIX`.
+pub const ROW_COMMIT_VERSION_MATERIALISED_PREFIX: &str = "_row-commit-version-col-";
 
 /// Per-task metadata pulled from `DeltaScanTask`. One entry per DataFusion partition;
 /// values are constant for every row in that file (except `byte_range_start` which is
@@ -85,9 +98,19 @@ pub struct TaskMetadata {
     /// Modification time in epoch milliseconds (`DeltaScanTask.modification_time`).
     /// Converted to microseconds in the emitted `TimestampMicrosecondArray`.
     pub modification_time_millis: Option<i64>,
+    /// `AddFile.baseRowId`. Emitted as a per-file Int64 constant when the upstream
+    /// asks for the `base_row_id` synthetic column.
+    pub base_row_id: Option<i64>,
 }
 
 fn metadata_field(name: &str) -> Field {
+    if name.starts_with(ROW_ID_MATERIALISED_PREFIX)
+        || name.starts_with(ROW_COMMIT_VERSION_MATERIALISED_PREFIX)
+    {
+        // Materialised row-id / row-commit-version columns are nullable Int64; when the
+        // parquet file doesn't carry them we emit all-nulls.
+        return Field::new(name, DataType::Int64, true);
+    }
     match name {
         META_FILE_PATH | META_FILE_NAME => Field::new(name, DataType::Utf8, false),
         META_FILE_SIZE | META_FILE_BLOCK_START | META_FILE_BLOCK_LENGTH => {
@@ -98,6 +121,7 @@ fn metadata_field(name: &str) -> Field {
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
+        META_BASE_ROW_ID => Field::new(name, DataType::Int64, true),
         _ => Field::new(name, DataType::Utf8, true),
     }
 }
@@ -536,12 +560,22 @@ impl DeltaSyntheticColumnsStream {
                     arr = arr.with_timezone("UTC");
                     Arc::new(arr)
                 }
+                META_BASE_ROW_ID => {
+                    // Per-file constant from `AddFile.baseRowId`. Plans reading
+                    // `_metadata.row_id` on row-tracking tables read this + row_index.
+                    let value = self.task_metadata.base_row_id.unwrap_or(0);
+                    Arc::new(Int64Array::from(vec![value; rows]))
+                }
+                other if other.starts_with(ROW_ID_MATERIALISED_PREFIX)
+                    || other.starts_with(ROW_COMMIT_VERSION_MATERIALISED_PREFIX) =>
+                {
+                    // Materialised row-id / row-commit-version column not present in
+                    // this parquet file. Emit all-nulls so the upstream Project falls
+                    // back to `base_row_id + row_index` / default commit version.
+                    let nulls: Vec<Option<i64>> = vec![None; rows];
+                    Arc::new(Int64Array::from(nulls))
+                }
                 other => {
-                    // Unknown name -- emit nulls so column count still matches
-                    // (better diagnosability than crashing). Caller side validates
-                    // names; this branch is defense-in-depth.
-                    let nulls: Vec<Option<&str>> = vec![None; rows];
-                    Arc::new(StringArray::from(nulls)) as Arc<dyn arrow::array::Array>;
                     return Err(DataFusionError::Internal(format!(
                         "DeltaSyntheticColumnsExec: unknown metadata column name '{other}'"
                     )));
