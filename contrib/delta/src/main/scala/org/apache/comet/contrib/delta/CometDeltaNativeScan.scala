@@ -926,24 +926,21 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       relation.partitionSchema.fields.zipWithIndex.map { case (f, i) =>
         f.name.toLowerCase(Locale.ROOT) -> i
       }.toMap
-    // Skip synthetic columns when building projection_vector: they aren't in
-    // file_data_schema OR partition_schema, so any attempt to map them produces -1
-    // (out of bounds for native usize). DeltaSyntheticColumnsExec appends them after
-    // the parquet read, satisfying the suffix-precondition asserted above.
-    val requiredIndexes: Seq[Int] = scan.requiredSchema.fields.filterNot(f =>
-      needsSyntheticEmit && isSynthetic(f)).map { field =>
-      val nameLower = field.name.toLowerCase(Locale.ROOT)
-      val dataIdx =
-        fileDataSchemaFields.indexWhere(_.name.toLowerCase(Locale.ROOT) == nameLower)
-      if (dataIdx >= 0) {
-        dataIdx
-      } else {
-        partitionNameToIndex
-          .get(nameLower)
-          .map(p => fileDataSchemaFields.length + p)
-          .getOrElse(-1)
+    // Skip synthetic columns from the projection: DeltaSyntheticColumnsExec
+    // appends them after the parquet read.
+    val requiredIndexes: Seq[Int] = scan.requiredSchema.fields.flatMap { field =>
+      if (needsSyntheticEmit && isSynthetic(field)) None
+      else {
+        val nameLower = field.name.toLowerCase(Locale.ROOT)
+        val dataIdx =
+          fileDataSchemaFields.indexWhere(_.name.toLowerCase(Locale.ROOT) == nameLower)
+        if (dataIdx >= 0) {
+          Some(dataIdx)
+        } else {
+          partitionNameToIndex.get(nameLower).map(p => fileDataSchemaFields.length + p)
+        }
       }
-    }
+    }.toSeq
     val partitionTailIndexes: Seq[Int] =
       relation.partitionSchema.fields.indices.map(i => fileDataSchemaFields.length + i)
     val projectionVector: Seq[Int] = requiredIndexes ++ partitionTailIndexes

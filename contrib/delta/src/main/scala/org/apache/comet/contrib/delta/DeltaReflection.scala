@@ -61,6 +61,15 @@ object DeltaReflection extends Logging {
   val IsRowDeletedColumnName: String = "__delta_internal_is_row_deleted"
 
   /**
+   * Delta's intermediate row-index column. Inserted by
+   * `DeltaParquetFileFormat.prepareSchemaForRead` and used by Delta's row-tracking /
+   * row-index logic before the public `__delta_internal_row_index` is exposed. Defined in
+   * `DeltaParquetFileFormat.TMP_METADATA_ROW_INDEX_COLUMN_NAME`. Appears in plans that
+   * read `_metadata.row_index` from a row-tracking-enabled table.
+   */
+  val TmpMetadataRowIndexColumnName: String = "_tmp_metadata_row_index"
+
+  /**
    * Synthetic column name Delta requests on the parquet scan when it needs the per-row physical
    * position within the file (e.g. for downstream DV bitmap lookup in `useMetadataRowIndex` mode,
    * or test-only reads of the metadata column). Produced only by `DeltaParquetFileFormat`'s
