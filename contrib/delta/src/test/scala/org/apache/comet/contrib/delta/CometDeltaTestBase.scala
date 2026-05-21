@@ -69,11 +69,6 @@ trait CometDeltaTestBase extends CometTestBase with AdaptiveSparkPlanHelper {
     // every scan. (The regression-script sbt run gets AQE-wrapped plans naturally
     // because Delta's own queries always include joins/exchanges.)
     conf.set("spark.sql.adaptive.enabled", "true")
-    // forceApply was earlier needed so AQE wraps simple plans (Comet's QueryStagePrepRule
-    // only fires under AdaptiveSparkPlanExec). With the DeltaIntegration $-fix landed,
-    // AQE wraps every Delta read naturally (Delta's PreprocessTableWithDVsStrategy
-    // produces a plan AQE elects to wrap). forceApply additionally triggered Spark
-    // internal asserts on column-mapping rewrites; safer to leave off.
     // Pin Spark to loopback so the test JVM doesn't try to reach a remote executor at
     // the host's LAN IP (which may be unreachable when Wi-Fi state is off-network).
     conf.set("spark.driver.bindAddress", "127.0.0.1")
