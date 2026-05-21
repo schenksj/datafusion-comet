@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow::array::{
-    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::common::{DataFusionError, Result as DFResult};
@@ -118,7 +118,10 @@ fn build_output_schema(
 ) -> SchemaRef {
     let mut fields: Vec<Arc<Field>> = input.fields().iter().cloned().collect();
     if emit_row_index {
-        fields.push(Arc::new(Field::new(row_index_column_name, DataType::UInt64, false)));
+        // Spark's row_index virtual column is `LongType` (signed Int64). Emit Int64
+        // here regardless of whether the canonical `__delta_internal_row_index` or
+        // the alternate `_tmp_metadata_row_index` name is used.
+        fields.push(Arc::new(Field::new(row_index_column_name, DataType::Int64, false)));
     }
     if emit_is_row_deleted {
         fields.push(Arc::new(Field::new(
@@ -400,8 +403,10 @@ impl DeltaSyntheticColumnsStream {
 
         // Build the row_index column: monotonically increasing UInt64 starting at
         // batch_start.
-        let row_index_array: Option<UInt64Array> = if self.emit_row_index {
-            Some(UInt64Array::from_iter_values(batch_start..batch_end))
+        let row_index_array: Option<Int64Array> = if self.emit_row_index {
+            Some(Int64Array::from_iter_values(
+                (batch_start..batch_end).map(|v| v as i64),
+            ))
         } else {
             None
         };
@@ -707,10 +712,10 @@ mod tests {
         let idx = out
             .column(1)
             .as_any()
-            .downcast_ref::<UInt64Array>()
+            .downcast_ref::<Int64Array>()
             .unwrap();
-        let vals: Vec<u64> = idx.iter().map(Option::unwrap).collect();
-        assert_eq!(vals, vec![0, 1, 2]);
+        let vals: Vec<i64> = idx.iter().map(Option::unwrap).collect();
+        assert_eq!(vals, vec![0i64, 1, 2]);
     }
 
     #[test]
@@ -718,24 +723,24 @@ mod tests {
         let mut s = make_stream(true, false, false, false, vec![], None, None);
         let out1 = s.augment(batch(&[1, 2, 3])).unwrap();
         let out2 = s.augment(batch(&[4, 5])).unwrap();
-        let idx1: Vec<u64> = out1
+        let idx1: Vec<i64> = out1
             .column(1)
             .as_any()
-            .downcast_ref::<UInt64Array>()
+            .downcast_ref::<Int64Array>()
             .unwrap()
             .iter()
             .map(Option::unwrap)
             .collect();
-        let idx2: Vec<u64> = out2
+        let idx2: Vec<i64> = out2
             .column(1)
             .as_any()
-            .downcast_ref::<UInt64Array>()
+            .downcast_ref::<Int64Array>()
             .unwrap()
             .iter()
             .map(Option::unwrap)
             .collect();
-        assert_eq!(idx1, vec![0, 1, 2]);
-        assert_eq!(idx2, vec![3, 4]);
+        assert_eq!(idx1, vec![0i64, 1, 2]);
+        assert_eq!(idx2, vec![3i64, 4]);
     }
 
     #[test]
@@ -841,15 +846,15 @@ mod tests {
 
         // col 0: data
         // col 1: row_index 0,1,2
-        let ri: Vec<u64> = out
+        let ri: Vec<i64> = out
             .column(1)
             .as_any()
-            .downcast_ref::<UInt64Array>()
+            .downcast_ref::<Int64Array>()
             .unwrap()
             .iter()
             .map(Option::unwrap)
             .collect();
-        assert_eq!(ri, vec![0, 1, 2]);
+        assert_eq!(ri, vec![0i64, 1, 2]);
         // col 2: is_row_deleted 0,1,0
         let dl: Vec<i32> = out
             .column(2)
