@@ -107,7 +107,7 @@ class CometDeltaFeaturesSuite extends CometDeltaTestBase {
 
   // ---- Synthetic columns ----------------------------------------------------
 
-  test("synthetic: native scan engages when downstream consumes _metadata.row_index") {
+  test("synthetic: native scan engages when row tracking is enabled (provides _metadata.row_index)") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("features_synth") { tablePath =>
       val ss = spark
@@ -118,15 +118,19 @@ class CometDeltaFeaturesSuite extends CometDeltaTestBase {
         .repartition(1)
         .write
         .format("delta")
+        .option("delta.enableRowTracking", "true")
+        .option("delta.minReaderVersion", "3")
+        .option("delta.minWriterVersion", "7")
         .save(tablePath)
 
       val df = spark.read.format("delta").load(tablePath)
         .selectExpr("id", "_metadata.row_index AS ri")
-      val plan = df.queryExecution.executedPlan
-      // We may or may not engage Comet's native scan depending on what Delta does with
-      // _metadata.row_index. Just verify the query runs and the row count matches.
       val rows = df.collect()
-      assert(rows.length === 6)
+      val plan = df.queryExecution.executedPlan
+      assert(rows.length === 6, s"expected 6 rows, got ${rows.length}")
+      assert(
+        collect(plan) { case s: CometDeltaNativeScanExec => s }.nonEmpty,
+        s"expected Comet to engage when _metadata.row_index is consumed:\n$plan")
     }
   }
 
