@@ -466,16 +466,22 @@ object DeltaReflection extends Logging {
       // construction time -- problematic when the same FileIndex is reused
       // across DML statements (e.g. consecutive DELETEs against the same path)
       // because the DV descriptor on the AddFile is frozen at the first
-      // construction. Prefer the live `matchingFiles(Nil, Nil)` call when
-      // available -- it asks Delta for the current snapshot's matching files
-      // and picks up updated DV descriptors. Fall back to the cached
-      // `preparedScan.files` only when `matchingFiles` isn't accessible.
-      val matchingFilesLive: Option[AnyRef] =
+      // construction. For PreparedDeltaFileIndex, refresh the DeltaLog snapshot
+      // via `deltaLog.update()` and read `snapshot.filesForScan(...).files` so
+      // we pick up DV descriptors written after the FileIndex was built.
+      // Fall back to `matchingFiles(Nil, Nil)`, then `preparedScan.files`, then
+      // raw `addFiles` if any of these reflection calls fail.
+      val refreshedFiles: Option[AnyRef] =
         if (location.getClass.getName.contains("PreparedDeltaFileIndex")) {
+          refreshedSnapshotFiles(location)
+        } else None
+      val matchingFilesLive: Option[AnyRef] =
+        if (refreshedFiles.isEmpty &&
+          location.getClass.getName.contains("PreparedDeltaFileIndex")) {
           callMatchingFiles(location)
         } else None
       val preparedFiles: Option[AnyRef] =
-        if (matchingFilesLive.isEmpty &&
+        if (refreshedFiles.isEmpty && matchingFilesLive.isEmpty &&
           location.getClass.getName.contains("PreparedDeltaFileIndex")) {
           findAccessor(location, Seq("preparedScan"))
             .flatMap(ps => findAccessor(ps, Seq("files")))
@@ -484,7 +490,8 @@ object DeltaReflection extends Logging {
       // AddFiles on CDC indexes and the plain list on TahoeBatchFileIndex.
       // Fall back to the raw `addFiles`/`filesList` accessors for indexes that
       // don't expose a no-arg-safe matchingFiles.
-      val addFilesOpt = matchingFilesLive
+      val addFilesOpt = refreshedFiles
+        .orElse(matchingFilesLive)
         .orElse(preparedFiles)
         .orElse(callMatchingFiles(location))
         .orElse(findAccessor(location, Seq("addFiles", "filesList")))
@@ -615,6 +622,47 @@ object DeltaReflection extends Logging {
    * Returns `None` if the method is missing or the invocation throws. Comet does not have a
    * compile-time dep on spark-delta, so we reach for reflection here.
    */
+  /**
+   * Force-refresh the DeltaLog snapshot referenced by a `PreparedDeltaFileIndex` and re-resolve
+   * the matching files against the latest snapshot. Returns `Some(Seq[AddFile])` (typed as the
+   * raw AnyRef from the Delta API) when the refresh + re-query succeeds, `None` when reflection
+   * fails or the FileIndex isn't a `PreparedDeltaFileIndex`.
+   *
+   * Why: `preparedScan.files` is captured at FileIndex construction. Consecutive DML statements
+   * on the same path (e.g. two DELETEs targeting the same parquet file) yield a stale DV
+   * descriptor when the second read reuses the cached PreparedDeltaFileIndex. `deltaLog.update`
+   * refreshes the snapshot to head, and `snapshot.filesForScan(Nil, false).files` returns the
+   * AddFiles with the freshest DV descriptors -- which is what vanilla Delta's runtime DV
+   * lookup ultimately consults.
+   */
+  private def refreshedSnapshotFiles(location: Any): Option[AnyRef] = {
+    if (location == null) return None
+    try {
+      val deltaLog = findAccessor(location, Seq("deltaLog")).orNull
+      if (deltaLog == null) return None
+      val updateMethod = deltaLog.getClass.getMethods.find { m =>
+        m.getName == "update" && m.getParameterCount == 3
+      }.orNull
+      if (updateMethod == null) return None
+      val falseBox: Object = java.lang.Boolean.FALSE
+      val none: Object = scala.None
+      val snapshot = updateMethod.invoke(deltaLog, falseBox, none, none)
+      if (snapshot == null) return None
+      val filesForScanMethod = snapshot.getClass.getMethods.find { m =>
+        m.getName == "filesForScan" && m.getParameterCount == 2 &&
+        m.getParameterTypes()(1) == classOf[Boolean]
+      }.orNull
+      if (filesForScanMethod == null) return None
+      val nilSeq = scala.collection.immutable.Nil
+      val keepNumRecords: Object = java.lang.Boolean.FALSE
+      val deltaScan = filesForScanMethod.invoke(snapshot, nilSeq, keepNumRecords)
+      if (deltaScan == null) return None
+      findAccessor(deltaScan, Seq("files"))
+    } catch {
+      case scala.util.control.NonFatal(_) => None
+    }
+  }
+
   private def callMatchingFiles(location: Any): Option[AnyRef] = {
     if (location == null) return None
     try {
