@@ -1068,22 +1068,44 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
         f.name.toLowerCase(Locale.ROOT) -> i
       }.toMap
     // Skip synthetic columns from the projection: DeltaSyntheticColumnsExec
-    // appends them after the parquet read.
+    // appends them after the parquet read. The data-schema seen by native is
+    // `dataSchemaForProtoStripped` (== fileDataSchemaFields with synthetics
+    // filtered out when needsSyntheticEmit). Indexes here must reflect that:
+    // (a) within the data tail, fileDataSchemaFields.indexWhere walks the
+    //     un-stripped fields and skips synthetic positions on the JVM side
+    //     by counting non-synthetic predecessors;
+    // (b) partition-tail indexes start at the STRIPPED data length, not the
+    //     un-stripped length, because that's what native sees on the wire.
+    // Without (b), a non-synthetic data column followed by a synthetic
+    // (e.g. relation.dataSchema = [id, __delta_internal_is_row_deleted] on
+    // a DV-rewritten Delta CDC scan) makes partition indexes overshoot the
+    // native schema length, panicking `ProjectionExprs::from_indices`.
+    val isSyntheticFieldName = (name: String) => {
+      val lc = name.toLowerCase(Locale.ROOT)
+      syntheticNames.contains(lc) ||
+        lc.startsWith("_row-id-col-") ||
+        lc.startsWith("_row-commit-version-col-")
+    }
+    val nonSyntheticDataIdxByName: Map[String, Int] =
+      fileDataSchemaFields
+        .filterNot(f => needsSyntheticEmit && isSyntheticFieldName(f.name))
+        .zipWithIndex
+        .map { case (f, i) => f.name.toLowerCase(Locale.ROOT) -> i }
+        .toMap
+    val nonSyntheticDataLen = nonSyntheticDataIdxByName.size
     val requiredIndexes: Seq[Int] = scan.requiredSchema.fields.flatMap { field =>
       if (needsSyntheticEmit && isSynthetic(field)) None
       else {
         val nameLower = field.name.toLowerCase(Locale.ROOT)
-        val dataIdx =
-          fileDataSchemaFields.indexWhere(_.name.toLowerCase(Locale.ROOT) == nameLower)
-        if (dataIdx >= 0) {
-          Some(dataIdx)
-        } else {
-          partitionNameToIndex.get(nameLower).map(p => fileDataSchemaFields.length + p)
+        nonSyntheticDataIdxByName.get(nameLower) match {
+          case Some(idx) => Some(idx)
+          case None =>
+            partitionNameToIndex.get(nameLower).map(p => nonSyntheticDataLen + p)
         }
       }
     }.toSeq
     val partitionTailIndexes: Seq[Int] =
-      relation.partitionSchema.fields.indices.map(i => fileDataSchemaFields.length + i)
+      relation.partitionSchema.fields.indices.map(i => nonSyntheticDataLen + i)
     val projectionVector: Seq[Int] = requiredIndexes ++ partitionTailIndexes
     commonBuilder.addAllProjectionVector(
       projectionVector.map(idx => idx.toLong.asInstanceOf[java.lang.Long]).toIterable.asJava)
