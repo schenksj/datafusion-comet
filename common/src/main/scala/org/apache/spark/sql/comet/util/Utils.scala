@@ -26,6 +26,7 @@ import java.nio.channels.Channels
 import scala.jdk.CollectionConverters._
 
 import org.apache.arrow.c.CDataDictionaryProvider
+import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector._
 import org.apache.arrow.vector.complex.{ListVector, MapVector, StructVector}
 import org.apache.arrow.vector.dictionary.DictionaryProvider
@@ -37,6 +38,7 @@ import org.apache.spark.{SparkEnv, SparkException}
 import org.apache.spark.internal.Logging
 import org.apache.spark.io.CompressionCodec
 import org.apache.spark.sql.comet.execution.arrow.ArrowReaderIterator
+import org.apache.spark.sql.execution.vectorized.ConstantColumnVector
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.io.{ChunkedByteBuffer, ChunkedByteBufferOutputStream}
@@ -360,6 +362,7 @@ object Utils extends CometTypeShim with Logging {
   def getBatchFieldVectors(
       batch: ColumnarBatch): (Seq[FieldVector], Option[DictionaryProvider]) = {
     var provider: Option[DictionaryProvider] = None
+    val rows = batch.numRows()
     val fieldVectors = (0 until batch.numCols()).map { index =>
       batch.column(index) match {
         case a: CometVector =>
@@ -371,6 +374,17 @@ object Utils extends CometTypeShim with Logging {
           }
 
           getFieldVector(valueVector, "serialize")
+
+        case cv: ConstantColumnVector =>
+          // Spark wraps file-source partition columns and other per-batch
+          // constants in `ConstantColumnVector`. Materialise to an Arrow vector
+          // so the serialisation path doesn't reject the batch.
+          materializeConstantColumnVector(
+            cv,
+            cv.dataType(),
+            rows,
+            s"_const_$index",
+            org.apache.comet.CometArrowAllocator)
 
         case c =>
           throw new SparkException(
@@ -397,6 +411,172 @@ object Utils extends CometTypeShim with Logging {
         v.asInstanceOf[FieldVector]
       case _ =>
         throw new SparkException(s"Unsupported Arrow Vector for $reason: ${valueVector.getClass}")
+    }
+  }
+
+  /**
+   * Materialize a Spark `ConstantColumnVector` into a fresh Arrow `FieldVector` whose
+   * value is the same constant repeated `numRows` times.
+   *
+   * Spark wraps file-source partition columns and other per-batch constants in
+   * `ConstantColumnVector`; downstream Comet operators feeding `NativeUtil.exportBatch`
+   * trip on it because exportBatch only knows how to handle `CometVector`. This helper
+   * lets the export path materialise the constant into an Arrow vector inline.
+   *
+   * The caller owns the returned vector and must close it (or hand it to Arrow's
+   * exporter which transfers ownership). The vector is allocated against
+   * `allocator`, sized to exactly `numRows`, and pre-filled with the constant
+   * value (or null when `cv.isNullAt(0)`).
+   *
+   * Supported types: Boolean, Byte, Short, Int, Long, Float, Double, Date, Timestamp,
+   * String, Binary, Decimal. Throws for unsupported types (struct/array/map). Add
+   * cases as new constant-column-on-partition shapes surface.
+   */
+  def materializeConstantColumnVector(
+      cv: ConstantColumnVector,
+      dt: org.apache.spark.sql.types.DataType,
+      numRows: Int,
+      name: String,
+      allocator: BufferAllocator): FieldVector = {
+    val isNull = cv.isNullAt(0)
+    def fillAllNull(vec: FieldVector): Unit = {
+      vec.setInitialCapacity(numRows)
+      vec.allocateNew()
+      var i = 0
+      while (i < numRows) {
+        vec.setNull(i)
+        i += 1
+      }
+      vec.setValueCount(numRows)
+    }
+    dt match {
+      case _: org.apache.spark.sql.types.BooleanType =>
+        val v = new BitVector(name, allocator)
+        if (isNull) { fillAllNull(v) } else {
+          v.setInitialCapacity(numRows); v.allocateNew()
+          val bit = if (cv.getBoolean(0)) 1 else 0
+          var i = 0; while (i < numRows) { v.set(i, bit); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case _: org.apache.spark.sql.types.ByteType =>
+        val v = new TinyIntVector(name, allocator)
+        if (isNull) fillAllNull(v) else {
+          v.setInitialCapacity(numRows); v.allocateNew()
+          val b = cv.getByte(0); var i = 0
+          while (i < numRows) { v.set(i, b); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case _: org.apache.spark.sql.types.ShortType =>
+        val v = new SmallIntVector(name, allocator)
+        if (isNull) fillAllNull(v) else {
+          v.setInitialCapacity(numRows); v.allocateNew()
+          val s = cv.getShort(0); var i = 0
+          while (i < numRows) { v.set(i, s); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case _: org.apache.spark.sql.types.IntegerType =>
+        val v = new IntVector(name, allocator)
+        if (isNull) fillAllNull(v) else {
+          v.setInitialCapacity(numRows); v.allocateNew()
+          val x = cv.getInt(0); var i = 0
+          while (i < numRows) { v.set(i, x); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case _: org.apache.spark.sql.types.LongType =>
+        val v = new BigIntVector(name, allocator)
+        if (isNull) fillAllNull(v) else {
+          v.setInitialCapacity(numRows); v.allocateNew()
+          val x = cv.getLong(0); var i = 0
+          while (i < numRows) { v.set(i, x); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case _: org.apache.spark.sql.types.FloatType =>
+        val v = new Float4Vector(name, allocator)
+        if (isNull) fillAllNull(v) else {
+          v.setInitialCapacity(numRows); v.allocateNew()
+          val x = cv.getFloat(0); var i = 0
+          while (i < numRows) { v.set(i, x); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case _: org.apache.spark.sql.types.DoubleType =>
+        val v = new Float8Vector(name, allocator)
+        if (isNull) fillAllNull(v) else {
+          v.setInitialCapacity(numRows); v.allocateNew()
+          val x = cv.getDouble(0); var i = 0
+          while (i < numRows) { v.set(i, x); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case _: org.apache.spark.sql.types.DateType =>
+        val v = new DateDayVector(name, allocator)
+        if (isNull) fillAllNull(v) else {
+          v.setInitialCapacity(numRows); v.allocateNew()
+          val x = cv.getInt(0); var i = 0
+          while (i < numRows) { v.set(i, x); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case _: org.apache.spark.sql.types.TimestampType =>
+        // Spark stores TimestampType as microseconds since epoch, in UTC.
+        val arrowType = new ArrowType.Timestamp(
+          org.apache.arrow.vector.types.TimeUnit.MICROSECOND, "UTC")
+        val field = new Field(name,
+          new FieldType(true, arrowType, null), java.util.Collections.emptyList[Field])
+        val v = field.createVector(allocator).asInstanceOf[TimeStampMicroTZVector]
+        if (isNull) fillAllNull(v) else {
+          v.setInitialCapacity(numRows); v.allocateNew()
+          val x = cv.getLong(0); var i = 0
+          while (i < numRows) { v.set(i, x); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case _: org.apache.spark.sql.types.StringType =>
+        val v = new VarCharVector(name, allocator)
+        if (isNull) fillAllNull(v) else {
+          val bytes = cv.getUTF8String(0).getBytes
+          v.setInitialCapacity(numRows)
+          v.allocateNew(bytes.length.toLong * numRows, numRows)
+          var i = 0
+          while (i < numRows) { v.setSafe(i, bytes); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case _: org.apache.spark.sql.types.BinaryType =>
+        val v = new VarBinaryVector(name, allocator)
+        if (isNull) fillAllNull(v) else {
+          val bytes = cv.getBinary(0)
+          v.setInitialCapacity(numRows)
+          v.allocateNew(bytes.length.toLong * numRows, numRows)
+          var i = 0
+          while (i < numRows) { v.setSafe(i, bytes); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case decType: org.apache.spark.sql.types.DecimalType =>
+        val arrowType = new ArrowType.Decimal(decType.precision, decType.scale, 128)
+        val field = new Field(name,
+          new FieldType(true, arrowType, null), java.util.Collections.emptyList[Field])
+        val v = field.createVector(allocator).asInstanceOf[DecimalVector]
+        if (isNull) fillAllNull(v) else {
+          v.setInitialCapacity(numRows); v.allocateNew()
+          val dec = cv.getDecimal(0, decType.precision, decType.scale).toJavaBigDecimal
+          var i = 0
+          while (i < numRows) { v.set(i, dec); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
+      case _: org.apache.spark.sql.types.NullType =>
+        val v = new NullVector(name, numRows)
+        v
+      case other =>
+        throw new SparkException(
+          s"materializeConstantColumnVector: unsupported data type for column '$name': $other")
     }
   }
 }
