@@ -332,6 +332,54 @@ object DeltaScanRule {
           s"delete/insert event reads ($fileIndexClassName).")
       return None
     }
+    // When Delta's `useMetadataRowIndex` is false (PredicatePushdownDisabled
+    // test variant), Delta materialises the DV filter as a synthetic
+    // `__delta_internal_is_row_deleted` column above the scan, expecting the
+    // scan to read parquet's row_index AND join against a DV bitmap to
+    // populate the column. Our native scan emits this column via per-task
+    // `deleted_row_indexes`, but in the post-MERGE-with-persistent-DV
+    // read path the original target files are observed to return 0 rows
+    // through our path (root cause undetermined; the DV bitmap reads as
+    // expected and the synthetic emit logic mirrors Delta's, yet the
+    // resulting batch is empty). Decline so Spark+Delta handles these reads
+    // correctly. Surfaced in `MergeIntoSchemaEvolutionBaseExistingColumnSQL
+    // PathBasedCDCOnDVsPredPushOffSuite` (9 of 42 tests failed).
+    //
+    // Gate: scan requires `__delta_internal_is_row_deleted` synthetic AND
+    // `useMetadataRowIndex` is false AND at least one AddFile carries a DV.
+    // This combination is rare in production (the conf is internal+default
+    // true) so the perf cost of the fallback is bounded to test workloads
+    // and any user who explicitly disables `useMetadataRowIndex`.
+    val needsRowDeletedSynth = scanExec.requiredSchema.fields.exists { f =>
+      f.name.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName)
+    }
+    if (needsRowDeletedSynth) {
+      val useMetadataRowIndex = scanExec.relation.sparkSession.conf
+        .getOption("spark.databricks.delta.deletionVectors.useMetadataRowIndex")
+        .map(_.equalsIgnoreCase("true"))
+        .getOrElse(true)
+      if (!useMetadataRowIndex) {
+        // Cheap DV-presence probe: peek at the AddFile list.
+        val anyDv = try {
+          DeltaReflection
+            .extractBatchAddFiles(
+              r.location,
+              scanExec.partitionFilters ++ scanExec.dataFilters)
+            .exists(_.exists(_.hasDeletionVector))
+        } catch {
+          case scala.util.control.NonFatal(_) => false
+        }
+        if (anyDv) {
+          withInfo(
+            scanExec,
+            "Native Delta scan declines DV-bearing reads when " +
+              "spark.databricks.delta.deletionVectors.useMetadataRowIndex=false; " +
+              "the synthetic `__delta_internal_is_row_deleted` emit path " +
+              "interacts incorrectly with MERGE-with-persistentDV writes.")
+          return None
+        }
+      }
+    }
     val supportedSchemes =
       Set("file", "s3", "s3a", "gs", "gcs", "abfss", "abfs", "wasbs", "wasb", "oss")
     val rootPaths = scanExec.relation.location.rootPaths
