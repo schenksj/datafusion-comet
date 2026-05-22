@@ -496,7 +496,10 @@ object DeltaReflection extends Logging {
    * `matchingFiles(Seq.empty, Seq.empty)` when it's available, so the returned `partitionValues`
    * maps already carry the CDC metadata.
    */
-  def extractBatchAddFiles(location: Any): Option[Seq[ExtractedAddFile]] = {
+  def extractBatchAddFiles(
+      location: Any,
+      partitionFilters: Seq[org.apache.spark.sql.catalyst.expressions.Expression] =
+        Seq.empty): Option[Seq[ExtractedAddFile]] = {
     try {
       // PreparedDeltaFileIndex carries the pre-skipped scan result. Reading the
       // cached `preparedScan.files` returns whatever the FileIndex captured at
@@ -510,7 +513,7 @@ object DeltaReflection extends Logging {
       // raw `addFiles` if any of these reflection calls fail.
       val refreshedFiles: Option[AnyRef] =
         if (location.getClass.getName.contains("PreparedDeltaFileIndex")) {
-          refreshedSnapshotFiles(location)
+          refreshedSnapshotFiles(location, partitionFilters)
         } else None
       val matchingFilesLive: Option[AnyRef] =
         if (refreshedFiles.isEmpty &&
@@ -672,7 +675,9 @@ object DeltaReflection extends Logging {
    * AddFiles with the freshest DV descriptors -- which is what vanilla Delta's runtime DV
    * lookup ultimately consults.
    */
-  private def refreshedSnapshotFiles(location: Any): Option[AnyRef] = {
+  private def refreshedSnapshotFiles(
+      location: Any,
+      partitionFilters: Seq[org.apache.spark.sql.catalyst.expressions.Expression]): Option[AnyRef] = {
     if (location == null) return None
     try {
       val deltaLog = findAccessor(location, Seq("deltaLog")).orNull
@@ -690,9 +695,19 @@ object DeltaReflection extends Logging {
         m.getParameterTypes()(1) == classOf[Boolean]
       }.orNull
       if (filesForScanMethod == null) return None
-      val nilSeq = scala.collection.immutable.Nil
+      // Pass through the scan's partition filters so the snapshot does its own
+      // file-skipping. Without this, the refreshed list is the FULL table --
+      // bypassing the partition pruning Delta already applied at planning
+      // time. Breaks tests like StatsCollectionSuite "gather stats" which
+      // assert `recordsScanned(df.where("id = 1")) == 1`. Cast the Scala Seq
+      // through AnyRef so Java reflection accepts it as the first formal arg.
+      val filtersSeq: Object = if (partitionFilters.isEmpty) {
+        scala.collection.immutable.Nil
+      } else {
+        partitionFilters.toList
+      }
       val keepNumRecords: Object = java.lang.Boolean.FALSE
-      val deltaScan = filesForScanMethod.invoke(snapshot, nilSeq, keepNumRecords)
+      val deltaScan = filesForScanMethod.invoke(snapshot, filtersSeq, keepNumRecords)
       if (deltaScan == null) return None
       findAccessor(deltaScan, Seq("files"))
     } catch {

@@ -442,7 +442,19 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     //   (b) Regular scan against a snapshot: call kernel for log replay as before.
     val taskListBytes =
       if (DeltaReflection.isBatchFileIndex(relation.location)) {
-        DeltaReflection.extractBatchAddFiles(relation.location) match {
+        // Pass BOTH the scan's partition filters AND data filters through
+        // so `refreshedSnapshotFiles` (which queries
+        // `snapshot.filesForScan(filters, ...)`) re-applies the same
+        // partition pruning + stats-based data-skipping Delta did at
+        // planning time. Without this, on `PreparedDeltaFileIndex` the
+        // refresh path returns ALL files, breaking stats-based file
+        // pruning (e.g. StatsCollectionSuite "gather stats" -- the
+        // partition column is `odd` but the test filter is on `id` which
+        // is a data column; only data-filter skipping makes the assertion
+        // `recordsScanned(df.where("id = 1")) == 1` hold).
+        DeltaReflection.extractBatchAddFiles(
+          relation.location,
+          scan.partitionFilters ++ scan.dataFilters) match {
           case Some(addFiles) =>
             // Under column mapping, Delta stores partition values in AddFile keyed by the
             // PHYSICAL column name. `relation.partitionSchema.fields[*].metadata` has had
