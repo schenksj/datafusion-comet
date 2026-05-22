@@ -137,6 +137,10 @@ jobs:
             delta-version: '3.3.2'
             scala-version: '2.13'
             java-version: 17
+          - spark-version: { short: '4.0', full: '4.0.1' }
+            delta-version: '4.0.0'
+            scala-version: '2.13'
+            java-version: 17
           - spark-version: { short: '4.1', full: '4.1.1' }
             delta-version: '4.1.0'
             scala-version: '2.13'

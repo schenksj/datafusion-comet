@@ -95,6 +95,22 @@ if [[ "$DELTA35_WRONG" -gt 0 ]]; then
 fi
 green "OK: -Pcontrib-delta + spark-3.5 correctly pulls delta-spark:3.x"
 
+# spark-4.0 + contrib-delta must pull delta-spark:4.0.x specifically (Delta 4.1
+# requires Spark 4.1 internals and tripping NoSuchMethodError on
+# ParserInterface.$init$ at runtime).
+DEPS_CONTRIB_40="$(mvn -Pspark-4.0,contrib-delta -Djava.version=17 -Dmaven.compiler.source=17 -Dmaven.compiler.target=17 -pl spark dependency:list 2>/dev/null || true)"
+DELTA40_HITS="$(printf '%s\n' "$DEPS_CONTRIB_40" | grep -cE 'io\.delta:delta-spark.*:4\.0\.' || true)"
+if [[ "$DELTA40_HITS" -lt 1 ]]; then
+  red "FAIL: -Pcontrib-delta + spark-4.0 missing delta-spark:4.0.x"
+  exit 1
+fi
+DELTA40_WRONG="$(printf '%s\n' "$DEPS_CONTRIB_40" | grep -cE 'io\.delta:delta-spark.*:4\.1\.' || true)"
+if [[ "$DELTA40_WRONG" -gt 0 ]]; then
+  red "FAIL: -Pcontrib-delta + spark-4.0 incorrectly pulls delta-spark:4.1.x (should be 4.0.x)"
+  exit 1
+fi
+green "OK: -Pcontrib-delta + spark-4.0 correctly pulls delta-spark:4.0.x"
+
 # ---- Compiled-class gate --------------------------------------------------
 
 hdr "Compiled classes: no contrib/delta classes in default build"

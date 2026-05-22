@@ -267,6 +267,15 @@ under the License.
 
     <profile>
       <id>spark-4.0</id>
+      <properties>
+        <!--
+          Delta dep version (only used when `-Pcontrib-delta` is also active).
+          Delta 4.1 requires Spark 4.1 internals (NoSuchMethodError on
+          ParserInterface.$init$ if used against Spark 4.0), so spark-4.0 pins
+          the 4.0.x line.
+        -->
+        <delta.version>4.0.0</delta.version>
+      </properties>
       <dependencies>
         <dependency>
           <groupId>org.apache.iceberg</groupId>
