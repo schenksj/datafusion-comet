@@ -313,6 +313,25 @@ object DeltaScanRule {
         s"Native Delta scan has not validated the cloud-fetch variant ($fileIndexClassName).")
       return None
     }
+    // CDC "delete events" / "insert events" reads attach a non-empty
+    // `rowIndexFilters` map to CdcAddFileIndex / TahoeRemoveFileIndex,
+    // inverting the DV bitmap semantics: native batch reads filter OUT the
+    // rows in the bitmap, but CDC needs the rows that ARE in the bitmap.
+    // Our native scan only implements the batch semantics; without the
+    // inversion the scan returns the wrong rows for these CDC code paths.
+    // Decline so Spark's reader handles them correctly. Specifically
+    // observed in DeltaCDCScalaWithCatalogOwnedBatch2Suite "filtering cdc
+    // metadata columns" / "Repeated delete" where post-DELETE deletes are
+    // reported via a DV update -- the test expected the DV'd rows
+    // (21..24 for delete("id > 20") on a [20-24] file) but native emitted
+    // the non-DV'd row (20) instead.
+    if (DeltaReflection.hasInvertedRowIndexFilters(r.location)) {
+      withInfo(
+        scanExec,
+        "Native Delta scan does not yet implement inverted DV semantics for CDC " +
+          s"delete/insert event reads ($fileIndexClassName).")
+      return None
+    }
     val supportedSchemes =
       Set("file", "s3", "s3a", "gs", "gcs", "abfss", "abfs", "wasbs", "wasb", "oss")
     val rootPaths = scanExec.relation.location.rootPaths

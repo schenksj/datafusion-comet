@@ -444,6 +444,43 @@ object DeltaReflection extends Logging {
   }
 
   /**
+   * Detect whether the FileIndex carries a non-empty `rowIndexFilters` map. Delta
+   * uses this to flag CDC "delete events" / "insert events" reads where the DV
+   * bitmap semantics are INVERTED relative to a normal batch read: native
+   * batch reads filter OUT the rows in the bitmap, but CDC needs the rows
+   * IN the bitmap (the rows that are being newly deleted / newly inserted).
+   * Our native scan currently only implements the batch semantics, so this
+   * method lets `DeltaScanRule` decline these CDC-special reads and fall
+   * back to Spark's reader.
+   *
+   * Returns true when:
+   *  - the FileIndex exposes a `rowIndexFilters` accessor that returns
+   *    `Some(map)` with non-empty contents, OR
+   *  - reflection succeeds but the value is `null` => treat as not set.
+   *
+   * Conservative on reflection failure -- returns false (don't decline) so a
+   * Delta version drift that renames the field doesn't silently break the
+   * happy path. The DV cardinality / column-count fixes are still applied.
+   */
+  def hasInvertedRowIndexFilters(location: Any): Boolean = {
+    try {
+      findAccessor(location, Seq("rowIndexFilters")) match {
+        case Some(opt: Option[_]) =>
+          opt match {
+            case Some(m: scala.collection.Map[_, _]) => m.nonEmpty
+            case Some(m: java.util.Map[_, _]) => !m.isEmpty
+            case _ => false
+          }
+        case Some(m: scala.collection.Map[_, _]) => m.nonEmpty
+        case Some(m: java.util.Map[_, _]) => !m.isEmpty
+        case _ => false
+      }
+    } catch {
+      case scala.util.control.NonFatal(_) => false
+    }
+  }
+
+  /**
    * Extract the AddFile list from a `TahoeBatchFileIndex`-like FileIndex via reflection (no
    * compile-time dep on spark-delta). Returns `None` when:
    *   - the FileIndex class doesn't expose an `addFiles: Seq[AddFile]` method
