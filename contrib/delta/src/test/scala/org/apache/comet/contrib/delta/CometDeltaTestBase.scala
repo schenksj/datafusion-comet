@@ -96,12 +96,16 @@ trait CometDeltaTestBase extends CometTestBase with AdaptiveSparkPlanHelper {
           (_: org.apache.spark.sql.SparkSessionExtensions) => ()
       }
 
-    org.apache.spark.sql.classic.SparkSession
+    // Use the standard SparkSession builder (works on Spark 3.5 and 4.x; on Spark 4
+    // `org.apache.spark.sql.SparkSession.builder()` returns the classic builder by
+    // default, same as `org.apache.spark.sql.classic.SparkSession.builder()`).
+    SparkSession
       .builder()
       .config(sparkContext.getConf)
       .withExtensions(new CometSparkSessionExtensions)
       .withExtensions(deltaExt)
       .getOrCreate()
+      .asInstanceOf[SparkSessionType]
   }
 
   override protected def beforeAll(): Unit = {

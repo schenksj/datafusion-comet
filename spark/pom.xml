@@ -235,6 +235,13 @@ under the License.
 
     <profile>
       <id>spark-3.5</id>
+      <!--
+        When `contrib-delta` is also active, pin Delta to 3.3.x (the latest
+        Delta line that targets Spark 3.5). Delta 4.x requires Spark 4.x.
+      -->
+      <properties>
+        <delta.version>3.3.2</delta.version>
+      </properties>
       <dependencies>
         <dependency>
           <groupId>org.apache.iceberg</groupId>
@@ -287,6 +294,10 @@ under the License.
       <activation>
         <activeByDefault>true</activeByDefault>
       </activation>
+      <properties>
+        <!-- Delta dep version (only used when `-Pcontrib-delta` is also active). -->
+        <delta.version>4.1.0</delta.version>
+      </properties>
       <dependencies>
         <!-- iceberg-spark-runtime-4.1 is not yet published; reuse the 4.0 runtime -->
         <dependency>
@@ -345,9 +356,13 @@ under the License.
     -->
     <profile>
       <id>contrib-delta</id>
-      <properties>
-        <delta.version>4.1.0</delta.version>
-      </properties>
+      <!--
+        Delta dep version is selected by the active Spark profile (each Spark
+        profile sets its matching `delta.version`): delta-spark 4.x for Spark
+        4.x, 3.3.x for Spark 3.5. When the user activates only
+        `-Pcontrib-delta` without a Spark profile, the spark-4.1 default
+        Maven activation supplies the version.
+      -->
       <dependencies>
         <dependency>
           <groupId>io.delta</groupId>

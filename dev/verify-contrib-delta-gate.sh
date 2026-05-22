@@ -1,4 +1,22 @@
 #!/usr/bin/env bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
 # Verify the `contrib-delta` build gate keeps Delta surface out of default builds.
 #
 # Three independent layers are checked:
@@ -56,12 +74,26 @@ fi
 green "OK: default Maven build has zero io.delta dependencies"
 
 DEPS_CONTRIB="$(mvn -Pspark-4.1,contrib-delta -Djava.version=17 -Dmaven.compiler.source=17 -Dmaven.compiler.target=17 -pl spark dependency:list 2>/dev/null || true)"
-DELTA_DEP_HITS="$(printf '%s\n' "$DEPS_CONTRIB" | grep -cE 'io\.delta:delta-spark' || true)"
+DELTA_DEP_HITS="$(printf '%s\n' "$DEPS_CONTRIB" | grep -cE 'io\.delta:delta-spark.*:4\.' || true)"
 if [[ "$DELTA_DEP_HITS" -lt 1 ]]; then
-  red "FAIL: -Pcontrib-delta profile missing io.delta:delta-spark"
+  red "FAIL: -Pcontrib-delta + spark-4.1 missing delta-spark:4.x"
   exit 1
 fi
-green "OK: -Pcontrib-delta correctly pulls io.delta:delta-spark"
+green "OK: -Pcontrib-delta + spark-4.1 correctly pulls delta-spark:4.x"
+
+# Per-Spark Delta version pinning: spark-3.5 + contrib-delta must pull delta-spark:3.x
+DEPS_CONTRIB_35="$(mvn -Pspark-3.5,contrib-delta -Djava.version=17 -Dmaven.compiler.source=17 -Dmaven.compiler.target=17 -pl spark dependency:list 2>/dev/null || true)"
+DELTA35_HITS="$(printf '%s\n' "$DEPS_CONTRIB_35" | grep -cE 'io\.delta:delta-spark.*:3\.' || true)"
+if [[ "$DELTA35_HITS" -lt 1 ]]; then
+  red "FAIL: -Pcontrib-delta + spark-3.5 missing delta-spark:3.x"
+  exit 1
+fi
+DELTA35_WRONG="$(printf '%s\n' "$DEPS_CONTRIB_35" | grep -cE 'io\.delta:delta-spark.*:4\.' || true)"
+if [[ "$DELTA35_WRONG" -gt 0 ]]; then
+  red "FAIL: -Pcontrib-delta + spark-3.5 incorrectly pulls delta-spark:4.x (should be 3.x)"
+  exit 1
+fi
+green "OK: -Pcontrib-delta + spark-3.5 correctly pulls delta-spark:3.x"
 
 # ---- Compiled-class gate --------------------------------------------------
 
