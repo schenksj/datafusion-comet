@@ -384,6 +384,14 @@ case class CometDeltaNativeScanExec(
     } else {
       serializedPlanOpt
     }
+    // IMPORTANT: forward `oneTaskPerPartition` to the rebuilt exec. The case
+    // class has `oneTaskPerPartition: Boolean = false` as the last constructor
+    // param with a default; if we don't pass it explicitly here, every call to
+    // `convertBlock()` silently downgrades the flag to false and
+    // `CometExecRDD`'s per-partition `InputFileBlockHolder` hook stops firing
+    // (multi-file partitions return empty `input_file_name()`, which breaks
+    // Delta's MERGE / UPDATE / DELETE `findTouchedFiles` lookup with
+    // DELTA_FILE_TO_OVERWRITE_NOT_FOUND).
     CometDeltaNativeScanExec(
       nativeOp,
       output,
@@ -392,7 +400,8 @@ case class CometDeltaNativeScanExec(
       tableRoot,
       taskListBytes,
       dppFilters,
-      partitionSchema)
+      partitionSchema,
+      oneTaskPerPartition)
   }
 
   override protected def doCanonicalize(): CometDeltaNativeScanExec = {
