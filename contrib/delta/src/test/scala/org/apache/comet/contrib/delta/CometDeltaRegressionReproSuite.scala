@@ -167,6 +167,66 @@ class CometDeltaRegressionReproSuite extends CometDeltaTestBase {
     }
   }
 
+  // 6. MERGE schema-evolution under DV + CDC + PredPushdownDisabled returns
+  // empty target. Upstream:
+  // MergeIntoSchemaEvolutionBaseExistingColumnSQLPathBasedCDCOnDVsPredPushOffSuite
+  // "schema evolution - upcast int source type into long target". Plan dump
+  // shows `CometScan [native_delta_compat]` reading
+  // `__delta_internal_is_row_deleted:tinyint` and the pushed-down filter
+  // `__delta_internal_is_row_deleted = 0`. The column does not exist in the
+  // fresh parquet file (no DV materialised yet); Spark normally synthesises
+  // it as 0, our scan returns 0 rows.
+  // Note: this repro does NOT yet fail locally even though the upstream
+  // MergeIntoSchemaEvolutionBaseExistingColumnSQLPathBasedCDCOnDVsPredPushOffSuite
+  // variant fails on the same shape. Documented as a known-incomplete
+  // reproducer -- fixing the upstream failure will require nailing down
+  // which additional session state the Delta test mixins set up that we
+  // aren't mirroring here.
+  test("MERGE upcast int->long under DV+CDC+PredPushdownDisabled doesn't empty target") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("merge_upcast_cdc_dv") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      // Mirror MergeIntoSchemaEvolutionBaseExistingColumnSQLPathBasedCDCOnDVsPredPushOffSuite
+      // mixin chain: CDCEnabled + MergeIntoDVsMixin + PredicatePushdownDisabled
+      // + MergeCDCMixin + MergeCDCWithDVsMixin
+      val keys = Seq(
+        "spark.databricks.delta.properties.defaults.enableChangeDataFeed" -> "true",
+        "spark.databricks.delta.properties.defaults.enableDeletionVectors" -> "true",
+        "spark.databricks.delta.merge.persistentDeletionVectors.enabled" -> "true",
+        "spark.databricks.delta.update.persistentDeletionVectors.enabled" -> "false",
+        "spark.databricks.delta.delete.persistentDeletionVectors.enabled" -> "false",
+        "spark.databricks.delta.deletionVectors.useMetadataRowIndex" -> "false")
+      val originals = keys.map { case (k, _) => k -> spark.conf.getOption(k) }
+      try {
+        keys.foreach { case (k, v) => spark.conf.set(k, v) }
+        Seq((0, 0L), (1, 10L), (3, 30L)).toDF("key", "value")
+          .write
+          .format("delta")
+          .save(tablePath)
+        Seq((1, 1), (2, 2)).toDF("key", "value")
+          .createOrReplaceTempView("merge_upcast_src")
+        spark.sql(
+          s"""MERGE INTO delta.`$tablePath` AS t
+              USING merge_upcast_src AS s
+              ON t.key = s.key
+              WHEN MATCHED THEN UPDATE SET *
+              WHEN NOT MATCHED THEN INSERT *""")
+        val rows = spark.read.format("delta").load(tablePath)
+          .orderBy("key").collect()
+          .map(r => (r.getInt(0), r.getLong(1)))
+          .toSeq
+        assert(rows === Seq((0, 0L), (1, 1L), (2, 2L), (3, 30L)),
+          s"MERGE upcast under DV+CDC produced unexpected rows: $rows")
+      } finally {
+        originals.foreach {
+          case (k, Some(orig)) => spark.conf.set(k, orig)
+          case (k, None) => spark.conf.unset(k)
+        }
+      }
+    }
+  }
+
   // 5. CHECK constraint with analyzer-evaluated expression
   // (year(current_date())). Delta resolves it at definition time; the
   // constraint then has to evaluate against inserted rows. Mirrors
