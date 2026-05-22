@@ -77,6 +77,12 @@ pub const META_FILE_MODIFICATION_TIME: &str = "file_modification_time";
 /// `row_id = base_row_id + row_index`; the upstream Project does the addition, so this
 /// column carries the per-file constant.
 pub const META_BASE_ROW_ID: &str = "base_row_id";
+/// Delta's per-file `AddFile.defaultRowCommitVersion` surfaced as an attribute.
+/// Same role as [`META_BASE_ROW_ID`] but for the row-commit-version side: plans
+/// reading `_metadata.row_commit_version` on row-tracking-enabled tables before
+/// materialisation pick this up as the default when the parquet file doesn't
+/// carry a per-row version.
+pub const META_DEFAULT_ROW_COMMIT_VERSION: &str = "default_row_commit_version";
 /// Prefix for Delta's materialised row-id columns (`_row-id-col-<uuid>`). Present in
 /// `scan.requiredSchema` whenever row tracking is enabled but the parquet file may not
 /// contain the column (unmaterialised row IDs). Emit as null so the upstream Project
@@ -101,6 +107,9 @@ pub struct TaskMetadata {
     /// `AddFile.baseRowId`. Emitted as a per-file Int64 constant when the upstream
     /// asks for the `base_row_id` synthetic column.
     pub base_row_id: Option<i64>,
+    /// `AddFile.defaultRowCommitVersion`. Emitted as a per-file Int64 constant when
+    /// the upstream asks for the `default_row_commit_version` synthetic column.
+    pub default_row_commit_version: Option<i64>,
 }
 
 fn metadata_field(name: &str) -> Field {
@@ -121,7 +130,9 @@ fn metadata_field(name: &str) -> Field {
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
-        META_BASE_ROW_ID => Field::new(name, DataType::Int64, true),
+        META_BASE_ROW_ID | META_DEFAULT_ROW_COMMIT_VERSION => {
+            Field::new(name, DataType::Int64, true)
+        }
         _ => Field::new(name, DataType::Utf8, true),
     }
 }
@@ -571,6 +582,21 @@ impl DeltaSyntheticColumnsStream {
                     // `_metadata.row_id` on row-tracking tables read this + row_index.
                     let value = self.task_metadata.base_row_id.unwrap_or(0);
                     Arc::new(Int64Array::from(vec![value; rows]))
+                }
+                META_DEFAULT_ROW_COMMIT_VERSION => {
+                    // Per-file constant from `AddFile.defaultRowCommitVersion`. Plans
+                    // reading `_metadata.row_commit_version` use this when the parquet
+                    // file doesn't materialise the column. Null when the AddFile lacks
+                    // a default (table doesn't track rows -> upstream Project emits null).
+                    match self.task_metadata.default_row_commit_version {
+                        Some(value) => {
+                            Arc::new(Int64Array::from(vec![Some(value); rows]))
+                        }
+                        None => {
+                            let nulls: Vec<Option<i64>> = vec![None; rows];
+                            Arc::new(Int64Array::from(nulls))
+                        }
+                    }
                 }
                 other if other.starts_with(ROW_ID_MATERIALISED_PREFIX)
                     || other.starts_with(ROW_COMMIT_VERSION_MATERIALISED_PREFIX) =>

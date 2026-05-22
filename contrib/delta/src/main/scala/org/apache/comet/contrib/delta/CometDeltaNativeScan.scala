@@ -881,10 +881,13 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       "file_block_start",
       "file_block_length",
       "file_modification_time",
-      // Delta row-tracking columns synthesised natively (base_row_id is per-file
-      // constant from AddFile.baseRowId; the materialised columns are null when the
-      // parquet file doesn't carry them).
-      "base_row_id")
+      // Delta row-tracking columns synthesised natively. Both are per-file constants
+      // from AddFile.baseRowId / AddFile.defaultRowCommitVersion; the materialised
+      // columns are null when the parquet file doesn't carry them. Must be kept in
+      // sync with `fixedMetadataNames` below and the proto setters in
+      // `buildTaskListFromAddFiles` so the native side actually emits these.
+      "base_row_id",
+      "default_row_commit_version")
     val isSynthetic = (f: StructField) => {
       val lc = f.name.toLowerCase(Locale.ROOT)
       syntheticNames.contains(lc) ||
@@ -917,7 +920,14 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       "file_block_start",
       "file_block_length",
       "file_modification_time",
-      "base_row_id")
+      "base_row_id",
+      // Delta row-tracking exposes `default_row_commit_version` as a per-file
+      // metadata column alongside `base_row_id`. Missing this here means the
+      // emit-name list passed to native drops the column, causing the
+      // upstream operator to see N-1 cols where Spark expected N (e.g. CDC
+      // reads on row-tracking-enabled tables, especially under
+      // coordinated-commits backfill where this code path is reached).
+      "default_row_commit_version")
     // The wrapped exec output is `parquet projection ++ row_index/is_row_deleted/...
     // ++ metadata_column_names` in the order metadata names are emitted. To make the
     // post-synthesis layout match scan.output WITHOUT a final reorder Project, walk

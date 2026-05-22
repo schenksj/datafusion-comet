@@ -610,8 +610,17 @@ abstract class CometNativeExec extends CometExec {
         // Collect per-partition file paths from any CometNativeScanExec leaves so
         // CometExecIterator can populate FAILED_READ_FILE.NO_HINT exceptions with
         // the actual path. Multiple scans (joins) get concatenated per partition.
+        // Collect from ANY scan that exposes file-level provenance via the
+        // `CometScanWithPlanData` trait -- covers `CometNativeScanExec` and
+        // contrib leaves like `CometDeltaNativeScanExec`. Critical for Delta's
+        // MERGE path: when the Delta scan is embedded inside a parent native
+        // tree the parent goes through this RDD-creation code (not
+        // `CometDeltaNativeScanExec.inputRDD`), so without this we'd send
+        // empty `filePaths` down to `CometExecRDD.compute` and
+        // `input_file_name()` would return "" -> `findTouchedFiles` resolves
+        // empty against the table root -> `DELTA_FILE_TO_OVERWRITE_NOT_FOUND`.
         val perPartitionFilePaths: Array[Seq[String]] = {
-          val scans = sparkPlans.collect { case s: CometNativeScanExec => s }
+          val scans = sparkPlans.collect { case s: CometScanWithPlanData => s }
           if (scans.isEmpty) Array.empty[Seq[String]]
           else {
             val perScan = scans.map(_.perPartitionFilePaths)
@@ -885,6 +894,12 @@ trait CometScanWithPlanData {
   def sourceKey: String
   def commonData: Array[Byte]
   def perPartitionData: Array[Array[Byte]]
+  // Per-partition list of file paths produced by this scan. Used by
+  // `CometExecRDD.compute` to populate `InputFileBlockHolder` so
+  // `input_file_name()` (and Delta's MERGE/UPDATE/DELETE `findTouchedFiles`
+  // join, which is keyed on `input_file_name()`) returns the right path.
+  // Empty when the scan doesn't track file-level provenance.
+  def perPartitionFilePaths: Array[Seq[String]] = Array.empty
 }
 
 abstract class CometUnaryExec extends CometNativeExec with UnaryExecNode

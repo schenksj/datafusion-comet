@@ -258,6 +258,19 @@ case class CometDeltaNativeScanExec(
   def commonData: Array[Byte] = commonBytes
   def perPartitionData: Array[Array[Byte]] = planningPerPartitionBytes
 
+  // Surface per-partition file paths to the unified `CometExecRDD` path in
+  // `operators.scala` so `InputFileBlockHolder` is populated when this scan
+  // is embedded inside a larger Comet native tree (e.g. Delta MERGE's
+  // `findTouchedFiles`). Without this, the parent operator's
+  // `CometExecRDD.compute` sees empty filePaths -> `input_file_name()`
+  // returns "" -> `DELTA_FILE_TO_OVERWRITE_NOT_FOUND`.
+  override def perPartitionFilePaths: Array[Seq[String]] = {
+    planningPerPartitionBytes.map { bytes =>
+      OperatorOuterClass.DeltaScan.parseFrom(bytes)
+        .getTasksList.asScala.map(_.getFilePath).toSeq
+    }
+  }
+
   /**
    * Unique key for matching this scan's common/per-partition data to its operator in the native
    * plan. Must be distinct across multiple Delta scans in the same plan tree -- e.g. a self-join

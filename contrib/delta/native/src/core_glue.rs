@@ -209,6 +209,7 @@ impl PhysicalPlanner {
                         byte_range_end: task.byte_range_end.map(|v| v as i64),
                         modification_time_millis: task.modification_time,
                         base_row_id: task.base_row_id,
+                        default_row_commit_version: task.default_row_commit_version,
                     },
                 );
             } else {

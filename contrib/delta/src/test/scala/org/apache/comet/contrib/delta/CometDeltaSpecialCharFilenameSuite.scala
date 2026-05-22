@@ -138,14 +138,7 @@ class CometDeltaSpecialCharFilenameSuite extends CometDeltaTestBase {
     }
   }
 
-  // The two MERGE tests below currently fail with DELTA_FILE_TO_OVERWRITE_NOT_FOUND
-  // despite the convertBlock() / oneTaskPerPartition fix. Root cause for the MERGE
-  // path is separate: Delta's MERGE plan-rewrite happens AFTER our DeltaScanRule
-  // runs, so the InputFileName-driven oneTaskPerPartition flag isn't set on the
-  // target scan that MERGE's `findTouchedFiles` join uses. Marked `ignore` until
-  // that timing issue is resolved -- the read-only multi-file `input_file_name`
-  // test above already validates the convertBlock() fix.
-  ignore("MERGE INTO on a table whose files have literal % in their name") {
+  test("MERGE INTO on a table whose files have literal % in their name") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("merge_pct") { tablePath =>
       val ss = spark
@@ -244,7 +237,7 @@ class CometDeltaSpecialCharFilenameSuite extends CometDeltaTestBase {
     }
   }
 
-  ignore("MERGE INTO when target has MULTIPLE files (no oneTaskPerPartition shortcut)") {
+  test("MERGE INTO when target has MULTIPLE files (no oneTaskPerPartition shortcut)") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("merge_multi") { tablePath =>
       val ss = spark
