@@ -615,7 +615,26 @@ object DeltaReflection extends Logging {
           m.getParameterTypes()(1) == classOf[org.apache.hadoop.fs.Path]
         }
         .getOrElse(return None)
-      val tablePath = new org.apache.hadoop.fs.Path(tableRoot)
+      // `tableRoot` is the contrib's double-URL-encoded form (output of
+      // `pathToSingleEncodedUri`, designed so the NATIVE side's
+      // RawLocalFileSystem.pathToFile decodes once to the literal on-disk
+      // path). The JVM-side `HadoopFileSystemDVStore` resolves the DV file
+      // via Hadoop FS, which expects the URI raw path to ALREADY be the
+      // single-encoded form (Hadoop URI's getRawPath is consumed verbatim
+      // by RawLocalFileSystem.pathToFile). Decode the table root once
+      // before constructing the Hadoop Path so the DV store's file
+      // resolution lands on the literal on-disk file -- otherwise tables
+      // in temp dirs like Delta's `s p a r k %2a-uuid` (with literal
+      // spaces + `%2a`) yield "file not found" / null read and our scan
+      // silently treats every row as not-deleted (or deleted, depending
+      // on caller default), breaking OPTIMIZE / MERGE on DV-bearing
+      // tables.
+      val singleEncoded = try {
+        java.net.URLDecoder.decode(tableRoot, java.nio.charset.StandardCharsets.UTF_8.name())
+      } catch {
+        case _: IllegalArgumentException => tableRoot
+      }
+      val tablePath = new org.apache.hadoop.fs.Path(singleEncoded)
       val bitmap = readMethod.invoke(store, dvDescriptor, tablePath)
       // RoaringBitmapArray.toArray returns Array[Long] of all set bits (= deleted row indexes).
       val toArrayMethod = bitmap.getClass.getMethod("toArray")
