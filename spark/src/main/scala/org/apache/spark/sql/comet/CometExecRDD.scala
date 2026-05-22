@@ -106,11 +106,14 @@ private[spark] class CometExecRDD(
     // not go through Spark's `FileScanRDD` (which is what normally maintains this
     // thread-local), so without this hook Delta's UPDATE/DELETE/MERGE flows -- which
     // rely on `input_file_name()` to identify touched files -- silently see an empty
-    // path. Set to the partition's first file: Delta forces one-task-per-partition
-    // when `input_file_name()` is referenced (see DeltaScanRule), so there is exactly
-    // one file in that case. Registers an unset on task completion to avoid leaking
-    // across tasks on the same executor thread.
-    if (partition.filePaths.nonEmpty) {
+    // path. Contribs surfacing `input_file_name()` MUST force one-task-per-partition
+    // (e.g. DeltaScanRule's `oneTaskPerPartition` flag); when that's the case the
+    // single file's path is set here. When the partition contains multiple files
+    // (which is normal for partitioned reads that don't query input_file_name()),
+    // we skip the hook so a stale "first file" path can't accidentally be reported
+    // for rows that came from a different file. Registers an unset on task
+    // completion to avoid leaking across tasks on the same executor thread.
+    if (partition.filePaths.length == 1) {
       org.apache.spark.rdd.InputFileBlockHolder.set(partition.filePaths.head, 0L, 0L)
       Option(context).foreach { ctx =>
         ctx.addTaskCompletionListener[Unit] { _ =>

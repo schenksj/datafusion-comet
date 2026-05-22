@@ -147,6 +147,22 @@ if [[ "$SIZE_CONTRIB" -le "$SIZE_DEFAULT" ]]; then
   red "       (would indicate contrib was being linked into default build too)"
   exit 1
 fi
+# Sanity check: the contrib-enabled libcomet MUST contain Delta-related symbols.
+# Without this, a future Rust toolchain that mangles symbols differently (so our
+# grep pattern stops matching) would silently make the default-build check a no-op
+# while still passing -- the gate would lie about being enforced. Asserting both
+# "default has 0" AND "contrib has >0" catches grep-pattern drift.
+if command -v nm >/dev/null 2>&1; then
+  CONTRIB_SYMS="$(nm -gU target/debug/libcomet.dylib 2>/dev/null \
+    | grep -ciE 'comet_contrib_delta|delta_kernel|deltadvfilter|deltasynthetic' || true)"
+  if [[ "$CONTRIB_SYMS" -lt 1 ]]; then
+    red "FAIL: contrib-enabled libcomet has 0 Delta-related symbols matching our grep pattern."
+    red "      This means the symbol-name pattern in this script has drifted from what"
+    red "      Rust currently emits, and the default-build check above is now a no-op."
+    red "      Inspect the dylib's exports and update the grep pattern."
+    exit 1
+  fi
+fi
 DIFF_MB=$(( (SIZE_CONTRIB - SIZE_DEFAULT) / 1024 / 1024 ))
 green "OK: contrib-enabled libcomet is ${DIFF_MB} MB larger than default (size=$SIZE_CONTRIB bytes)"
 

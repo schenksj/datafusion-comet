@@ -1519,8 +1519,9 @@ impl PhysicalPlanner {
                     let _ = scan;
                     Err(GeneralError(
                         "Received a DeltaScan operator but core was built without the \
-                         `contrib-delta` Cargo feature. Rebuild with \
-                         `cargo build --features contrib-delta` to enable Delta Lake support."
+                         `contrib-delta` Cargo feature. Rebuild with both \
+                         `-Pcontrib-delta` (Maven) and `--features contrib-delta` (Cargo) \
+                         to enable Delta Lake support."
                             .into(),
                     ))
                 }

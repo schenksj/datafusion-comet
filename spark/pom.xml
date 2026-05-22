@@ -359,9 +359,11 @@ under the License.
       <!--
         Delta dep version is selected by the active Spark profile (each Spark
         profile sets its matching `delta.version`): delta-spark 4.x for Spark
-        4.x, 3.3.x for Spark 3.5. When the user activates only
-        `-Pcontrib-delta` without a Spark profile, the spark-4.1 default
-        Maven activation supplies the version.
+        4.x, 3.3.x for Spark 3.5. A top-level `<delta.version>4.1.0</delta.version>`
+        default lives in the parent POM as a floor so Maven invocations that
+        don't activate any Spark profile (e.g. `mvn -Pcontrib-delta
+        spotless:apply`) still have a resolvable property; any active Spark
+        profile overrides that top-level default.
       -->
       <dependencies>
         <dependency>

@@ -85,7 +85,7 @@ private[comet] trait PlanDataInjector {
 /**
  * Registry and utilities for injecting per-partition planning data into operator trees.
  */
-private[comet] object PlanDataInjector {
+private[comet] object PlanDataInjector extends org.apache.spark.internal.Logging {
 
   // Registry of injectors for different operator types. The contrib/delta integration's
   // DeltaPlanDataInjector is appended via one reflective class lookup -- present only when
@@ -104,8 +104,19 @@ private[comet] object PlanDataInjector {
         // scalastyle:on classforname
         Some(cls.getField("MODULE$").get(null).asInstanceOf[PlanDataInjector])
       } catch {
+        // Default builds (no -Pcontrib-delta) won't have the class -> silent None.
         case _: ClassNotFoundException => None
-        case _: Exception => None
+        // Reflection-binding failures (signature/access drift) -> silent None.
+        case _: NoSuchFieldException | _: IllegalAccessException => None
+        // Anything else (ExceptionInInitializerError, linkage errors, CCE on the
+        // PlanDataInjector cast) is a real bug -- surface it as a log warning and
+        // still decline so the rest of the planner stays alive.
+        case e: Throwable =>
+          logWarning(
+            "Found org.apache.spark.sql.comet.DeltaPlanDataInjector$ on classpath " +
+              "but failed to load it; skipping contrib-delta plan-data injection",
+            e)
+          None
       }
     builtin ++ deltaOpt
   }

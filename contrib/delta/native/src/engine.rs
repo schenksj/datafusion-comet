@@ -146,13 +146,38 @@ pub fn create_object_store(
 /// defaults to ~1300). Sharing one engine per (scheme, authority, config) bounds the
 /// thread count by table-storage diversity instead of by request count.
 ///
+/// **LRU-bounded**: the cache holds at most `MAX_CACHE_ENTRIES` engines. When full,
+/// the least-recently-used entry is evicted and its `Arc<DeltaEngine>` drops --
+/// `DefaultEngine`'s `TokioBackgroundExecutor` joins its OS thread on drop, so the
+/// thread count stabilizes even when long-running drivers rotate credentials (e.g.
+/// hourly STS / IRSA rotations on production). Without this bound, every rotation
+/// produced a new cache entry (because `DeltaStorageConfig` is part of the key and
+/// `aws_session_token` rotates) and leaked one tokio thread per rotation -- a
+/// production-grade memory + thread leak over days.
+///
 /// `Arc<DeltaEngine>` is handed out so callers don't hold the mutex while using the
-/// engine. We never evict — entries are cheap (one Arc per distinct storage target),
-/// and dropping the cache at JVM teardown is acceptable.
+/// engine; concurrent in-flight scans against an evicted engine keep it alive until
+/// they complete.
+const MAX_CACHE_ENTRIES: usize = 32;
+
 type EngineKey = (String, String, DeltaStorageConfig);
-fn engine_cache() -> &'static Mutex<HashMap<EngineKey, Arc<DeltaEngine>>> {
-    static CACHE: OnceLock<Mutex<HashMap<EngineKey, Arc<DeltaEngine>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+
+/// Cache state: maps key to (engine, monotonic last-use counter). The counter is the
+/// LRU recency stamp; we bump it on every hit AND on every insert, and evict the
+/// entry with the smallest counter when full.
+struct EngineCacheState {
+    map: HashMap<EngineKey, (Arc<DeltaEngine>, u64)>,
+    counter: u64,
+}
+
+fn engine_cache() -> &'static Mutex<EngineCacheState> {
+    static CACHE: OnceLock<Mutex<EngineCacheState>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(EngineCacheState {
+            map: HashMap::new(),
+            counter: 0,
+        })
+    })
 }
 
 fn engine_key(url: &Url, config: &DeltaStorageConfig) -> EngineKey {
@@ -176,6 +201,11 @@ pub fn create_engine(table_url: &Url, config: &DeltaStorageConfig) -> DeltaResul
 }
 
 /// Return a shared `DeltaEngine` for the given URL+config, building one on first use.
+///
+/// LRU-bounded: when the cache is full, the least-recently-used entry is evicted.
+/// In-flight users of an evicted engine keep it alive via their `Arc` clone until
+/// they're done; only THEN does the evicted entry's `TokioBackgroundExecutor` join
+/// its OS thread.
 pub fn get_or_create_engine(
     table_url: &Url,
     config: &DeltaStorageConfig,
@@ -185,13 +215,37 @@ pub fn get_or_create_engine(
     // construction. Multi-threaded JNI callers serialize here on first miss per key
     // but proceed lock-free on subsequent hits via the returned Arc clone.
     let mut cache = engine_cache().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(existing) = cache.get(&key) {
-        return Ok(Arc::clone(existing));
+    cache.counter = cache.counter.wrapping_add(1);
+    let stamp = cache.counter;
+    if let Some(entry) = cache.map.get_mut(&key) {
+        // Hit: bump the LRU stamp and return the existing Arc.
+        entry.1 = stamp;
+        return Ok(Arc::clone(&entry.0));
+    }
+    // Miss: build a fresh engine. If the cache is at capacity, evict the LRU entry
+    // first so the bound is respected.
+    if cache.map.len() >= MAX_CACHE_ENTRIES {
+        if let Some(victim_key) = cache
+            .map
+            .iter()
+            .min_by_key(|(_, (_, s))| *s)
+            .map(|(k, _)| k.clone())
+        {
+            cache.map.remove(&victim_key);
+        }
     }
     let store = create_object_store(table_url, config)?;
     let engine = Arc::new(DefaultEngine::new(store));
-    cache.insert(key, Arc::clone(&engine));
+    cache.map.insert(key, (Arc::clone(&engine), stamp));
     Ok(engine)
+}
+
+/// Test-only: clear the cache so tests don't see entries from prior tests.
+#[cfg(test)]
+pub(crate) fn _clear_cache_for_tests() {
+    let mut cache = engine_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.map.clear();
+    cache.counter = 0;
 }
 
 #[cfg(test)]
@@ -378,6 +432,62 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&e_file, &e_creds),
             "differing config keys must yield distinct engines"
+        );
+    }
+
+    #[test]
+    fn get_or_create_engine_evicts_lru_when_full() {
+        _clear_cache_for_tests();
+        // Build MAX_CACHE_ENTRIES distinct engines, each with a distinct credential
+        // tuple so they all key uniquely against the same local URL.
+        let urls_and_engines: Vec<(String, Arc<DeltaEngine>)> = (0..MAX_CACHE_ENTRIES)
+            .map(|i| {
+                let cfg = DeltaStorageConfig {
+                    aws_access_key: Some(format!("key-{i}")),
+                    ..Default::default()
+                };
+                let url_s = format!("file:///tmp/lru-{i}");
+                let eng = get_or_create_engine(&url(&url_s), &cfg).unwrap();
+                (format!("key-{i}"), eng)
+            })
+            .collect();
+
+        // Cache is now exactly full.
+        assert_eq!(
+            engine_cache().lock().unwrap().map.len(),
+            MAX_CACHE_ENTRIES,
+            "cache should be at capacity after filling it"
+        );
+
+        // Touch entry 1 so it becomes most-recently-used. Entry 0 is now LRU.
+        let cfg_1 = DeltaStorageConfig {
+            aws_access_key: Some(urls_and_engines[1].0.clone()),
+            ..Default::default()
+        };
+        let _hit_1 = get_or_create_engine(&url("file:///tmp/lru-1"), &cfg_1).unwrap();
+
+        // Insert one more -- entry 0 (LRU after the touch) should be evicted.
+        let cfg_new = DeltaStorageConfig {
+            aws_access_key: Some("key-new".into()),
+            ..Default::default()
+        };
+        let _new = get_or_create_engine(&url("file:///tmp/lru-new"), &cfg_new).unwrap();
+
+        assert_eq!(
+            engine_cache().lock().unwrap().map.len(),
+            MAX_CACHE_ENTRIES,
+            "cache size should stay at capacity after eviction"
+        );
+
+        // Hitting key-0 again should construct a fresh engine (not return the original Arc).
+        let cfg_0 = DeltaStorageConfig {
+            aws_access_key: Some(urls_and_engines[0].0.clone()),
+            ..Default::default()
+        };
+        let fresh_0 = get_or_create_engine(&url("file:///tmp/lru-0"), &cfg_0).unwrap();
+        assert!(
+            !Arc::ptr_eq(&urls_and_engines[0].1, &fresh_0),
+            "key-0 was LRU and should have been evicted -> fresh engine on re-insert"
         );
     }
 }

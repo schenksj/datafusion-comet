@@ -41,7 +41,7 @@ import org.apache.comet.serde.CometOperatorSerde
  * No `SPI`, no `ServiceLoader`, no registry: the contrib provides its own static helper objects
  * with stable names; this bridge just calls them.
  */
-object DeltaIntegration {
+object DeltaIntegration extends org.apache.spark.internal.Logging {
 
   // Scala compiles `object Foo` into BOTH `Foo.class` (a static-forwarder class) AND
   // `Foo$.class` (the actual module class). Only the latter has the `MODULE$` singleton
@@ -117,7 +117,10 @@ object DeltaIntegration {
             classOf[HadoopFsRelation])
           Some((module, m))
         } catch {
-          case _: Exception => None
+          // Only swallow true reflection-binding failures (signature/access drift).
+          // Other exceptions (linkage errors, init failures) should surface.
+          case _: NoSuchMethodException | _: NoSuchFieldException | _: IllegalAccessException =>
+            None
         }
       }
       transformV1IfDeltaBindingCache = Some(binding)
@@ -135,9 +138,19 @@ object DeltaIntegration {
           .map(_.asInstanceOf[Option[SparkPlan]])
           .flatten
       } catch {
-        // scalastyle:off
-        case _: Exception => None
-        // scalastyle:on
+        // Reflection invocation errors (signature drift / access) -> silent None.
+        case _: IllegalAccessException | _: IllegalArgumentException =>
+          None
+        // The contrib's transform threw a real exception -- DON'T silently swallow;
+        // surface it as a log warning + decline. Without this, kernel-rs IO errors,
+        // CCE on a Delta version bump, NPE in the CM-id translator etc. would
+        // silently fall back to vanilla and the user would never know Comet declined.
+        case e: java.lang.reflect.InvocationTargetException =>
+          logWarning(
+            s"CometDeltaNativeScan.transformV1IfDelta threw, declining to vanilla Delta " +
+              s"for this scan",
+            Option(e.getCause).getOrElse(e))
+          None
       }
     }
   }
@@ -153,7 +166,10 @@ object DeltaIntegration {
       val module = cls.getField("MODULE$").get(null)
       Some(module.asInstanceOf[CometOperatorSerde[CometScanExec]])
     } catch {
-      case _: Exception => None
+      // Only swallow true reflection-binding failures. A ClassCastException here
+      // would mean the contrib's serde object doesn't implement the expected trait
+      // -- a real bug worth surfacing.
+      case _: NoSuchFieldException | _: IllegalAccessException => None
     }
   }
 }
