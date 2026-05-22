@@ -796,6 +796,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       val lc = name.toLowerCase(Locale.ROOT)
       sparkMetadataNameSet.contains(lc) ||
         lc == "base_row_id" ||
+        lc == "default_row_commit_version" ||
         lc.startsWith("_row-id-col-") ||
         lc.startsWith("_row-commit-version-col-")
     }
