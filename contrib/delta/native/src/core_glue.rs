@@ -17,11 +17,24 @@
 
 //! `OpStruct::DeltaScan` planner body, feature-gated behind `contrib-delta`.
 //!
-//! This module mirrors the size and shape of the `OpStruct::IcebergScan` arm in
-//! `super::planner` -- the arm itself stays tiny (just dispatches here), and the
+//! **Where this file lives vs. where it is compiled.**
+//!
+//! Physically this file is co-located with the rest of the Delta integration
+//! under `contrib/delta/native/src/`. It is *compiled* as a module of the core
+//! crate via `#[path = "../../../../contrib/delta/native/src/core_glue.rs"]`
+//! at `native/core/src/execution/planner.rs`. The reason: this file implements
+//! `PhysicalPlanner::plan_delta_scan` and reaches into core's `pub(crate)`
+//! helpers (`create_expr`, `init_datasource_exec`,
+//! `prepare_object_store_with_configs`). A true cross-crate `impl` block is
+//! forbidden by Rust, and a `contrib -> core` cargo dependency would create a
+//! cycle with core's optional `contrib-delta` dep on contrib, so `#[path]` is
+//! the available tool that lets the FILE's home be with Delta while its
+//! COMPILATION unit stays in core.
+//!
 //! Delta-specific algorithmic pieces (DV filter exec wrapping, column-mapping
-//! rename projection, partition value parsing) live in the
-//! [`comet_contrib_delta`] crate.
+//! rename projection, partition value parsing, synthetic column emission, kernel
+//! log replay) all live in the [`comet_contrib_delta`] crate proper. This file
+//! is the glue that wires those pieces into core's plan-tree builder.
 
 #![cfg(feature = "contrib-delta")]
 

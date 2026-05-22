@@ -21,7 +21,17 @@ pub mod expression_registry;
 pub mod macros;
 pub mod operator_registry;
 
+// The DeltaScan dispatcher body lives PHYSICALLY under `contrib/delta/native/src/`
+// (next to the rest of the Delta integration) but is compiled HERE as part of the
+// core crate because it implements `PhysicalPlanner::plan_delta_scan` and uses
+// core's `pub(crate)` helpers (`create_expr`, `init_datasource_exec`,
+// `prepare_object_store_with_configs`). Rust forbids a true cross-crate `impl`
+// block, and cargo forbids a contrib→core dep (cycle with core's optional dep on
+// contrib), so `#[path]` is what lets the file's HOME be with Delta while its
+// COMPILATION unit stays in core. Build gate (`cfg(feature = "contrib-delta")`)
+// is preserved -- default builds carry zero Delta surface.
 #[cfg(feature = "contrib-delta")]
+#[path = "../../../../contrib/delta/native/src/core_glue.rs"]
 mod contrib_delta_scan;
 
 use crate::execution::operators::init_csv_datasource_exec;
