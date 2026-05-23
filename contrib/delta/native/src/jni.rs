@@ -262,33 +262,59 @@ fn has_uri_scheme(s: &str) -> bool {
 /// [`DeltaStorageConfig`]. Checks both kernel-style keys (`aws_access_key_id`)
 /// and Hadoop-style keys (`fs.s3a.access.key`) since Comet's
 /// `NativeConfig.extractObjectStoreOptions` passes the latter.
+///
+/// Reads the JMap into a Rust `HashMap` and delegates to
+/// [`delta_storage_config_from_map`] for the actual key mapping. Splitting
+/// the JNI traversal from the mapping logic lets the mapping be unit-tested
+/// without a JVM.
 fn extract_storage_config(env: &mut Env, jmap: &JMap<'_>) -> CometResult<DeltaStorageConfig> {
-    // Helper: try kernel key first, fall back to Hadoop key.
-    let get = |env: &mut Env, k1: &str, k2: &str| -> CometResult<Option<String>> {
-        let v = map_get_string(env, jmap, k1)?;
-        if v.is_some() {
-            return Ok(v);
-        }
-        map_get_string(env, jmap, k2)
-    };
+    let m = jmap_to_hashmap(env, jmap)?;
+    Ok(delta_storage_config_from_map(&m))
+}
 
-    Ok(DeltaStorageConfig {
-        aws_access_key: get(env, "aws_access_key_id", "fs.s3a.access.key")?,
-        aws_secret_key: get(env, "aws_secret_access_key", "fs.s3a.secret.key")?,
-        aws_session_token: get(env, "aws_session_token", "fs.s3a.session.token")?,
-        aws_region: get(env, "aws_region", "fs.s3a.endpoint.region")?.or(map_get_string(
-            env,
-            jmap,
-            "fs.s3a.region",
-        )?),
-        aws_endpoint: get(env, "aws_endpoint", "fs.s3a.endpoint")?,
-        aws_force_path_style: get(env, "aws_force_path_style", "fs.s3a.path.style.access")?
-            .map(|s| s == "true")
-            .unwrap_or(false),
-        azure_account_name: map_get_string(env, jmap, "azure_account_name")?,
-        azure_access_key: map_get_string(env, jmap, "azure_access_key")?,
-        azure_bearer_token: map_get_string(env, jmap, "azure_bearer_token")?,
-    })
+/// Pure (JVM-free) mapping from a generic options map to [`DeltaStorageConfig`].
+///
+/// Accepts kernel-style keys (`aws_access_key_id`, `azure_account_name`, ...)
+/// AND Hadoop-style keys that Comet's `NativeConfig.extractObjectStoreOptions`
+/// produces on the Scala side (`fs.s3a.access.key`, ...). The kernel-style key
+/// wins when both are present.
+///
+/// Known gaps tracked by the credential audit:
+///   - GCS (`gs://`) is unsupported -- no `gcp_*` fields, no
+///     `fs.gs.*` translation; reads against GCS would fail at
+///     `create_object_store` with `UnsupportedScheme`.
+///   - Per-bucket S3 keys (`fs.s3a.bucket.<name>.*`) are not extracted;
+///     multi-bucket setups fall back to global creds.
+///   - Hadoop Azure connector keys (`fs.azure.account.key.<account>`,
+///     OAuth client id/secret, MSI tokens, SAS tokens) are not bridged --
+///     only the three kernel-style azure keys flow through.
+///
+/// These gaps are intentional for the initial cut: every active test path
+/// uses local-fs, and the Iceberg-style key translation should land before
+/// shipping cloud credentials in production. New cred shapes that surface
+/// in tests should grow new branches here AND a corresponding entry in
+/// [`tests::extract_storage_config_matrix`] below.
+pub fn delta_storage_config_from_map(
+    m: &std::collections::HashMap<String, String>,
+) -> DeltaStorageConfig {
+    let kernel_or_hadoop = |k1: &str, k2: &str| m.get(k1).or_else(|| m.get(k2)).cloned();
+    DeltaStorageConfig {
+        aws_access_key: kernel_or_hadoop("aws_access_key_id", "fs.s3a.access.key"),
+        aws_secret_key: kernel_or_hadoop("aws_secret_access_key", "fs.s3a.secret.key"),
+        aws_session_token: kernel_or_hadoop("aws_session_token", "fs.s3a.session.token"),
+        aws_region: kernel_or_hadoop("aws_region", "fs.s3a.endpoint.region")
+            .or_else(|| m.get("fs.s3a.region").cloned()),
+        aws_endpoint: kernel_or_hadoop("aws_endpoint", "fs.s3a.endpoint"),
+        aws_force_path_style: kernel_or_hadoop(
+            "aws_force_path_style",
+            "fs.s3a.path.style.access",
+        )
+        .map(|s| s == "true")
+        .unwrap_or(false),
+        azure_account_name: m.get("azure_account_name").cloned(),
+        azure_access_key: m.get("azure_access_key").cloned(),
+        azure_bearer_token: m.get("azure_bearer_token").cloned(),
+    }
 }
 
 /// Read a Java `String[]` into a `Vec<String>`. Returns empty vec for null arrays.
@@ -339,23 +365,6 @@ fn jmap_to_hashmap(
     Ok(out)
 }
 
-/// `map.get(key)` for a `java.util.Map<String, String>` surfaced as a
-/// `JMap`. Returns `None` if the key is absent or the value is `null`.
-fn map_get_string(env: &mut Env, jmap: &JMap<'_>, key: &str) -> CometResult<Option<String>> {
-    let key_obj = env.new_string(key)?;
-    let key_jobj: JObject = key_obj.into();
-    match jmap.get(env, &key_jobj)? {
-        None => Ok(None),
-        Some(value) => {
-            // SAFETY: Map<String, String>::get always returns a String. The
-            // JObject reference is valid because JMap::get returned it from the
-            // current env frame. We consume the local ref via into_raw().
-            let jstr = unsafe { JString::from_raw(env, value.into_raw()) };
-            Ok(Some(jstr.try_to_string(env)?))
-        }
-    }
-}
-
 // Re-export the test helpers so the integration_tests module can verify
 // `resolve_file_path` without exposing it in the public API surface.
 #[cfg(test)]
@@ -380,6 +389,130 @@ mod tests {
             resolve_file_path("file:///tmp/t/", "s3://bucket/data/part-0.parquet"),
             "s3://bucket/data/part-0.parquet"
         );
+    }
+
+    /// Cred-audit regression: full matrix of storage-option keys that the
+    /// Scala side (`NativeConfig.extractObjectStoreOptions` +
+    /// `augmentWithResolvedAwsCredentials`) is allowed to send, mapped to
+    /// the expected [`DeltaStorageConfig`] field values. When new
+    /// translation branches land here, extend this matrix so a future
+    /// silent drop is caught.
+    #[test]
+    fn extract_storage_config_matrix() {
+        use std::collections::HashMap;
+        // Case 1: Hadoop-style S3A keys (the Comet path produces these).
+        let mut hadoop_s3 = HashMap::new();
+        hadoop_s3.insert("fs.s3a.access.key".into(), "AK".into());
+        hadoop_s3.insert("fs.s3a.secret.key".into(), "SK".into());
+        hadoop_s3.insert("fs.s3a.session.token".into(), "TOK".into());
+        hadoop_s3.insert("fs.s3a.endpoint.region".into(), "us-west-2".into());
+        hadoop_s3.insert("fs.s3a.endpoint".into(), "https://s3.example".into());
+        hadoop_s3.insert("fs.s3a.path.style.access".into(), "true".into());
+        let cfg = delta_storage_config_from_map(&hadoop_s3);
+        assert_eq!(cfg.aws_access_key.as_deref(), Some("AK"));
+        assert_eq!(cfg.aws_secret_key.as_deref(), Some("SK"));
+        assert_eq!(cfg.aws_session_token.as_deref(), Some("TOK"));
+        assert_eq!(cfg.aws_region.as_deref(), Some("us-west-2"));
+        assert_eq!(cfg.aws_endpoint.as_deref(), Some("https://s3.example"));
+        assert!(cfg.aws_force_path_style);
+
+        // Case 2: Kernel-style keys WIN when both forms are present.
+        let mut both = HashMap::new();
+        both.insert("aws_access_key_id".into(), "KERNEL_AK".into());
+        both.insert("fs.s3a.access.key".into(), "HADOOP_AK".into());
+        both.insert("aws_secret_access_key".into(), "KERNEL_SK".into());
+        both.insert("fs.s3a.secret.key".into(), "HADOOP_SK".into());
+        let cfg = delta_storage_config_from_map(&both);
+        assert_eq!(cfg.aws_access_key.as_deref(), Some("KERNEL_AK"));
+        assert_eq!(cfg.aws_secret_key.as_deref(), Some("KERNEL_SK"));
+
+        // Case 3: `fs.s3a.region` is the deepest-fallback for region
+        // (after both `aws_region` and `fs.s3a.endpoint.region`).
+        let mut region_fallback = HashMap::new();
+        region_fallback.insert("fs.s3a.region".into(), "eu-central-1".into());
+        let cfg = delta_storage_config_from_map(&region_fallback);
+        assert_eq!(cfg.aws_region.as_deref(), Some("eu-central-1"));
+
+        // Case 4: Azure kernel-style keys.
+        let mut azure = HashMap::new();
+        azure.insert("azure_account_name".into(), "myacct".into());
+        azure.insert("azure_access_key".into(), "AZKEY".into());
+        azure.insert("azure_bearer_token".into(), "BEARER".into());
+        let cfg = delta_storage_config_from_map(&azure);
+        assert_eq!(cfg.azure_account_name.as_deref(), Some("myacct"));
+        assert_eq!(cfg.azure_access_key.as_deref(), Some("AZKEY"));
+        assert_eq!(cfg.azure_bearer_token.as_deref(), Some("BEARER"));
+
+        // Case 5: empty map -> all defaults (no creds, force_path_style=false).
+        let cfg = delta_storage_config_from_map(&HashMap::new());
+        assert!(cfg.aws_access_key.is_none());
+        assert!(cfg.aws_secret_key.is_none());
+        assert!(cfg.aws_session_token.is_none());
+        assert!(cfg.aws_region.is_none());
+        assert!(cfg.aws_endpoint.is_none());
+        assert!(!cfg.aws_force_path_style);
+        assert!(cfg.azure_account_name.is_none());
+    }
+
+    /// Cred-audit gap markers. These document the credential shapes that
+    /// the current implementation DOES NOT bridge through to native. Each
+    /// asserts the missing-credential state explicitly so when a fix lands
+    /// the failing assertion forces the gap entry to be removed (and a
+    /// positive case added to `extract_storage_config_matrix`).
+    #[test]
+    fn extract_storage_config_known_gaps() {
+        use std::collections::HashMap;
+        // Gap 1: GCS service-account / OAuth keys aren't bridged. Hadoop
+        // surfaces these under `fs.gs.*`; iceberg-rust uses `gcs.*`.
+        // DeltaStorageConfig has no `gcp_*` fields at all -- reads against
+        // `gs://` would fail at `create_object_store` with
+        // UnsupportedScheme. Tracked in #183 follow-up.
+        let mut gcs = HashMap::new();
+        gcs.insert(
+            "fs.gs.auth.service.account.json.keyfile".into(),
+            "/tmp/key.json".into(),
+        );
+        gcs.insert("fs.gs.project.id".into(), "my-project".into());
+        let cfg = delta_storage_config_from_map(&gcs);
+        // Everything stays None -- the GCS keys are silently dropped.
+        assert!(cfg.aws_access_key.is_none());
+        assert!(cfg.azure_account_name.is_none());
+
+        // Gap 2: per-bucket S3 keys (`fs.s3a.bucket.<name>.access.key`)
+        // aren't bridged. Multi-bucket setups silently fall back to global
+        // creds (or fail when none are set).
+        let mut per_bucket = HashMap::new();
+        per_bucket.insert(
+            "fs.s3a.bucket.my-bucket.access.key".into(),
+            "PERBKT_AK".into(),
+        );
+        let cfg = delta_storage_config_from_map(&per_bucket);
+        assert!(
+            cfg.aws_access_key.is_none(),
+            "per-bucket S3 key was unexpectedly bridged; if intentional, \
+             move this case into extract_storage_config_matrix"
+        );
+
+        // Gap 3: Hadoop's Azure connector key formats (storage-account key,
+        // OAuth, MSI, SAS) aren't bridged -- only the three kernel-style
+        // azure keys flow through.
+        let mut hadoop_azure = HashMap::new();
+        hadoop_azure.insert(
+            "fs.azure.account.key.myacct.blob.core.windows.net".into(),
+            "HADOOP_AZKEY".into(),
+        );
+        hadoop_azure.insert(
+            "fs.azure.account.oauth2.client.id".into(),
+            "CLIENT_ID".into(),
+        );
+        hadoop_azure.insert(
+            "fs.azure.account.oauth2.client.secret".into(),
+            "CLIENT_SECRET".into(),
+        );
+        let cfg = delta_storage_config_from_map(&hadoop_azure);
+        assert!(cfg.azure_account_name.is_none());
+        assert!(cfg.azure_access_key.is_none());
+        assert!(cfg.azure_bearer_token.is_none());
     }
 
     #[test]
