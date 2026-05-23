@@ -138,13 +138,15 @@ class CometDeltaTypeRoundTripAuditSuite extends CometDeltaTestBase {
     }
   }
 
-  // DISCOVERED GAP (audit found): column-mapping name/id mode + complex
-  // types / post-rename reads trigger an AQE assertion in
-  // AdaptiveSparkPlanExec.setLogicalLinkForNewQueryStage. Likely a
-  // missing/mismatched logical link on the native scan's serialized
-  // physical node. Logged as a follow-up; the audit tests below stay as
-  // expected-to-fail markers so when the AQE fix lands we promote them.
-  test("GAP: column mapping mode=name + complex types -- AQE logical-link assertion") {
+  // Regression: column-mapping mode + a shuffle above the native scan
+  // (orderBy / join / aggregate) once tripped
+  // AdaptiveSparkPlanExec.setLogicalLinkForNewQueryStage's assertion. Root
+  // cause: in CM mode the wrapped FileSourceScanExec lacks a logicalLink
+  // even though the surrounding CometScanExec has one, so the contrib's
+  // exec inherited none and CometExecRule's link-setup pass unset the tag.
+  // Fixed by seeding the link from `op.logicalLink` as a fallback
+  // (CometDeltaNativeScan.nativeDeltaScan). These MUST now match vanilla.
+  test("column mapping mode=name + complex types + orderBy round-trip") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("type_cm_name") { tablePath =>
       spark.sql(
@@ -159,18 +161,11 @@ class CometDeltaTypeRoundTripAuditSuite extends CometDeltaTestBase {
         s"""INSERT INTO delta.`$tablePath` VALUES
            |(1, NAMED_STRUCT('a', 1, 'b', 'x'), ARRAY(1,2)),
            |(2, NULL, ARRAY())""".stripMargin)
-      val ex = intercept[org.apache.spark.SparkException] {
-        assertDeltaNativeMatches(tablePath, _.orderBy("id"))
-      }
-      assert(
-        Option(ex.getCause).exists(_.isInstanceOf[AssertionError]),
-        s"GAP CLOSED or shape changed: expected AssertionError cause, got " +
-          s"${Option(ex.getCause).map(_.getClass.getName).getOrElse("none")}. " +
-          "If AQE no longer asserts, promote this test to a positive matches check.")
+      assertDeltaNativeMatches(tablePath, _.orderBy("id"))
     }
   }
 
-  test("GAP: column mapping mode=id post-rename -- AQE logical-link assertion") {
+  test("column mapping mode=id post-rename + orderBy round-trip") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("type_cm_id_rename") { tablePath =>
       spark.sql(
@@ -183,14 +178,29 @@ class CometDeltaTypeRoundTripAuditSuite extends CometDeltaTestBase {
       spark.sql(s"INSERT INTO delta.`$tablePath` VALUES (1,'a'),(2,'b')")
       spark.sql(s"ALTER TABLE delta.`$tablePath` RENAME COLUMN name TO label")
       spark.sql(s"INSERT INTO delta.`$tablePath` VALUES (3,'c')")
-      val ex = intercept[org.apache.spark.SparkException] {
-        assertDeltaNativeMatches(tablePath, _.orderBy("id"))
-      }
-      assert(
-        Option(ex.getCause).exists(_.isInstanceOf[AssertionError]),
-        s"GAP CLOSED or shape changed: expected AssertionError cause, got " +
-          s"${Option(ex.getCause).map(_.getClass.getName).getOrElse("none")}. " +
-          "If AQE no longer asserts, promote this test to a positive matches check.")
+      // Old files still carry the original physical column name; native must
+      // resolve via field-id, not by logical name.
+      assertDeltaNativeMatches(tablePath, _.orderBy("id"))
+    }
+  }
+
+  // Direct regression for the CM-mode + shuffle logical-link bug with the
+  // simplest possible shape (simple types) -- this is what isolated the
+  // root cause from "complex types".
+  test("column mapping mode=name + simple types + orderBy (logical-link regression)") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("type_cm_simple") { tablePath =>
+      spark.sql(
+        s"""CREATE TABLE delta.`$tablePath` (id INT, v STRING)
+           |USING delta
+           |TBLPROPERTIES (
+           |  'delta.columnMapping.mode' = 'name',
+           |  'delta.minReaderVersion' = '2',
+           |  'delta.minWriterVersion' = '5')""".stripMargin)
+      spark.sql(s"INSERT INTO delta.`$tablePath` VALUES (1,'a'),(2,'b'),(3,'c')")
+      assertDeltaNativeMatches(tablePath, _.orderBy("id"))
+      // Aggregate also introduces a shuffle.
+      assertDeltaNativeMatches(tablePath, _.groupBy("v").count())
     }
   }
 

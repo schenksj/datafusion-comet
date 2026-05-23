@@ -1477,7 +1477,21 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // CometDeltaNativeScanExec hit the assertion when the AQE optimizer tries to wrap
     // them (especially under spark.sql.adaptive.forceApply and on column-mapping
     // rewritten plans).
-    op.wrapped.logicalLink.foreach(exec.setLogicalLink)
+    // Propagate the logical link, falling back from the wrapped scan to the
+    // CometScanExec itself. The built-in CometExecRule runs a later "set up
+    // logical links" pass that re-derives THIS exec's link from
+    // `exec.originalPlan.logicalLink` (== `op.wrapped.logicalLink`) and
+    // UNSETS the tag when that's empty -- which would discard a link we set
+    // only on the exec. In column-mapping mode the wrapped FileSourceScanExec
+    // can lack a logicalLink even though the surrounding CometScanExec has one
+    // (Delta builds the CM scan without propagating it), so any plan with a
+    // shuffle above the scan (orderBy / join / aggregate) tripped
+    // AdaptiveSparkPlanExec.setLogicalLinkForNewQueryStage's assertion. Seed
+    // the wrapped scan's link from `op`'s so both passes agree, then set it on
+    // the exec too.
+    val link = op.wrapped.logicalLink.orElse(op.logicalLink)
+    link.foreach(op.wrapped.setLogicalLink)
+    link.foreach(exec.setLogicalLink)
     exec
   }
 }
