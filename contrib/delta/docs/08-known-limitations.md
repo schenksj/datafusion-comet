@@ -209,7 +209,7 @@ The originally-"untriaged" failures resolve into:
   subquery" is the same `CometSubqueryAdaptiveBroadcastExec` DPP crash as B2 —
   fixed by `64cd878a`. Confirm via re-run.
 
-### B5. Deeply-nested data-skipping expression — protobuf recursion limit — PENDING
+### B5. Deeply-nested data-skipping expression — protobuf recursion limit — FIXED
 
 - **Test:** "remove redundant stats column references in data skipping
   expression" (+ "old behavior with DataFrame schema" variant), from
@@ -218,11 +218,18 @@ The originally-"untriaged" failures resolve into:
   expression; serializing it to Comet's native proto exceeds protobuf's default
   recursion limit (100): `InvalidProtocolBufferException: Protocol message had
   too many levels of nesting` from `ExprOuterClass$BinaryExpr.mergeFrom`.
-- **Fix direction:** raise the proto parse recursion limit
-  (`CodedInputStream.setRecursionLimit`) where Comet parses the plan/expr, or
-  rebalance/flatten deep AND/OR chains before serialization.
-- **Repro:** `CometDeltaPendingReproSuite` ("F4: deeply-nested data-skipping
-  filter ..."), `ignore`d until fixed.
+- **Parse site:** `CometNativeExec.findShuffleScanIndices`
+  (`OperatorOuterClass.Operator.parseFrom`) re-parses the serialized plan; a
+  `CometFilter` carrying the 202-conjunct left-deep `And` is a deep `BinaryExpr`.
+- **Fix (base Comet):** balance associative `And`/`Or` chains at serialization so
+  the proto is O(log n) deep instead of O(n) -- `CometAnd`/`CometOr` flatten the
+  chain (`flattenAssociative`) and emit a balanced `BinaryExpr` tree
+  (`QueryPlanSerde.createBalancedBinaryExpr`). Comet evaluates And/Or
+  vectorially (both sides always evaluated), so rebalancing is semantically
+  identical. This is a CORE Comet change (not contrib-only) -- flag in the PR.
+- **Guard:** `CometDeltaPendingReproSuite` ("F4: deeply-nested data-skipping
+  filter ...", now a passing `test`). Verified no regression in base
+  `CometExpressionSuite` (123 tests).
 
 ### B6. Corrupted-file read error compatibility (SC-8810) — PENDING
 

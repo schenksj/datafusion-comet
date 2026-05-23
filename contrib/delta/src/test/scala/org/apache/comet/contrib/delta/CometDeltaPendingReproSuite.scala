@@ -25,28 +25,26 @@ import org.apache.spark.sql.functions._
 // not yet fixed on this branch. One faithful, minimal repro per root cause so
 // each can be diagnosed and fixed (and kept as a regression guard afterward).
 //
-// Status when written:
-//   F3 (row tracking)      -- FIXED; guard now in CometDeltaRowTrackingMaterializedSuite
-//   F4 (protobuf recursion)-- PENDING
-//   F6 (corrupted file)    -- PENDING
+// Status:
+//   F3 (row tracking)      -- FIXED; guard in CometDeltaRowTrackingMaterializedSuite
+//   F4 (protobuf recursion)-- FIXED; the passing `test` below now guards it
+//   F6 (corrupted file)    -- PENDING; `ignore`d repro below
 //
-// Each test asserts the EXPECTED (correct) behavior and is marked `ignore` so
-// CI stays green while the bug is open. It is a confirmed repro: un-`ignore` it
-// (change `ignore(` -> `test(`) to watch it fail today and pass once the
-// corresponding fix lands. Verified failing at the time of writing (see commit
-// message / docs/08-known-limitations.md).
+// `ignore`d tests are confirmed repros asserting correct behavior; un-`ignore`
+// (change `ignore(` -> `test(`) to watch one fail today and pass once fixed.
 class CometDeltaPendingReproSuite extends CometDeltaTestBase {
 
-  // === F4: deeply-nested data-skipping expression -> protobuf recursion =====
+  // === F4 (FIXED): deeply-nested data-skipping expression -> protobuf recursion
   //
   // Mirrors DataSkippingDeltaTests "remove redundant stats column references in
   // data skipping expression". A WHERE with ~101 AND'd conditions builds a very
-  // deep boolean expression; serializing it to Comet's native proto exceeds
-  // protobuf's default recursion limit (100), throwing
-  // "Protocol message had too many levels of nesting" from BinaryExpr.mergeFrom.
-  // Expected: the query runs.
+  // deep boolean expression; serializing it left-deep made the plan proto exceed
+  // protobuf's default recursion limit (100) when re-parsed
+  // (CometNativeExec.findShuffleScanIndices), throwing "Protocol message had too
+  // many levels of nesting". Fixed by balancing And/Or chains in base Comet's
+  // serializer (QueryPlanSerde.createBalancedBinaryExpr). Kept as a guard.
 
-  ignore("F4: deeply-nested data-skipping filter does not overflow protobuf nesting") {
+  test("F4: deeply-nested data-skipping filter does not overflow protobuf nesting") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     val tbl = "f4_deep_filter"
     withTable(tbl) {
