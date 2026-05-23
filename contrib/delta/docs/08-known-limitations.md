@@ -157,7 +157,7 @@ predicates - ... updates and inserts", "extended syntax - ...", "unlimited
 clauses - ...". Guard: `CometDeltaDppReproSuite`. Pruning in the join case
 remains (A1 / #198).
 
-### B3. Row tracking — materialized row-id / row-commit-version columns — PENDING
+### B3. Row tracking — materialized row-id / row-commit-version columns — FIXED
 
 - **Tests (~18):** "z-order {un,}partitioned table with {fresh,stable} row IDs
   (+ filter)", "z-order preserves row tracking on backfill enabled tables",
@@ -174,12 +174,21 @@ remains (A1 / #198).
   scan classifies those names as synthetic (`isExtraSyntheticName`) and
   synthesizes from `base_row_id + row_index` instead of reading the persisted
   values, so the coalesce falls back to the wrong synthesized id.
-- **Fix direction:** When the file has a materialized row-id /
-  row-commit-version column, read it from parquet (don't synthesize).
+- **Fix:** `CometDeltaNativeScan.convert` now treats `_row-id-col-*` /
+  `_row-commit-version-col-*` as REAL parquet columns: they are added to the
+  file data schema (`materializedRowTrackingFields`) and read by name (null for
+  files that don't carry them), and removed from every synthetic classification
+  (`isSynthetic`, `isExtraSyntheticName`, `metadataColumnNamesEmitted`, the
+  projection-vector `isSyntheticFieldName`). The downstream `coalesce` then uses
+  the persisted stable value when present and falls back to base+index only when
+  null. `base_row_id` / `row_index` / `default_row_commit_version` remain
+  synthesised. Filter pushdown on these columns stays conservatively disabled.
+- **Guard:** `CometDeltaRowTrackingMaterializedSuite` (row IDs stable across
+  OPTIMIZE / UPDATE; materialised row_commit_version matches vanilla). Verified
+  no regression across 55 contrib tests. Full Delta-suite verification of the
+  RowTracking{Merge,Delete,Compaction,ReadWrite} families pending the next
+  full regression re-run.
 - **Tracking:** internal task #197 (F3).
-
-  Repro: `CometDeltaPendingReproSuite` ("F3: row IDs are stable across
-  OPTIMIZE"), `ignore`d until fixed.
 
 ### B4. Triage of remaining failures
 
@@ -194,7 +203,8 @@ The originally-"untriaged" failures resolve into:
   all live in `rowid/RowTracking{Merge,Delete,...}Suite` and fail the same way:
   a stable row ID changes across a rewrite (e.g. "Row ID has change for row with
   stored_id = 412"). Same root cause as B3 — the native scan synthesizes row IDs
-  instead of reading the materialized columns. Fixing B3/F3 should clear these.
+  instead of reading the materialized columns. **Addressed by the B3/F3 fix**;
+  pending confirmation in the next full regression re-run.
 - **F1 (already fixed).** "data skipping shouldn't use expressions involving a
   subquery" is the same `CometSubqueryAdaptiveBroadcastExec` DPP crash as B2 —
   fixed by `64cd878a`. Confirm via re-run.

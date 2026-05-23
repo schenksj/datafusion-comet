@@ -116,6 +116,19 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
    * Fields without `delta.columnMapping.id` are passed through unchanged (e.g. partition
    * columns, synthetic row-index columns, struct-leaf fields the metadata strip elided).
    */
+  /**
+   * True for Delta's MATERIALISED row-tracking column names
+   * (`_row-id-col-<uuid>` / `_row-commit-version-col-<uuid>`). These are real parquet
+   * columns persisted when a file is rewritten to keep row IDs stable, read from the
+   * file by name -- NOT synthesised. (Distinct from the logical `row_id` /
+   * `row_commit_version` synthetic columns, which ARE synthesised from baseRowId +
+   * row_index when no materialised column exists.)
+   */
+  private[delta] def isMaterializedRowTrackingName(name: String): Boolean = {
+    val lc = name.toLowerCase(Locale.ROOT)
+    lc.startsWith("_row-id-col-") || lc.startsWith("_row-commit-version-col-")
+  }
+
   private[delta] def translateDeltaFieldIdToParquet(field: StructField): StructField = {
     val newDataType = translateDataTypeFieldIds(field.dataType)
     val newMetadata =
@@ -673,9 +686,25 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // `relation.dataSchema`. Mirrors what delta-kernel itself reports as the scan schema.
     val partitionNames =
       relation.partitionSchema.fields.map(_.name.toLowerCase(Locale.ROOT)).toSet
+    // Materialised row-tracking columns (`_row-id-col-<uuid>` /
+    // `_row-commit-version-col-<uuid>`) are REAL parquet columns written when a file is
+    // rewritten (OPTIMIZE / z-order / compaction / MERGE) to persist stable row IDs.
+    // They are NOT in `relation.dataSchema` (row tracking is metadata, not the logical
+    // schema), but they ARE in `scan.requiredSchema`, matched in the file BY NAME. Add
+    // them to the file data schema so the native parquet reader actually reads them
+    // (returning null for files that don't carry them -- unmaterialised -- which is
+    // exactly what Delta's downstream `coalesce(_metadata.row_id, base_row_id +
+    // row_index)` needs). Treating them as synthetic (the previous behaviour) made the
+    // scan synthesise base_row_id+row_index instead, so row IDs were not stable across
+    // rewrites. See F3 in docs/08-known-limitations.md.
+    val materializedRowTrackingFields: Array[StructField] =
+      scan.requiredSchema.fields
+        .filter(f => CometDeltaNativeScan.isMaterializedRowTrackingName(f.name))
+        .map(f => StructField(f.name, f.dataType, f.nullable))
     val fileDataSchemaFields =
       relation.dataSchema.fields.filterNot(f =>
-        partitionNames.contains(f.name.toLowerCase(Locale.ROOT)))
+        partitionNames.contains(f.name.toLowerCase(Locale.ROOT))) ++
+        materializedRowTrackingFields
 
     // When column mapping (id or name) is active, Delta writes parquet files using physical
     // names at EVERY level of nesting -- struct inner fields, array elements, map keys/values.
@@ -806,11 +835,12 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       "file_modification_time")
     def isExtraSyntheticName(name: String): Boolean = {
       val lc = name.toLowerCase(Locale.ROOT)
+      // NOTE: materialised row-tracking columns (`_row-id-col-*` /
+      // `_row-commit-version-col-*`) are deliberately NOT here -- they are real
+      // parquet columns read from the file (added to the data schema), not synthesised.
       sparkMetadataNameSet.contains(lc) ||
         lc == "base_row_id" ||
-        lc == "default_row_commit_version" ||
-        lc.startsWith("_row-id-col-") ||
-        lc.startsWith("_row-commit-version-col-")
+        lc == "default_row_commit_version"
     }
     val extraMetadataFields: Array[StructField] = scan.output.toArray.collect {
       case a if isExtraSyntheticName(a.name) &&
@@ -902,10 +932,10 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       "base_row_id",
       "default_row_commit_version")
     val isSynthetic = (f: StructField) => {
-      val lc = f.name.toLowerCase(Locale.ROOT)
-      syntheticNames.contains(lc) ||
-        lc.startsWith("_row-id-col-") ||
-        lc.startsWith("_row-commit-version-col-")
+      // Materialised row-tracking columns are NOT synthetic -- they are read from
+      // parquet (see `materializedRowTrackingFields`), so they must stay in the
+      // proto data/required schemas.
+      syntheticNames.contains(f.name.toLowerCase(Locale.ROOT))
     }
     // metadataColumnNames includes the Spark `_metadata.*` virtual columns (file_path,
     // file_name, file_size, file_block_start, file_block_length, file_modification_time)
@@ -947,11 +977,9 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // scan.output and pick out the metadata-style columns in the order they appear.
     val metadataColumnNamesEmitted: Seq[String] = scan.output.flatMap { attr =>
       val lc = attr.name.toLowerCase(Locale.ROOT)
-      if (fixedMetadataNames.contains(lc) ||
-        lc.startsWith("_row-id-col-") ||
-        lc.startsWith("_row-commit-version-col-")) {
-        Some(lc)
-      } else None
+      // Materialised row-tracking columns are read from parquet, not synthesised, so
+      // they are excluded here.
+      if (fixedMetadataNames.contains(lc)) Some(lc) else None
     }.distinct
     val needsMetadataEmit = metadataColumnNamesEmitted.nonEmpty
     val needsSyntheticEmit =
@@ -1092,11 +1120,11 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // (e.g. relation.dataSchema = [id, __delta_internal_is_row_deleted] on
     // a DV-rewritten Delta CDC scan) makes partition indexes overshoot the
     // native schema length, panicking `ProjectionExprs::from_indices`.
+    // Consistent with `isSynthetic`: materialised row-tracking columns are data
+    // columns (in fileDataSchemaFields), so they must NOT be filtered out here --
+    // otherwise the projection vector wouldn't map them to the parquet read.
     val isSyntheticFieldName = (name: String) => {
-      val lc = name.toLowerCase(Locale.ROOT)
-      syntheticNames.contains(lc) ||
-        lc.startsWith("_row-id-col-") ||
-        lc.startsWith("_row-commit-version-col-")
+      syntheticNames.contains(name.toLowerCase(Locale.ROOT))
     }
     val nonSyntheticDataIdxByName: Map[String, Int] =
       fileDataSchemaFields

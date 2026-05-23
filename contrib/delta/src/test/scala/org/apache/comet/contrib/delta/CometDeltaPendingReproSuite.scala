@@ -25,8 +25,8 @@ import org.apache.spark.sql.functions._
 // not yet fixed on this branch. One faithful, minimal repro per root cause so
 // each can be diagnosed and fixed (and kept as a regression guard afterward).
 //
-// Status when written (after F1 DPP / F2 time-travel / #198 fixes landed):
-//   F3 (row tracking)      -- PENDING; dominant family (all RowTracking* suites)
+// Status when written:
+//   F3 (row tracking)      -- FIXED; guard now in CometDeltaRowTrackingMaterializedSuite
 //   F4 (protobuf recursion)-- PENDING
 //   F6 (corrupted file)    -- PENDING
 //
@@ -36,56 +36,6 @@ import org.apache.spark.sql.functions._
 // corresponding fix lands. Verified failing at the time of writing (see commit
 // message / docs/08-known-limitations.md).
 class CometDeltaPendingReproSuite extends CometDeltaTestBase {
-
-  // === F3: row tracking -- materialized stable row IDs ======================
-  //
-  // Mirrors RowTracking{Merge,Compaction,ReadWrite}Suite. When a file is
-  // rewritten (OPTIMIZE / z-order / compaction / MERGE), Delta preserves stable
-  // row IDs by MATERIALIZING them into real parquet columns
-  // `_row-id-col-<uuid>` / `_row-commit-version-col-<uuid>`. The Spark plan then
-  // reads `coalesce(_metadata.row_id, base_row_id + row_index)`. The native scan
-  // classifies those names as synthetic (`isExtraSyntheticName`) and synthesizes
-  // from `base_row_id + row_index` instead of reading the persisted values --
-  // so after a rewrite the row IDs CHANGE (new file => new base+index) instead
-  // of staying stable. Expected: row IDs are stable across OPTIMIZE.
-
-  ignore("F3: row IDs are stable across OPTIMIZE (materialized row-id columns)") {
-    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
-    withDeltaTable("f3_rowid_optimize") { tablePath =>
-      val ss = spark
-      import ss.implicits._
-      // Multiple files so OPTIMIZE actually compacts/rewrites.
-      (0 until 100)
-        .map(i => (i.toLong, s"v_$i"))
-        .toDF("id", "v")
-        .repartition(5)
-        .write
-        .format("delta")
-        .option("delta.enableRowTracking", "true")
-        .option("delta.minReaderVersion", "3")
-        .option("delta.minWriterVersion", "7")
-        .save(tablePath)
-
-      def rowIdsByValue(): Map[String, Long] =
-        spark.read.format("delta").load(tablePath)
-          .select(col("v"), col("_metadata.row_id").as("rid"))
-          .collect()
-          .map(r => r.getString(0) -> r.getLong(1))
-          .toMap
-
-      val before = rowIdsByValue()
-      // OPTIMIZE compacts the 5 files into 1, rewriting + materializing row IDs.
-      spark.sql(s"OPTIMIZE delta.`$tablePath`")
-      val after = rowIdsByValue()
-
-      assert(before.nonEmpty && before.size == 100, s"setup: ${before.size} rows")
-      val changed = before.keys.filter(k => before(k) != after.getOrElse(k, -1L)).toSeq.sorted
-      assert(
-        changed.isEmpty,
-        s"row IDs must be stable across OPTIMIZE; changed for ${changed.size} rows, " +
-          s"e.g. ${changed.take(3).map(k => s"$k: ${before(k)} -> ${after.get(k)}").mkString(", ")}")
-    }
-  }
 
   // === F4: deeply-nested data-skipping expression -> protobuf recursion =====
   //
