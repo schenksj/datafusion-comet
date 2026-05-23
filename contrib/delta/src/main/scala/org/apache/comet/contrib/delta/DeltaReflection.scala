@@ -503,17 +503,16 @@ object DeltaReflection extends Logging {
     try {
       // PreparedDeltaFileIndex carries the pre-skipped scan result. Reading the
       // cached `preparedScan.files` returns whatever the FileIndex captured at
-      // construction time -- problematic when the same FileIndex is reused
-      // across DML statements (e.g. consecutive DELETEs against the same path)
-      // because the DV descriptor on the AddFile is frozen at the first
-      // construction. For PreparedDeltaFileIndex, refresh the DeltaLog snapshot
-      // via `deltaLog.update()` and read `snapshot.filesForScan(...).files` so
-      // we pick up DV descriptors written after the FileIndex was built.
-      // Fall back to `matchingFiles(Nil, Nil)`, then `preparedScan.files`, then
-      // raw `addFiles` if any of these reflection calls fail.
+      // construction time -- so its DV descriptors are frozen at construction.
+      // Re-query the scan's prepared snapshot (`preparedScan.scannedSnapshot`)
+      // via `filesForScan` to pick up the freshest DV descriptors that snapshot
+      // carries, WITHOUT switching to head (which would diverge from vanilla and
+      // break time travel -- see preparedSnapshotFiles). Fall back to
+      // `matchingFiles(Nil, Nil)`, then `preparedScan.files`, then raw `addFiles`
+      // if any of these reflection calls fail.
       val refreshedFiles: Option[AnyRef] =
         if (location.getClass.getName.contains("PreparedDeltaFileIndex")) {
-          refreshedSnapshotFiles(location, partitionFilters)
+          preparedSnapshotFiles(location, partitionFilters)
         } else None
       val matchingFilesLive: Option[AnyRef] =
         if (refreshedFiles.isEmpty &&
@@ -682,55 +681,45 @@ object DeltaReflection extends Logging {
    * compile-time dep on spark-delta, so we reach for reflection here.
    */
   /**
-   * Force-refresh the DeltaLog snapshot referenced by a `PreparedDeltaFileIndex` and re-resolve
-   * the matching files against the latest snapshot. Returns `Some(Seq[AddFile])` (typed as the
-   * raw AnyRef from the Delta API) when the refresh + re-query succeeds, `None` when reflection
-   * fails or the FileIndex isn't a `PreparedDeltaFileIndex`.
+   * Re-resolve the matching files for a `PreparedDeltaFileIndex` against the snapshot the scan was
+   * prepared against (`preparedScan.scannedSnapshot`). Returns `Some(Seq[AddFile])` (typed as the
+   * raw AnyRef from the Delta API) when the re-query succeeds, `None` when reflection fails or the
+   * FileIndex isn't a `PreparedDeltaFileIndex`.
    *
-   * Why: `preparedScan.files` is captured at FileIndex construction. Consecutive DML statements
-   * on the same path (e.g. two DELETEs targeting the same parquet file) yield a stale DV
-   * descriptor when the second read reuses the cached PreparedDeltaFileIndex. `deltaLog.update`
-   * refreshes the snapshot to head, and `snapshot.filesForScan(Nil, false).files` returns the
-   * AddFiles with the freshest DV descriptors -- which is what vanilla Delta's runtime DV
-   * lookup ultimately consults.
+   * Why re-query instead of using cached `preparedScan.files`: the cached list freezes its DV
+   * descriptors at FileIndex construction; `scannedSnapshot.filesForScan(filters, false).files`
+   * returns AddFiles with the freshest DV descriptors carried by that snapshot. Why
+   * `scannedSnapshot` and not `deltaLog.update()` to head: the scanned snapshot is exactly what
+   * vanilla Spark+Delta reads (PreparedDeltaFileIndex extends
+   * TahoeFileIndexWithSnapshotDescriptor over it), so matching it keeps Comet a faithful drop-in
+   * accelerator -- including for time travel, where it's pinned to the requested version.
    */
-  private def refreshedSnapshotFiles(
+  private def preparedSnapshotFiles(
       location: Any,
       partitionFilters: Seq[org.apache.spark.sql.catalyst.expressions.Expression]): Option[AnyRef] = {
     if (location == null) return None
     try {
-      val deltaLog = findAccessor(location, Seq("deltaLog")).orNull
-      if (deltaLog == null) return None
-      // Time-travel guard: `PreparedDeltaFileIndex.versionScanned` is `Some(v)`
-      // when the query pinned a historical version (versionAsOf / timestampAsOf).
-      // Historical versions are immutable, so the DV-staleness reason for
-      // refreshing to head does NOT apply -- and refreshing to head would
-      // (incorrectly) return the LATEST files, making a time-travel read return
-      // current data. Detected via the regression's DeltaTimeTravelSuite /
-      // DeltaHistoryManager* tests (v0 returned head's 20 rows instead of 10).
-      // For time travel, use the snapshot the scan was prepared against
-      // (`preparedScan.scannedSnapshot`), which is pinned to the requested
-      // version. Only fall back to `deltaLog.update()` (head) for non-time-travel
-      // reads, where the consecutive-DELETE DV-staleness fix is needed.
-      val isTimeTravel = findAccessor(location, Seq("versionScanned")) match {
-        case Some(opt: Option[_]) => opt.isDefined
-        case _ => false
-      }
-      val snapshot: AnyRef = if (isTimeTravel) {
-        val pinned = findAccessor(location, Seq("preparedScan"))
-          .flatMap(ps => findAccessor(ps, Seq("scannedSnapshot")))
-          .orNull
-        if (pinned == null) return None
-        pinned
-      } else {
-        val updateMethod = deltaLog.getClass.getMethods.find { m =>
-          m.getName == "update" && m.getParameterCount == 3
-        }.orNull
-        if (updateMethod == null) return None
-        val falseBox: Object = java.lang.Boolean.FALSE
-        val none: Object = scala.None
-        updateMethod.invoke(deltaLog, falseBox, none, none)
-      }
+      // Read the files from the snapshot the scan was PREPARED against
+      // (`preparedScan.scannedSnapshot`). This is the same snapshot vanilla
+      // Spark+Delta reads from -- `PreparedDeltaFileIndex` extends
+      // `TahoeFileIndexWithSnapshotDescriptor(... preparedScan.scannedSnapshot)`
+      // -- so re-querying it keeps Comet a faithful drop-in accelerator for
+      // both normal reads and time travel (versionAsOf/timestampAsOf pin the
+      // scannedSnapshot to the requested version).
+      //
+      // We deliberately do NOT `deltaLog.update()` to head here. An earlier
+      // revision did, to pick up deletion-vector descriptors written after a
+      // cached FileIndex was built -- but refreshing to head makes Comet read a
+      // DIFFERENT (newer) snapshot than vanilla, which (a) silently diverges
+      // from vanilla on the consecutive-DELETE / DeltaLog-cache-staleness case
+      // and (b) returned the LATEST version's data for a time-travel query
+      // (DeltaTimeTravelSuite: versionAsOf=0 yielded head's rows). Reading
+      // `scannedSnapshot` matches vanilla in every case. Re-querying via
+      // `filesForScan` (rather than the cached `preparedScan.files`) still picks
+      // up the freshest DV descriptors carried by that snapshot.
+      val snapshot: AnyRef = findAccessor(location, Seq("preparedScan"))
+        .flatMap(ps => findAccessor(ps, Seq("scannedSnapshot")))
+        .orNull
       if (snapshot == null) return None
       val filesForScanMethod = snapshot.getClass.getMethods.find { m =>
         m.getName == "filesForScan" && m.getParameterCount == 2 &&
