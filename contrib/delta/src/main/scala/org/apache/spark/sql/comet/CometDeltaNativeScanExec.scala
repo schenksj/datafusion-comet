@@ -132,12 +132,13 @@ case class CometDeltaNativeScanExec(
     super.doPrepare()
   }
 
-  // Comet's native-scan subquery lifecycle (see CometLeafExec). The default
-  // `prepare(); waitForSubqueries()` would execute EVERY collected subquery; if
-  // an unrewritten placeholder slipped through it would crash. Resolve only the
-  // executable DPP subqueries; skip placeholders (read-all fallback).
-  override def ensureSubqueriesResolved(): Unit = {
-    prepare()
+  // Resolve only the DPP subqueries we can execute; skip adaptive-broadcast
+  // PLACEHOLDERS (CometSubqueryAdaptiveBroadcastExec / SubqueryAdaptiveBroadcastExec),
+  // which throw from doExecute(). When the optimizer rule's in-place rewrite reached
+  // this instance, `effectiveDppFilters` holds the executable form and pruning applies;
+  // otherwise the placeholder is skipped and the scan reads all partitions (correct, the
+  // surrounding Filter/join still prunes). `applyDppFilters` enforces the same skip.
+  private def resolveExecutableDppSubqueries(): Unit = {
     effectiveDppFilters.foreach {
       case DynamicPruningExpression(inSub: InSubqueryExec)
           if !isUnexecutableDpp(inSub.plan) && inSub.values().isEmpty =>
@@ -145,6 +146,24 @@ case class CometDeltaNativeScanExec(
       case _ =>
     }
   }
+
+  // Comet's native-scan subquery lifecycle (see CometLeafExec): used when this scan is
+  // fused inside a parent native block (findAllPlanData path).
+  override def ensureSubqueriesResolved(): Unit = {
+    prepare()
+    resolveExecutableDppSubqueries()
+  }
+
+  // Standard Spark lifecycle path (executeColumnar -> executeQuery -> waitForSubqueries),
+  // used when this scan is a native-block ROOT executed directly (e.g. the child of a
+  // CometNativeColumnarToRowExec, as in a MERGE target read). The default would execute
+  // EVERY collected subquery -- including an unconverted CometSubqueryAdaptiveBroadcastExec
+  // (the in-place DPP rewrite is lost whenever the plan is copied after the rule runs,
+  // since `dppFiltersOverride` is not a constructor field) -- and crash. Override to
+  // resolve only the executable ones, mirroring `ensureSubqueriesResolved`. The native
+  // scan has no subqueries other than its DPP partition filters, so not delegating to
+  // `super` is safe.
+  override def waitForSubqueries(): Unit = resolveExecutableDppSubqueries()
 
   @transient private lazy val commonBytes: Array[Byte] = {
     // The typed DeltaScan variant of OpStruct carries the common block directly.

@@ -19,6 +19,7 @@
 
 package org.apache.comet.contrib.delta
 
+import org.apache.spark.sql.Row
 import org.apache.spark.sql.comet.CometDeltaNativeScanExec
 
 // Repro for regression family F1 (DPP):
@@ -90,6 +91,49 @@ class CometDeltaDppReproSuite extends CometDeltaTestBase {
             s"DPP pruning did not apply: fact scan read $factScanRows rows " +
               "(expected ~120 for 3 of 50 partitions)")
         }
+      }
+    }
+  }
+
+  // Mirrors MergeIntoSuiteBase "basic case - local predicates - ... isPartitioned:
+  // true" -- the actual failing Delta own-suite test. MERGE into a table partitioned
+  // by the join key, with cross-join enabled (Delta's local-predicate path) so AQE+DPP
+  // inserts a dynamic-partition-pruning InSubquery over the target read. The subquery
+  // resolution here goes through the standard `child.executeColumnar() ->
+  // waitForSubqueries()` lifecycle on the native block (not the scan's own
+  // `ensureSubqueriesResolved`), so the CometSubqueryAdaptiveBroadcastExec must be
+  // CONVERTED, not merely skipped.
+  test("MERGE into partitioned table with local predicate (DPP)") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withSQLConf(
+      "spark.sql.optimizer.dynamicPartitionPruning.enabled" -> "true",
+      "spark.sql.optimizer.dynamicPartitionPruning.useStats" -> "false",
+      "spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly" -> "true",
+      "spark.sql.exchange.reuse" -> "true",
+      "spark.sql.crossJoin.enabled" -> "true",
+      "spark.sql.autoBroadcastJoinThreshold" -> "10485760") {
+      withDeltaTable("merge_dpp") { tablePath =>
+        val ss = spark
+        import ss.implicits._
+        Seq(("1", "2", "noop"), ("1", "4", "noop"), ("3", "2", "noop"), ("4", "4", "noop"))
+          .toDF("key2", "value", "op")
+          .repartition(2)
+          .write.format("delta").partitionBy("key2").save(tablePath)
+        Seq(("1", "8"), ("0", "3")).toDF("key1", "value")
+          .createOrReplaceTempView("merge_dpp_src")
+        spark.sql(
+          s"""MERGE INTO delta.`$tablePath` trg
+             |USING merge_dpp_src src
+             |ON src.key1 = trg.key2 AND trg.key2 < '3'
+             |WHEN MATCHED THEN UPDATE SET
+             |  key2 = src.key1, value = src.value, op = 'update'
+             |WHEN NOT MATCHED THEN INSERT
+             |  (key2, value, op) VALUES (src.key1, src.value, 'insert')""".stripMargin)
+        val rows = spark.read.format("delta").load(tablePath).collect().toSet
+        val expected = Set(
+          Row("3", "2", "noop"), Row("4", "4", "noop"),
+          Row("1", "8", "update"), Row("1", "8", "update"), Row("0", "3", "insert"))
+        assert(rows == expected, s"MERGE result mismatch\n got=$rows\n want=$expected")
       }
     }
   }

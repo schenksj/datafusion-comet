@@ -69,10 +69,18 @@ The Delta own-suite regression is run via
      recomputed (not memoized) so a parent block's `findAllPlanData` sees the
      pruned task lists after the broadcast is materialized.
 - **Guard:** `CometDeltaDppReproSuite` asserts native engagement, correct
-  results, AND that the fact scan reads ~120 of 2000 rows (real pruning).
-- **Residual:** if the rule somehow doesn't run, `ensureSubqueriesResolved` /
-  `applyDppFilters` skip the unexecutable placeholder and read all partitions
-  (correct, unpruned) instead of crashing.
+  results, AND that the fact scan reads ~120 of 2000 rows (real pruning) for a
+  SELECT broadcast join; plus a MERGE-into-partitioned guard.
+- **Residual (MERGE / re-planned plans):** the in-place rewrite lives in a
+  transient `dppFiltersOverride` (not a constructor field), so it is LOST
+  whenever the plan is copied after the optimizer rule runs (e.g. MERGE
+  re-plans internally). In that case `effectiveDppFilters` reverts to the
+  placeholder and the scan reads ALL partitions (correct, unpruned) rather
+  than pruning. To stay crash-safe, BOTH subquery-resolution paths skip the
+  unexecutable placeholder: the fused-block path (`ensureSubqueriesResolved`,
+  via `findAllPlanData`) and the standard-lifecycle path (`waitForSubqueries`,
+  used when the scan is a native-block root, e.g. a MERGE target read under
+  `CometNativeColumnarToRowExec`). `applyDppFilters` enforces the same skip.
 - **Commits:** `64cd878a` (no-crash) → in-place rewrite + stable-group pruning.
 
 ### A2. Cloud credential plumbing gaps
