@@ -701,13 +701,36 @@ object DeltaReflection extends Logging {
     try {
       val deltaLog = findAccessor(location, Seq("deltaLog")).orNull
       if (deltaLog == null) return None
-      val updateMethod = deltaLog.getClass.getMethods.find { m =>
-        m.getName == "update" && m.getParameterCount == 3
-      }.orNull
-      if (updateMethod == null) return None
-      val falseBox: Object = java.lang.Boolean.FALSE
-      val none: Object = scala.None
-      val snapshot = updateMethod.invoke(deltaLog, falseBox, none, none)
+      // Time-travel guard: `PreparedDeltaFileIndex.versionScanned` is `Some(v)`
+      // when the query pinned a historical version (versionAsOf / timestampAsOf).
+      // Historical versions are immutable, so the DV-staleness reason for
+      // refreshing to head does NOT apply -- and refreshing to head would
+      // (incorrectly) return the LATEST files, making a time-travel read return
+      // current data. Detected via the regression's DeltaTimeTravelSuite /
+      // DeltaHistoryManager* tests (v0 returned head's 20 rows instead of 10).
+      // For time travel, use the snapshot the scan was prepared against
+      // (`preparedScan.scannedSnapshot`), which is pinned to the requested
+      // version. Only fall back to `deltaLog.update()` (head) for non-time-travel
+      // reads, where the consecutive-DELETE DV-staleness fix is needed.
+      val isTimeTravel = findAccessor(location, Seq("versionScanned")) match {
+        case Some(opt: Option[_]) => opt.isDefined
+        case _ => false
+      }
+      val snapshot: AnyRef = if (isTimeTravel) {
+        val pinned = findAccessor(location, Seq("preparedScan"))
+          .flatMap(ps => findAccessor(ps, Seq("scannedSnapshot")))
+          .orNull
+        if (pinned == null) return None
+        pinned
+      } else {
+        val updateMethod = deltaLog.getClass.getMethods.find { m =>
+          m.getName == "update" && m.getParameterCount == 3
+        }.orNull
+        if (updateMethod == null) return None
+        val falseBox: Object = java.lang.Boolean.FALSE
+        val none: Object = scala.None
+        updateMethod.invoke(deltaLog, falseBox, none, none)
+      }
       if (snapshot == null) return None
       val filesForScanMethod = snapshot.getClass.getMethods.find { m =>
         m.getName == "filesForScan" && m.getParameterCount == 2 &&
