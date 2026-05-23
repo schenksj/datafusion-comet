@@ -227,11 +227,11 @@ The originally-"untriaged" failures resolve into:
   (`QueryPlanSerde.createBalancedBinaryExpr`). Comet evaluates And/Or
   vectorially (both sides always evaluated), so rebalancing is semantically
   identical. This is a CORE Comet change (not contrib-only) -- flag in the PR.
-- **Guard:** `CometDeltaPendingReproSuite` ("F4: deeply-nested data-skipping
+- **Guard:** `CometDeltaEdgeCaseRegressionSuite` ("F4: deeply-nested data-skipping
   filter ...", now a passing `test`). Verified no regression in base
   `CometExpressionSuite` (123 tests).
 
-### B6. Corrupted-file read error compatibility (SC-8810) — PENDING
+### B6. Corrupted-file read error compatibility (SC-8810) — FIXED
 
 - **Test:** "SC-8810: skipping deleted file still throws on corrupted file"
   (`DeltaSuite`).
@@ -239,14 +239,14 @@ The originally-"untriaged" failures resolve into:
   throws `[FAILED_READ_FILE.NO_HINT]`; Comet's native reader throws
   `CometNativeException: External: Generic LocalFileSystem error: Requested range
   was invalid` instead, so the test's message assertion fails.
-- **Fix direction:** map the native corrupted/short-file error to Spark's
-  `FAILED_READ_FILE` (or decline native and let Spark's reader produce it).
-- **Repro:** `CometDeltaPendingReproSuite` ("F6: reading a corrupted file ..."),
-  `ignore`d until fixed.
-
-All pending-failure repros live in `CometDeltaPendingReproSuite` (marked
-`ignore`; un-`ignore` to drive a fix). They are confirmed failing as of this
-writing.
+- **Fix (CORE Comet):** `CometExecIterator.isFileReadError` now also recognises
+  object-store read failures (truncated/empty file: "Requested range was
+  invalid"; "Object at location ... not found"; "Generic <Store> error: ..."),
+  not just "Parquet error: ...". These wrap to `FAILED_READ_FILE.NO_HINT` via
+  `ShimSparkErrorConverter.wrapNativeParquetError`, matching Spark's own
+  file-read error. Flag in the PR (affects all Comet native scans).
+- **Guard:** `CometDeltaEdgeCaseRegressionSuite` ("F6: reading a corrupted file
+  ..."). `SparkErrorConverterSuite` (base) unaffected (covers cast overflow).
 
 ---
 

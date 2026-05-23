@@ -178,21 +178,14 @@ class CometExecIterator(
         // threw the exception, so we log the exception with taskAttemptId here
         logError(s"Native execution for task $taskAttemptId failed", e)
 
-        // `(?s)` so `.` matches across newlines -- native parquet errors sometimes
-        // span multiple lines (footer corruption messages include a hex dump), and a
-        // single-line regex would let those slip past the wrap and surface as bare
-        // CometNativeException to the user.
-        val parquetError: scala.util.matching.Regex =
-          """(?s)^Parquet error: (?:.*)$""".r
-        e.getMessage match {
-          case parquetError() =>
-            // Wrap in the FAILED_READ_FILE.NO_HINT SparkException Spark produces when
-            // its own parquet reader fails. The shim accesses spark-private APIs
-            // (InputFileBlockHolder, QueryExecutionErrors) from a Spark-package class.
-            throw org.apache.spark.sql.comet.shims.ShimSparkErrorConverter
-              .wrapNativeParquetError(e, taskFilePaths)
-          case _ =>
-            throw e
+        if (CometExecIterator.isFileReadError(e.getMessage)) {
+          // Wrap in the FAILED_READ_FILE.NO_HINT SparkException Spark produces when
+          // its own parquet reader fails. The shim accesses spark-private APIs
+          // (InputFileBlockHolder, QueryExecutionErrors) from a Spark-package class.
+          throw org.apache.spark.sql.comet.shims.ShimSparkErrorConverter
+            .wrapNativeParquetError(e, taskFilePaths)
+        } else {
+          throw e
         }
       case e: Throwable =>
         throw e
@@ -272,6 +265,29 @@ class CometExecIterator(
 }
 
 object CometExecIterator extends Logging {
+
+  /**
+   * True when a native error message indicates a per-file read failure that Spark would
+   * surface as `FAILED_READ_FILE.NO_HINT` (so we wrap it via
+   * `ShimSparkErrorConverter.wrapNativeParquetError` for error compatibility, e.g.
+   * DeltaSuite "SC-8810: skipping deleted file still throws on corrupted file").
+   *
+   * Beyond DataFusion's "Parquet error: ..." (corrupt footer etc.), a truncated/empty or
+   * otherwise unreadable file fails earlier in the object_store layer, before parquet
+   * parsing -- e.g. "Generic LocalFileSystem error: Requested range was invalid" or
+   * "Object at location ... not found". These are still file-read failures and must wrap
+   * the same way. The signatures are specific to file/object-store IO, so non-file native
+   * errors are not mis-wrapped.
+   */
+  def isFileReadError(message: String): Boolean = {
+    if (message == null) return false
+    message.startsWith("Parquet error:") ||
+    message.contains("Requested range was invalid") ||
+    (message.contains("Object at location") && message.contains("not found")) ||
+    // object_store IO errors are formatted "Generic <Store> error: <msg>" (LocalFileSystem,
+    // S3, GCS, ...), surfaced through DataFusion as "External: Generic <Store> error: ...".
+    message.matches("(?s).*Generic \\S+ error:.*")
+  }
 
   private def cometSqlConfs: Map[String, String] =
     SQLConf.get.getAllConfs.filter(_._1.startsWith(CometConf.COMET_PREFIX))

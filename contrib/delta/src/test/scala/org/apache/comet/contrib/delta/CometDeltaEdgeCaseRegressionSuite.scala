@@ -21,20 +21,16 @@ package org.apache.comet.contrib.delta
 
 import org.apache.spark.sql.functions._
 
-// Local reproductions for the Delta 4.1 own-suite regression families that are
-// not yet fixed on this branch. One faithful, minimal repro per root cause so
-// each can be diagnosed and fixed (and kept as a regression guard afterward).
-//
-// Status:
-//   F3 (row tracking)      -- FIXED; guard in CometDeltaRowTrackingMaterializedSuite
-//   F4 (protobuf recursion)-- FIXED; the passing `test` below now guards it
-//   F6 (corrupted file)    -- PENDING; `ignore`d repro below
-//
-// `ignore`d tests are confirmed repros asserting correct behavior; un-`ignore`
-// (change `ignore(` -> `test(`) to watch one fail today and pass once fixed.
-class CometDeltaPendingReproSuite extends CometDeltaTestBase {
+// Regression guards for two Delta 4.1 own-suite edge cases that surfaced
+// CORE Comet bugs (both now fixed). Each test mirrors the failing Delta test
+// and asserts the corrected behavior:
+//   F4 -- deeply-nested boolean predicate overflowed protobuf's recursion limit
+//         (fixed by balancing And/Or chains in QueryPlanSerde).
+//   F6 -- a corrupted/0-byte file produced a non-Spark error (fixed by mapping
+//         object-store read errors to FAILED_READ_FILE in CometExecIterator).
+class CometDeltaEdgeCaseRegressionSuite extends CometDeltaTestBase {
 
-  // === F4 (FIXED): deeply-nested data-skipping expression -> protobuf recursion
+  // === F4: deeply-nested data-skipping expression -> protobuf recursion
   //
   // Mirrors DataSkippingDeltaTests "remove redundant stats column references in
   // data skipping expression". A WHERE with ~101 AND'd conditions builds a very
@@ -69,7 +65,7 @@ class CometDeltaPendingReproSuite extends CometDeltaTestBase {
   // the error is the Spark-compatible one (so user-facing error handling and the
   // Delta test pass). Repro asserts the message contains the Spark marker.
 
-  ignore("F6: reading a corrupted file surfaces a Spark-compatible error (SC-8810)") {
+  test("F6: reading a corrupted file surfaces a Spark-compatible error (SC-8810)") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("f6_corrupt") { tablePath =>
       val ss = spark
