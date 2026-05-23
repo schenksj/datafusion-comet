@@ -28,7 +28,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, UnknownPartitioning}
-import org.apache.spark.sql.execution.{FileSourceScanExec, InSubqueryExec, SparkPlan, SubqueryBroadcastExec}
+import org.apache.spark.sql.execution.{FileSourceScanExec, InSubqueryExec, SparkPlan}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
@@ -83,10 +83,45 @@ case class CometDeltaNativeScanExec(
 
   override val nodeName: String = s"CometDeltaNativeScan $tableRoot"
 
+  // DPP support. The AQE DPP subquery on a partitioned Delta scan arrives as an
+  // unexecutable placeholder: CometExecRule wraps Spark's
+  // SubqueryAdaptiveBroadcastExec into CometSubqueryAdaptiveBroadcastExec, and
+  // CometPlanAdaptiveDynamicPruningFilters rewrites it to an executable
+  // (Comet)SubqueryBroadcastExec with proper broadcast reuse. That rewrite would
+  // normally produce a copy of this scan, but the copy is dropped when the
+  // enclosing native block is rebuilt (TreeNode.makeCopy can't carry @transient
+  // fields, #3510). So the rule installs the rewrite IN PLACE via
+  // `withDynamicPruningFilters` (below), which updates this transient
+  // side-channel and returns `this` -- landing the executable subqueries on the
+  // SAME instance that executes. `dppFilters` (the case-class field) is left
+  // untouched so node equality/canonicalization is unaffected; everything at
+  // execution reads `effectiveDppFilters`.
+  @transient private var dppFiltersOverride: Seq[Expression] = null
+
+  private def effectiveDppFilters: Seq[Expression] =
+    if (dppFiltersOverride != null) dppFiltersOverride else dppFilters
+
+  override def dynamicPruningFilters: Seq[Expression] = effectiveDppFilters
+
+  override def withDynamicPruningFilters(filters: Seq[Expression]): SparkPlan = {
+    dppFiltersOverride = filters
+    this
+  }
+
+  /** True when a DPP subquery is an adaptive-broadcast placeholder we can't
+   *  execute: the unwrapped Spark `SubqueryAdaptiveBroadcastExec` or the
+   *  Comet-wrapped `CometSubqueryAdaptiveBroadcastExec`. Both throw from
+   *  `doExecute()`. Normally the rule rewrites them in place (see above) before
+   *  execution; this guard skips any that slip through (e.g. the rule didn't
+   *  run) so we read all partitions instead of crashing. */
+  private def isUnexecutableDpp(plan: SparkPlan): Boolean =
+    plan.isInstanceOf[org.apache.spark.sql.execution.SubqueryAdaptiveBroadcastExec] ||
+      plan.isInstanceOf[CometSubqueryAdaptiveBroadcastExec]
+
   override protected def doPrepare(): Unit = {
-    // `prepare()` (not execute) is safe for any subquery plan, including an
-    // unconverted adaptive-broadcast placeholder.
-    dppFilters.foreach {
+    // `prepare()` (not execute) is safe for any subquery plan, including a
+    // placeholder.
+    effectiveDppFilters.foreach {
       case DynamicPruningExpression(e: InSubqueryExec) =>
         e.plan.prepare()
       case _ =>
@@ -94,37 +129,13 @@ case class CometDeltaNativeScanExec(
     super.doPrepare()
   }
 
-  /** True when a DPP subquery is an adaptive-broadcast placeholder we can't
-   *  execute ourselves: the unwrapped Spark `SubqueryAdaptiveBroadcastExec` or
-   *  the Comet-wrapped `CometSubqueryAdaptiveBroadcastExec`. Both throw from
-   *  `doExecute()`; they only become executable once
-   *  `CometPlanAdaptiveDynamicPruningFilters` rewrites them to a
-   *  (Comet)SubqueryBroadcastExec. */
-  private def isUnexecutableDpp(plan: SparkPlan): Boolean =
-    plan.isInstanceOf[org.apache.spark.sql.execution.SubqueryAdaptiveBroadcastExec] ||
-      plan.isInstanceOf[CometSubqueryAdaptiveBroadcastExec]
-
-  // DPP support. The AQE DPP subquery on a partitioned Delta scan arrives as an
-  // unexecutable placeholder: CometExecRule wraps Spark's
-  // SubqueryAdaptiveBroadcastExec into CometSubqueryAdaptiveBroadcastExec, and
-  // CometPlanAdaptiveDynamicPruningFilters is supposed to rewrite it to an
-  // executable (Comet)SubqueryBroadcastExec -- but that rewritten scan copy is
-  // dropped when the enclosing native block is rebuilt (TreeNode.makeCopy can't
-  // carry @transient fields, #3510), so the live scan keeps the placeholder.
-  // We therefore (1) skip the placeholder in `ensureSubqueriesResolved` so it
-  // doesn't execute and crash, and (2) convert it on the fly during partition
-  // pruning in `applyDppFilters` (where the broadcast is already materialized)
-  // to recover the pruning values. Results are always correct; pruning applies
-  // when the scan recomputes partitions at execution.
-
   // Comet's native-scan subquery lifecycle (see CometLeafExec). The default
-  // `prepare(); waitForSubqueries()` would execute EVERY collected subquery,
-  // including an unexecutable adaptive-broadcast placeholder -> crash. Resolve
-  // only the DPP subqueries we can execute; skip placeholders so pruning falls
-  // back to read-all instead of throwing.
+  // `prepare(); waitForSubqueries()` would execute EVERY collected subquery; if
+  // an unrewritten placeholder slipped through it would crash. Resolve only the
+  // executable DPP subqueries; skip placeholders (read-all fallback).
   override def ensureSubqueriesResolved(): Unit = {
     prepare()
-    dppFilters.foreach {
+    effectiveDppFilters.foreach {
       case DynamicPruningExpression(inSub: InSubqueryExec)
           if !isUnexecutableDpp(inSub.plan) && inSub.values().isEmpty =>
         inSub.updateResult()
@@ -190,18 +201,30 @@ case class CometDeltaNativeScanExec(
    * reading the full table every time AQE is in the loop.
    */
   private def buildPerPartitionBytes(): Array[Array[Byte]] = {
-    val tasks =
-      if (dppFilters.nonEmpty && partitionSchema.nonEmpty) applyDppFilters(allTasks)
-      else allTasks
-    if (tasks.isEmpty) {
-      Array.empty[Array[Byte]]
-    } else {
-      packTasks(tasks).map { group =>
-        val builder = OperatorOuterClass.DeltaScan.newBuilder()
-        group.foreach(builder.addTasks)
-        builder.build().toByteArray
-      }.toArray
-    }
+    // Group ALL tasks once (`taskGroups`) so the partition COUNT is fixed
+    // regardless of DPP -- Spark pins `numPartitions` at planning and the native
+    // RDD's partition count must not change at execution. DPP pruning then
+    // happens WITHIN each group: pruned-out tasks are removed, and a group whose
+    // tasks are all pruned becomes an empty DeltaScan (0 rows) -- but the group
+    // (= partition slot) remains, keeping the count stable. This lets DPP prune
+    // even when the scan executes inside a parent native block (MERGE/join),
+    // where the parent reads `perPartitionData` rather than running the scan's
+    // own `doExecuteColumnar`.
+    val groups = taskGroups
+    if (groups.isEmpty) return Array.empty[Array[Byte]]
+    val survivorPaths: Option[Set[String]] =
+      if (dppFilters.nonEmpty && partitionSchema.nonEmpty) {
+        Some(applyDppFilters(allTasks).map(_.getFilePath).toSet)
+      } else None
+    groups.map { group =>
+      val kept = survivorPaths match {
+        case Some(s) => group.filter(t => s.contains(t.getFilePath))
+        case None => group
+      }
+      val builder = OperatorOuterClass.DeltaScan.newBuilder()
+      kept.foreach(builder.addTasks)
+      builder.build().toByteArray
+    }.toArray
   }
 
   // #75 design A: when input_file_name() is needed (signal threaded from CometScanRule
@@ -241,41 +264,34 @@ case class CometDeltaNativeScanExec(
     out.toSeq
   }
 
-  // Planning-time snapshot used by metrics, sourceKey derivations, and `numPartitions`.
-  // Execution-time recomputation happens inside `doExecuteColumnar`.
-  @transient private lazy val planningPerPartitionBytes: Array[Array[Byte]] =
-    buildPerPartitionBytes()
+  // Stable task grouping = the partition layout. Computed once from ALL tasks so
+  // the partition count is fixed across planning and execution (DPP prunes
+  // tasks WITHIN groups, never changing the group count). `numPartitions` reads
+  // this directly so counting partitions never triggers DPP broadcast
+  // resolution.
+  @transient private lazy val taskGroups: Seq[Seq[OperatorOuterClass.DeltaScanTask]] =
+    if (allTasks.isEmpty) Seq.empty else packTasks(allTasks)
 
   private def applyDppFilters(
       tasks: Seq[OperatorOuterClass.DeltaScanTask]): Seq[OperatorOuterClass.DeltaScanTask] = {
     // Resolve each DPP subquery to its runtime pruning values, then prune tasks
-    // by evaluating the partition predicate below.
-    //
-    // A DPP subquery may still be an adaptive-broadcast PLACEHOLDER that can't
-    // execute directly: the Comet-wrapped `CometSubqueryAdaptiveBroadcastExec`
-    // (produced by CometExecRule) or the unwrapped `SubqueryAdaptiveBroadcast
-    // Exec`. `CometPlanAdaptiveDynamicPruningFilters` normally rewrites these to
-    // an executable (Comet)SubqueryBroadcastExec, but that rewrite can be
-    // orphaned for a scan buried inside a native block (the converted copy is
-    // dropped when the parent block is rebuilt -- #3510), leaving the live scan
-    // with the placeholder. By the time we build per-partition data the
-    // broadcast the placeholder wraps is already materialized, so we convert it
-    // on the fly to an executable `SubqueryBroadcastExec` (its `child` is that
-    // materialized broadcast) and resolve THAT to recover the pruning values --
-    // so we still scan only the required partitions. Any failure falls back to
-    // returning all tasks (correct, just unpruned).
+    // by evaluating the partition predicate below. By execution time the rule
+    // has installed executable (Comet)SubqueryBroadcastExec subqueries in place
+    // (see `withDynamicPruningFilters`); we resolve them here. If an
+    // unexecutable placeholder slipped through (rule didn't run), skip pruning
+    // and read all tasks (correct, just unpruned) rather than crashing.
+    if (effectiveDppFilters.exists {
+        case DynamicPruningExpression(inSub: InSubqueryExec) => isUnexecutableDpp(inSub.plan)
+        case _ => false
+      }) {
+      return tasks
+    }
     val resolvedFilters: Seq[Expression] =
       try {
-        dppFilters.map {
+        effectiveDppFilters.map {
           case DynamicPruningExpression(inSub: InSubqueryExec) =>
-            val executable = inSub.plan match {
-              case csab: CometSubqueryAdaptiveBroadcastExec =>
-                inSub.copy(plan = SubqueryBroadcastExec(
-                  csab.name, csab.indices, csab.buildKeys, csab.child))
-              case _ => inSub
-            }
-            if (executable.values().isEmpty) executable.updateResult()
-            executable
+            if (inSub.values().isEmpty) inSub.updateResult()
+            inSub
           case DynamicPruningExpression(e) => e
           case other => other
         }
@@ -310,7 +326,11 @@ case class CometDeltaNativeScanExec(
   }
 
   def commonData: Array[Byte] = commonBytes
-  def perPartitionData: Array[Array[Byte]] = planningPerPartitionBytes
+  // Recomputed (not memoised) so that when a parent native block reads this at
+  // execution -- after AQE has materialised the DPP broadcast -- the returned
+  // per-partition task lists reflect DPP pruning. The partition COUNT is fixed
+  // by `taskGroups`; only the tasks within each group are pruned.
+  def perPartitionData: Array[Array[Byte]] = buildPerPartitionBytes()
 
   // Surface per-partition file paths to the unified `CometExecRDD` path in
   // `operators.scala` so `InputFileBlockHolder` is populated when this scan
@@ -319,7 +339,7 @@ case class CometDeltaNativeScanExec(
   // `CometExecRDD.compute` sees empty filePaths -> `input_file_name()`
   // returns "" -> `DELTA_FILE_TO_OVERWRITE_NOT_FOUND`.
   override def perPartitionFilePaths: Array[Seq[String]] = {
-    planningPerPartitionBytes.map { bytes =>
+    perPartitionData.map { bytes =>
       OperatorOuterClass.DeltaScan.parseFrom(bytes)
         .getTasksList.asScala.map(_.getFilePath).toSeq
     }
@@ -337,7 +357,7 @@ case class CometDeltaNativeScanExec(
    */
   def sourceKey: String = CometDeltaNativeScanExec.computeSourceKey(nativeOp)
 
-  def numPartitions: Int = perPartitionData.length
+  def numPartitions: Int = taskGroups.length
 
   override lazy val outputPartitioning: Partitioning =
     UnknownPartitioning(math.max(1, numPartitions))

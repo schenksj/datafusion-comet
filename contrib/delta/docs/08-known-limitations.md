@@ -41,41 +41,39 @@ The Delta own-suite regression is run via
 
 ## Part A — Deliberate tradeoffs (open as enhancement issues)
 
-### A1. DPP pruning not applied when the scan is inside a native block (MERGE/join)
+### A1. DPP on a partitioned Delta scan — FIXED
 
-- **Behavior:** A dynamic-partition-pruning (DPP) broadcast join over a
-  partitioned Delta table keeps the native scan and returns correct results, and
-  prunes to the required partitions **when the scan runs standalone**. When the
-  scan is buried inside a parent Comet native block (e.g. MERGE, or a broadcast
-  hash join), DPP pruning is **not** applied — the scan reads all partitions
-  (correct, just unpruned; the surrounding join still filters).
-- **Why:** Two layers.
-  1. The AQE DPP subquery arrives as an unexecutable
-     `CometSubqueryAdaptiveBroadcastExec` placeholder.
-     `CometPlanAdaptiveDynamicPruningFilters` is meant to rewrite it to an
-     executable form, but the rewritten scan copy is **orphaned**: when
-     `transformUp` rebuilds the enclosing native block, `TreeNode.makeCopy`
-     drops the converted child (the `@transient`-field / makeCopy issue,
-     base-Comet `#3510`). Verified: the converted node is not reachable in the
-     rule's output.
-  2. The native scan's partition **count** is fixed at planning. When executed
-     via a parent block, the parent's `findAllPlanData` reads
-     `CometDeltaNativeScanExec.perPartitionData` — a planning-time snapshot
-     memoized **before** the broadcast is materialized (to keep `numPartitions`
-     stable). So runtime pruning doesn't reach that path.
-- **Correctness:** Always correct. Tradeoff is performance (reads all partitions
-  in the join case).
-- **Fix done so far:** `CometDeltaNativeScanExec` no longer crashes on the
-  placeholder — it skips it in `ensureSubqueriesResolved` and converts it on the
-  fly to an executable `SubqueryBroadcastExec` during `applyDppFilters` (where
-  the broadcast is materialized). See commit `64cd878a`.
-- **To close:** Keep the partition count fixed at planning but **empty** the
-  DPP-pruned partitions at execution (recompute `perPartitionData` with
-  broadcast-resolved values, emitting empty task lists for pruned files; needs
-  native-side tolerance of empty file groups).
-- **Guard:** `CometDeltaDppReproSuite` (asserts correctness + native engagement;
-  extend to assert the fact scan reads ~120 not 2000 rows once closed).
-- **Tracking:** internal task #198.
+- **History:** A dynamic-partition-pruning (DPP) broadcast join / MERGE over a
+  partitioned Delta table originally crashed
+  (`CometSubqueryAdaptiveBroadcastExec ... does not support the execute() code
+  path`), then (intermediate fix) ran correctly but unpruned in the
+  native-block case. Now it engages the native scan, returns correct results,
+  AND prunes to the required partitions in both the standalone and the
+  parent-block (MERGE/join) cases.
+- **Two root causes that had to be solved:**
+  1. **Orphaned rewrite (`#3510`).** The AQE DPP subquery arrives as an
+     unexecutable `CometSubqueryAdaptiveBroadcastExec`.
+     `CometPlanAdaptiveDynamicPruningFilters` rewrites it to an executable
+     `CometSubqueryBroadcastExec` (with broadcast reuse), but the rewritten
+     scan *copy* was dropped when `transformUp` rebuilt the enclosing native
+     block (`TreeNode.makeCopy` can't carry `@transient` fields). **Fix:** the
+     scan implements `withDynamicPruningFilters` to install the rewrite IN PLACE
+     via a transient side-channel (`dppFiltersOverride`) and return `this`, so
+     it lands on the same instance that executes. `dppFilters` (the case-class
+     field) is left untouched so node equality/canonicalization is unaffected.
+  2. **Fixed partition count vs runtime pruning.** The native scan's partition
+     count is pinned at planning. **Fix:** group ALL tasks once
+     (`taskGroups = packTasks(allTasks)`) so the count is stable, then prune
+     tasks WITHIN each group at execution (a fully-pruned group becomes an empty
+     DeltaScan = 0 rows, but the partition slot remains). `perPartitionData` is
+     recomputed (not memoized) so a parent block's `findAllPlanData` sees the
+     pruned task lists after the broadcast is materialized.
+- **Guard:** `CometDeltaDppReproSuite` asserts native engagement, correct
+  results, AND that the fact scan reads ~120 of 2000 rows (real pruning).
+- **Residual:** if the rule somehow doesn't run, `ensureSubqueriesResolved` /
+  `applyDppFilters` skip the unexecutable placeholder and read all partitions
+  (correct, unpruned) instead of crashing.
+- **Commits:** `64cd878a` (no-crash) → in-place rewrite + stable-group pruning.
 
 ### A2. Cloud credential plumbing gaps
 

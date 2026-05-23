@@ -79,6 +79,16 @@ class CometDeltaDppReproSuite extends CometDeltaTestBase {
           // still filters; the scan just reads more partitions.)
           val expected = (0 until 2000).count(i => Set(3, 7, 11).contains(i % 50))
           assert(rows.length == expected, s"got ${rows.length} want $expected")
+          // DPP pruning: the partitioned fact scan must read only the 3 matching
+          // partitions (~120 rows), not all 2000.
+          val factScanRows = scans
+            .map(_.metrics.get("numOutputRows").map(_.value).getOrElse(0L)).max
+          // 3 of 50 partitions kept => ~120 rows (40 per partition); allow slack
+          // but require well under the full 2000 to prove real pruning.
+          assert(
+            factScanRows <= 200,
+            s"DPP pruning did not apply: fact scan read $factScanRows rows " +
+              "(expected ~120 for 3 of 50 partitions)")
         }
       }
     }

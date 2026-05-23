@@ -900,6 +900,24 @@ trait CometScanWithPlanData {
   // join, which is keyed on `input_file_name()`) returns the right path.
   // Empty when the scan doesn't track file-level provenance.
   def perPartitionFilePaths: Array[Seq[String]] = Array.empty
+
+  // DPP / partition filters that may carry AQE SubqueryAdaptiveBroadcast
+  // subqueries needing rewrite by CometPlanAdaptiveDynamicPruningFilters.
+  // Default empty: scans with dedicated handling (CometNativeScanExec,
+  // CometIcebergNativeScanExec) don't use this path.
+  def dynamicPruningFilters: Seq[Expression] = Nil
+
+  // Install rewritten DPP filters on this scan. Implementers whose filters live
+  // in a @transient field (which TreeNode.makeCopy can't carry, #3510) update
+  // them via a transient side-channel and return `this` -- so the optimizer
+  // rule's rewrite lands on the SAME instance that executes, instead of a copy
+  // that gets dropped when the enclosing native block is rebuilt. Only called
+  // when `dynamicPruningFilters` is non-empty, so the default is never reached
+  // for scans that leave it empty.
+  def withDynamicPruningFilters(filters: Seq[Expression]): SparkPlan =
+    throw new UnsupportedOperationException(
+      s"${getClass.getSimpleName} exposes dynamicPruningFilters but does not " +
+        "override withDynamicPruningFilters")
 }
 
 abstract class CometUnaryExec extends CometNativeExec with UnaryExecNode
