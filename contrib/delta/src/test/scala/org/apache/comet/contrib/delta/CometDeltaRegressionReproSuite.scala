@@ -227,6 +227,51 @@ class CometDeltaRegressionReproSuite extends CometDeltaTestBase {
     }
   }
 
+  // 7. Stats recompute returns null stats for one of multiple files.
+  // Upstream: StatsCollectionSuite "recompute stats multiple columns and files".
+  test("Stats recompute over 3-file table produces non-null per-file stats") {
+    assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
+    withDeltaTable("stats_recompute") { tablePath =>
+      val ss = spark
+      import ss.implicits._
+      val df = spark.range(10, 20).withColumn("x", $"id" + 10).repartition(3)
+      spark.conf.set("spark.databricks.delta.stats.collect", "false")
+      try {
+        df.write.format("delta").save(tablePath)
+        // Directly call StatisticsCollection.recompute -- this uses
+        // `deltaLog.createDataFrame(snapshot, addFiles)` which builds
+        // `TahoeBatchFileIndex` (different from the
+        // `PreparedDeltaFileIndex` used by `spark.read.format("delta")`).
+        // The failing test in regression follows this exact path.
+        val deltaLog = org.apache.spark.sql.delta.DeltaLog
+          .forTable(spark, tablePath)
+        org.apache.spark.sql.delta.stats.StatisticsCollection
+          .recompute(
+            spark,
+            deltaLog,
+            catalogTable = None,
+            predicates = Seq(org.apache.spark.sql.catalyst.expressions.Literal(true)),
+            fileFilter = (_: org.apache.spark.sql.delta.actions.AddFile) => true)
+        // After recompute, read the per-file stats. Use the same
+        // accessor pattern the upstream test does: iterate AddFiles and
+        // pull `stats` JSON.
+        val snapshot = deltaLog.unsafeVolatileSnapshot
+        val allStats = snapshot.allFiles.collect().map(_.stats).toSeq
+        assert(allStats.length == 3,
+          s"expected 3 stats jsons, got ${allStats.length}: $allStats")
+        allStats.foreach { s =>
+          assert(s != null && s.nonEmpty, s"empty stats: $s")
+          val mn = """"minValues":\{"id":(\d+)""".r.findFirstMatchIn(s)
+          val mx = """"maxValues":\{"id":(\d+)""".r.findFirstMatchIn(s)
+          assert(mn.isDefined && mx.isDefined,
+            s"missing min/max values in stats: $s")
+        }
+      } finally {
+        spark.conf.unset("spark.databricks.delta.stats.collect")
+      }
+    }
+  }
+
   // 5. CHECK constraint with analyzer-evaluated expression
   // (year(current_date())). Delta resolves it at definition time; the
   // constraint then has to evaluate against inserted rows. Mirrors

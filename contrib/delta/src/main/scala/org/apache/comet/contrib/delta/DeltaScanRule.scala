@@ -241,7 +241,27 @@ object DeltaScanRule {
         case _ => false
       })
     }
-    val scanForDelta = if (needsInputFileName) {
+    // Scans that project `_metadata.file_path` ALSO need per-task partitioning:
+    // when multiple files are packed into one Spark partition, we create
+    // multiple DataFusion file_groups (one per file) to give SyntheticColumnsExec
+    // a 1:1 per-file metadata mapping. But Spark only consumes ONE DataFusion
+    // partition per Spark partition -- so the 2nd+ files' batches are silently
+    // dropped. Force one-task-per-partition so each file becomes its own Spark
+    // partition with its own DataFusion partition (1:1 alignment, no dropped
+    // data). Specifically breaks `StatsCollectionSuite "recompute stats
+    // multiple columns and files"` and `... "recompute stats on partitioned
+    // table"` -- recompute groupBy's on `_metadata.file_path` and one file's
+    // rows go missing because they never reach Spark.
+    //
+    // Only `file_path` triggers this -- other per-file metadata cols
+    // (`base_row_id`, `default_row_commit_version`, etc.) appear in many
+    // scans that the existing packing handles correctly without per-task
+    // partitioning.
+    val needsMetadataPerFile = scanExec.output.exists { a =>
+      a.name.equalsIgnoreCase("file_path")
+    }
+    val needsOneTaskPerPartition = needsInputFileName || needsMetadataPerFile
+    val scanForDelta = if (needsOneTaskPerPartition) {
       val taggedOptions = scanExec.relation.options +
         (DeltaConf.NeedsInputFileNameOption -> "true")
       val taggedRelation = scanExec.relation.copy(options = taggedOptions)(
@@ -334,22 +354,14 @@ object DeltaScanRule {
     }
     // When Delta's `useMetadataRowIndex` is false (PredicatePushdownDisabled
     // test variant), Delta materialises the DV filter as a synthetic
-    // `__delta_internal_is_row_deleted` column above the scan, expecting the
-    // scan to read parquet's row_index AND join against a DV bitmap to
-    // populate the column. Our native scan emits this column via per-task
-    // `deleted_row_indexes`, but in the post-MERGE-with-persistent-DV
-    // read path the original target files are observed to return 0 rows
-    // through our path (root cause undetermined; the DV bitmap reads as
-    // expected and the synthetic emit logic mirrors Delta's, yet the
-    // resulting batch is empty). Decline so Spark+Delta handles these reads
-    // correctly. Surfaced in `MergeIntoSchemaEvolutionBaseExistingColumnSQL
-    // PathBasedCDCOnDVsPredPushOffSuite` (9 of 42 tests failed).
-    //
-    // Gate: scan requires `__delta_internal_is_row_deleted` synthetic AND
-    // `useMetadataRowIndex` is false AND at least one AddFile carries a DV.
-    // This combination is rare in production (the conf is internal+default
-    // true) so the perf cost of the fallback is bounded to test workloads
-    // and any user who explicitly disables `useMetadataRowIndex`.
+    // `__delta_internal_is_row_deleted` column above the scan. In the
+    // post-MERGE-with-persistent-DV read path the original target files
+    // return 0 rows through our scan (root cause undetermined separate
+    // from the per-file-groups bug fixed in this commit). Decline so
+    // Spark+Delta handles these reads correctly. The conf is internal +
+    // default true, so production reads use the parquet `row_index` path
+    // (which our scan handles); the fallback only triggers for tests or
+    // users that explicitly disable `useMetadataRowIndex`.
     val needsRowDeletedSynth = scanExec.requiredSchema.fields.exists { f =>
       f.name.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName)
     }
@@ -359,7 +371,6 @@ object DeltaScanRule {
         .map(_.equalsIgnoreCase("true"))
         .getOrElse(true)
       if (!useMetadataRowIndex) {
-        // Cheap DV-presence probe: peek at the AddFile list.
         val anyDv = try {
           DeltaReflection
             .extractBatchAddFiles(
