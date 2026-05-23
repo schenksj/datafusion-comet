@@ -138,7 +138,14 @@ impl FileSource for IgnoreMissingFileSource {
     }
 
     fn as_any(&self) -> &dyn Any {
-        self
+        // Delegate to the inner source so DataFusion optimizations that downcast a
+        // `FileSource` to its concrete type (e.g. `ParquetSource`, to read/apply
+        // parquet-specific config) see through this decorator instead of failing the
+        // downcast and silently skipping the optimization. Nothing downcasts to
+        // `IgnoreMissingFileSource` itself, and all source operations still flow through
+        // this wrapper's trait methods (which delegate + re-wrap), so the
+        // ignore-missing behavior is preserved.
+        self.inner.as_any()
     }
 
     fn table_schema(&self) -> &TableSchema {

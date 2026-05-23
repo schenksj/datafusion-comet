@@ -274,19 +274,20 @@ object CometExecIterator extends Logging {
    *
    * Beyond DataFusion's "Parquet error: ..." (corrupt footer etc.), a truncated/empty or
    * otherwise unreadable file fails earlier in the object_store layer, before parquet
-   * parsing -- e.g. "Generic LocalFileSystem error: Requested range was invalid" or
-   * "Object at location ... not found". These are still file-read failures and must wrap
-   * the same way. The signatures are specific to file/object-store IO, so non-file native
-   * errors are not mis-wrapped.
+   * parsing -- e.g. a 0-byte file footer read gives "Requested range was invalid", and a
+   * deleted file gives "Object at location ... not found". These are still file-read
+   * failures and must wrap the same way.
+   *
+   * We match those specific IO phrasings rather than the broad object_store "Generic
+   * <Store> error:" prefix, because that prefix is also produced for NON-file config
+   * errors -- e.g. "Generic HadoopFileSystem error: Hdfs support is not enabled in this
+   * build" -- which must surface as-is, not masked behind FAILED_READ_FILE.
    */
   def isFileReadError(message: String): Boolean = {
     if (message == null) return false
     message.startsWith("Parquet error:") ||
     message.contains("Requested range was invalid") ||
-    (message.contains("Object at location") && message.contains("not found")) ||
-    // object_store IO errors are formatted "Generic <Store> error: <msg>" (LocalFileSystem,
-    // S3, GCS, ...), surfaced through DataFusion as "External: Generic <Store> error: ...".
-    message.matches("(?s).*Generic \\S+ error:.*")
+    (message.contains("Object at location") && message.contains("not found"))
   }
 
   private def cometSqlConfs: Map[String, String] =

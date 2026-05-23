@@ -536,6 +536,20 @@ object Utils extends CometTypeShim with Logging {
           v.setValueCount(numRows)
         }
         v
+      case _: org.apache.spark.sql.types.TimestampNTZType =>
+        // Spark stores TimestampNTZType as microseconds since epoch with NO timezone.
+        val arrowType = new ArrowType.Timestamp(
+          org.apache.arrow.vector.types.TimeUnit.MICROSECOND, null)
+        val field = new Field(name,
+          new FieldType(true, arrowType, null), java.util.Collections.emptyList[Field])
+        val v = field.createVector(allocator).asInstanceOf[TimeStampMicroVector]
+        if (isNull) fillAllNull(v) else {
+          v.setInitialCapacity(numRows); v.allocateNew()
+          val x = cv.getLong(0); var i = 0
+          while (i < numRows) { v.set(i, x); i += 1 }
+          v.setValueCount(numRows)
+        }
+        v
       case _: org.apache.spark.sql.types.StringType =>
         val v = new VarCharVector(name, allocator)
         if (isNull) fillAllNull(v) else {

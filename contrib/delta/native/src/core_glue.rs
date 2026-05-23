@@ -243,20 +243,24 @@ impl PhysicalPlanner {
         )
         .map_err(|e| GeneralError(format!("prepare_object_store_with_configs: {e}")))?;
 
-        // Filter pushdown is incompatible with `emit_is_row_deleted`. When the
-        // synthetic `__delta_internal_is_row_deleted` column is emitted, the
-        // DeltaSyntheticColumnsStream uses a running `current_row_offset` to look
-        // up `deleted_row_indexes` -- which assumes the parquet reader returns
-        // every row in physical order. With data-filter pushdown the reader may
-        // skip rows that don't match, leaving `current_row_offset` decoupled
-        // from the true parquet row_index. Result: DV indexes get applied to the
-        // wrong rows (audit-5 finding: filter `id > 10 AND id < 25` over a DV-
-        // bearing single-file table dropped 8 of 14 expected rows). Suppress
-        // data-filter pushdown when emit_is_row_deleted=true; Spark's outer
-        // Filter still applies the predicates correctly, just without parquet
-        // pruning. Partition filters are unaffected (they prune file groups
-        // before this point).
-        let data_filters_for_parquet = if common.emit_is_row_deleted {
+        // Filter pushdown is incompatible with any synthetic that is derived from a
+        // row's PHYSICAL position in the file. DeltaSyntheticColumnsStream uses a
+        // running `current_row_offset` to compute:
+        //   - `is_row_deleted`  (membership in `deleted_row_indexes`),
+        //   - `row_index`       (the offset itself), and
+        //   - `row_id`          (base_row_id + offset, when unmaterialised).
+        // All three assume the parquet reader returns EVERY row in physical order.
+        // With data-filter pushdown the reader skips non-matching rows, decoupling
+        // `current_row_offset` from the true parquet row_index, so these synthetics
+        // are computed against the wrong positions (e.g. `id >= 50` pushed down
+        // yielded row_id 0..49 for ids 50..99). Suppress data-filter pushdown
+        // whenever one of them is emitted; Spark's outer Filter still applies the
+        // predicates correctly, just without parquet pruning. `row_commit_version`
+        // is a per-file constant (not position-derived) and partition filters prune
+        // file groups before this point, so neither is affected.
+        let suppress_pushdown =
+            common.emit_is_row_deleted || common.emit_row_index || common.emit_row_id;
+        let data_filters_for_parquet = if suppress_pushdown {
             Vec::new()
         } else {
             data_filters?

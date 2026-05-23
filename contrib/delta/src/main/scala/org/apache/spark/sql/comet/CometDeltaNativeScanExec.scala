@@ -96,7 +96,10 @@ case class CometDeltaNativeScanExec(
   // SAME instance that executes. `dppFilters` (the case-class field) is left
   // untouched so node equality/canonicalization is unaffected; everything at
   // execution reads `effectiveDppFilters`.
-  @transient private var dppFiltersOverride: Seq[Expression] = null
+  // `@volatile`: set during query-stage optimization and read during execution
+  // (driver-thread-confined in practice, but volatile guards against AQE re-planning
+  // on a different thread).
+  @transient @volatile private var dppFiltersOverride: Seq[Expression] = null
 
   private def effectiveDppFilters: Seq[Expression] =
     if (dppFiltersOverride != null) dppFiltersOverride else dppFilters
@@ -212,8 +215,10 @@ case class CometDeltaNativeScanExec(
     // own `doExecuteColumnar`.
     val groups = taskGroups
     if (groups.isEmpty) return Array.empty[Array[Byte]]
+    // Gate on `effectiveDppFilters` (the rule's in-place rewrite), not the raw
+    // `dppFilters`, so pruning uses the executable converted form when present.
     val survivorPaths: Option[Set[String]] =
-      if (dppFilters.nonEmpty && partitionSchema.nonEmpty) {
+      if (effectiveDppFilters.nonEmpty && partitionSchema.nonEmpty) {
         Some(applyDppFilters(allTasks).map(_.getFilePath).toSet)
       } else None
     groups.map { group =>

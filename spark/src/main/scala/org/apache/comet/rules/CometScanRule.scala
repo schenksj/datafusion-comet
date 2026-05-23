@@ -193,11 +193,23 @@ case class CometScanRule(session: SparkSession)
         // surface at execution time as `Generic URL error: Unable to recognise URL "..."`.
         // Decline here so Spark's reader -- which goes through the Hadoop FS API and can
         // resolve custom schemes -- handles the scan.
+        //
+        // EXCEPT schemes the user routes through libhdfs via
+        // `spark.hadoop.fs.comet.libhdfs.schemes` (e.g. `hdfs`, or a test `fake`): those
+        // ARE natively readable through the libhdfs object_store bridge, so they must NOT
+        // be declined here (regression guarded by ParquetReadFromFakeHadoopFsSuite).
+        val libhdfsSchemes: Set[String] = CometConf.COMET_LIBHDFS_SCHEMES.get() match {
+          case Some(s) => s.split(",").map(_.trim.toLowerCase(java.util.Locale.ROOT))
+              .filter(_.nonEmpty).toSet
+          case None => Set.empty
+        }
         val supportedSchemes =
-          Set("file", "s3", "s3a", "gs", "gcs", "oss", "abfss", "abfs", "wasbs", "wasb")
+          Set("file", "s3", "s3a", "gs", "gcs", "oss", "abfss", "abfs", "wasbs", "wasb") ++
+            libhdfsSchemes
         val unsupportedFsSchemes = r.location.rootPaths
           .map(p => p.toUri.getScheme)
-          .filter(s => s != null && !supportedSchemes.contains(s))
+          .filter(s =>
+            s != null && !supportedSchemes.contains(s.toLowerCase(java.util.Locale.ROOT)))
           .toSet
         if (unsupportedFsSchemes.nonEmpty) {
           return withInfo(
