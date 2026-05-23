@@ -28,7 +28,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, UnknownPartitioning}
-import org.apache.spark.sql.execution.{FileSourceScanExec, InSubqueryExec}
+import org.apache.spark.sql.execution.{FileSourceScanExec, InSubqueryExec, SparkPlan, SubqueryBroadcastExec}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
@@ -84,12 +84,52 @@ case class CometDeltaNativeScanExec(
   override val nodeName: String = s"CometDeltaNativeScan $tableRoot"
 
   override protected def doPrepare(): Unit = {
+    // `prepare()` (not execute) is safe for any subquery plan, including an
+    // unconverted adaptive-broadcast placeholder.
     dppFilters.foreach {
       case DynamicPruningExpression(e: InSubqueryExec) =>
         e.plan.prepare()
       case _ =>
     }
     super.doPrepare()
+  }
+
+  /** True when a DPP subquery is an adaptive-broadcast placeholder we can't
+   *  execute ourselves: the unwrapped Spark `SubqueryAdaptiveBroadcastExec` or
+   *  the Comet-wrapped `CometSubqueryAdaptiveBroadcastExec`. Both throw from
+   *  `doExecute()`; they only become executable once
+   *  `CometPlanAdaptiveDynamicPruningFilters` rewrites them to a
+   *  (Comet)SubqueryBroadcastExec. */
+  private def isUnexecutableDpp(plan: SparkPlan): Boolean =
+    plan.isInstanceOf[org.apache.spark.sql.execution.SubqueryAdaptiveBroadcastExec] ||
+      plan.isInstanceOf[CometSubqueryAdaptiveBroadcastExec]
+
+  // DPP support. The AQE DPP subquery on a partitioned Delta scan arrives as an
+  // unexecutable placeholder: CometExecRule wraps Spark's
+  // SubqueryAdaptiveBroadcastExec into CometSubqueryAdaptiveBroadcastExec, and
+  // CometPlanAdaptiveDynamicPruningFilters is supposed to rewrite it to an
+  // executable (Comet)SubqueryBroadcastExec -- but that rewritten scan copy is
+  // dropped when the enclosing native block is rebuilt (TreeNode.makeCopy can't
+  // carry @transient fields, #3510), so the live scan keeps the placeholder.
+  // We therefore (1) skip the placeholder in `ensureSubqueriesResolved` so it
+  // doesn't execute and crash, and (2) convert it on the fly during partition
+  // pruning in `applyDppFilters` (where the broadcast is already materialized)
+  // to recover the pruning values. Results are always correct; pruning applies
+  // when the scan recomputes partitions at execution.
+
+  // Comet's native-scan subquery lifecycle (see CometLeafExec). The default
+  // `prepare(); waitForSubqueries()` would execute EVERY collected subquery,
+  // including an unexecutable adaptive-broadcast placeholder -> crash. Resolve
+  // only the DPP subqueries we can execute; skip placeholders so pruning falls
+  // back to read-all instead of throwing.
+  override def ensureSubqueriesResolved(): Unit = {
+    prepare()
+    dppFilters.foreach {
+      case DynamicPruningExpression(inSub: InSubqueryExec)
+          if !isUnexecutableDpp(inSub.plan) && inSub.values().isEmpty =>
+        inSub.updateResult()
+      case _ =>
+    }
   }
 
   @transient private lazy val commonBytes: Array[Byte] = {
@@ -208,26 +248,40 @@ case class CometDeltaNativeScanExec(
 
   private def applyDppFilters(
       tasks: Seq[OperatorOuterClass.DeltaScanTask]): Seq[OperatorOuterClass.DeltaScanTask] = {
-    // If any DPP subquery is still a `SubqueryAdaptiveBroadcastExec` placeholder,
-    // AQE hasn't yet replaced it with the real broadcast plan. We can't execute
-    // it ourselves (that plan's `doExecute` throws), so skip pruning for this
-    // batch — the scan just reads all tasks, which is correct but slower.
-    val hasUnresolvedAdaptive = dppFilters.exists {
-      case DynamicPruningExpression(inSub: InSubqueryExec) =>
-        inSub.plan.isInstanceOf[org.apache.spark.sql.execution.SubqueryAdaptiveBroadcastExec]
-      case _ => false
-    }
-    if (hasUnresolvedAdaptive) return tasks
-    dppFilters.foreach {
-      case DynamicPruningExpression(inSub: InSubqueryExec) if inSub.values().isEmpty =>
-        inSub.updateResult()
-      case _ =>
-    }
-
-    val resolvedFilters = dppFilters.map {
-      case DynamicPruningExpression(e) => e
-      case other => other
-    }
+    // Resolve each DPP subquery to its runtime pruning values, then prune tasks
+    // by evaluating the partition predicate below.
+    //
+    // A DPP subquery may still be an adaptive-broadcast PLACEHOLDER that can't
+    // execute directly: the Comet-wrapped `CometSubqueryAdaptiveBroadcastExec`
+    // (produced by CometExecRule) or the unwrapped `SubqueryAdaptiveBroadcast
+    // Exec`. `CometPlanAdaptiveDynamicPruningFilters` normally rewrites these to
+    // an executable (Comet)SubqueryBroadcastExec, but that rewrite can be
+    // orphaned for a scan buried inside a native block (the converted copy is
+    // dropped when the parent block is rebuilt -- #3510), leaving the live scan
+    // with the placeholder. By the time we build per-partition data the
+    // broadcast the placeholder wraps is already materialized, so we convert it
+    // on the fly to an executable `SubqueryBroadcastExec` (its `child` is that
+    // materialized broadcast) and resolve THAT to recover the pruning values --
+    // so we still scan only the required partitions. Any failure falls back to
+    // returning all tasks (correct, just unpruned).
+    val resolvedFilters: Seq[Expression] =
+      try {
+        dppFilters.map {
+          case DynamicPruningExpression(inSub: InSubqueryExec) =>
+            val executable = inSub.plan match {
+              case csab: CometSubqueryAdaptiveBroadcastExec =>
+                inSub.copy(plan = SubqueryBroadcastExec(
+                  csab.name, csab.indices, csab.buildKeys, csab.child))
+              case _ => inSub
+            }
+            if (executable.values().isEmpty) executable.updateResult()
+            executable
+          case DynamicPruningExpression(e) => e
+          case other => other
+        }
+      } catch {
+        case scala.util.control.NonFatal(_) => return tasks
+      }
     if (resolvedFilters.isEmpty) return tasks
 
     val caseSensitive = SQLConf.get.getConf[Boolean](SQLConf.CASE_SENSITIVE)
