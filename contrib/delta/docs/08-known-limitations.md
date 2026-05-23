@@ -178,24 +178,58 @@ remains (A1 / #198).
   row-commit-version column, read it from parquet (don't synthesize).
 - **Tracking:** internal task #197 (F3).
 
-### B4. Other untriaged failures — PENDING
+  Repro: `CometDeltaPendingReproSuite` ("F3: row IDs are stable across
+  OPTIMIZE"), `ignore`d until fixed.
 
-Not yet root-caused; need triage (some may share a root cause with B2/B3 or be
-test-harness/transaction-visibility artifacts):
+### B4. Triage of remaining failures
 
-- MERGE family (not `isPartitioned`-gated): "DELETE MATCHED only MERGE",
-  "UPDATE MATCHED only MERGE", "DELETE/UPDATE WHEN NOT MATCHED BY SOURCE MERGE",
-  "UPDATE + DELETE WHEN NOT MATCHED BY SOURCE MERGE", "{DELETE,UPDATE} only with
-  source rows matching multiple target rows", "Multiple merges into the same
-  table", "Source and target referencing to the same table", "Target is accessed
-  through a view", "MERGE preserves Row Tracking on tables enabled using
-  backfill", "schema evolution, extra nested column in source - update".
-- DELETE with persistent DVs disabled (isPartitioned true/false).
-- Optimized writes (partitioned / unpartitioned / disabled).
-- Data skipping: "data skipping shouldn't use expressions involving a subquery",
-  "remove redundant stats column references in data skipping expression"
-  (and "old behavior with DataFrame schema" variants).
-- "SC-8810: skipping deleted file still throws on corrupted file".
+The originally-"untriaged" failures resolve into:
+
+- **Mostly B3 (row tracking).** "DELETE/UPDATE MATCHED only MERGE", "... WHEN NOT
+  MATCHED BY SOURCE", "{DELETE,UPDATE} only with source rows matching multiple
+  target rows", "Multiple merges into the same table", "Source and target
+  referencing to the same table", "Target is accessed through a view", "MERGE
+  preserves Row Tracking on tables enabled using backfill", "Optimized writes
+  (partitioned/unpartitioned/disabled)", "DELETE with persistent DVs disabled"
+  all live in `rowid/RowTracking{Merge,Delete,...}Suite` and fail the same way:
+  a stable row ID changes across a rewrite (e.g. "Row ID has change for row with
+  stored_id = 412"). Same root cause as B3 — the native scan synthesizes row IDs
+  instead of reading the materialized columns. Fixing B3/F3 should clear these.
+- **F1 (already fixed).** "data skipping shouldn't use expressions involving a
+  subquery" is the same `CometSubqueryAdaptiveBroadcastExec` DPP crash as B2 —
+  fixed by `64cd878a`. Confirm via re-run.
+
+### B5. Deeply-nested data-skipping expression — protobuf recursion limit — PENDING
+
+- **Test:** "remove redundant stats column references in data skipping
+  expression" (+ "old behavior with DataFrame schema" variant), from
+  `DataSkippingDeltaTests`.
+- **Symptom:** A WHERE with ~101 AND'd predicates produces a very deep boolean
+  expression; serializing it to Comet's native proto exceeds protobuf's default
+  recursion limit (100): `InvalidProtocolBufferException: Protocol message had
+  too many levels of nesting` from `ExprOuterClass$BinaryExpr.mergeFrom`.
+- **Fix direction:** raise the proto parse recursion limit
+  (`CodedInputStream.setRecursionLimit`) where Comet parses the plan/expr, or
+  rebalance/flatten deep AND/OR chains before serialization.
+- **Repro:** `CometDeltaPendingReproSuite` ("F4: deeply-nested data-skipping
+  filter ..."), `ignore`d until fixed.
+
+### B6. Corrupted-file read error compatibility (SC-8810) — PENDING
+
+- **Test:** "SC-8810: skipping deleted file still throws on corrupted file"
+  (`DeltaSuite`).
+- **Symptom:** With one data file truncated to 0 bytes, vanilla Spark+Delta
+  throws `[FAILED_READ_FILE.NO_HINT]`; Comet's native reader throws
+  `CometNativeException: External: Generic LocalFileSystem error: Requested range
+  was invalid` instead, so the test's message assertion fails.
+- **Fix direction:** map the native corrupted/short-file error to Spark's
+  `FAILED_READ_FILE` (or decline native and let Spark's reader produce it).
+- **Repro:** `CometDeltaPendingReproSuite` ("F6: reading a corrupted file ..."),
+  `ignore`d until fixed.
+
+All pending-failure repros live in `CometDeltaPendingReproSuite` (marked
+`ignore`; un-`ignore` to drive a fix). They are confirmed failing as of this
+writing.
 
 ---
 
