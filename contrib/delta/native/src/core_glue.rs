@@ -243,6 +243,24 @@ impl PhysicalPlanner {
         )
         .map_err(|e| GeneralError(format!("prepare_object_store_with_configs: {e}")))?;
 
+        // Filter pushdown is incompatible with `emit_is_row_deleted`. When the
+        // synthetic `__delta_internal_is_row_deleted` column is emitted, the
+        // DeltaSyntheticColumnsStream uses a running `current_row_offset` to look
+        // up `deleted_row_indexes` -- which assumes the parquet reader returns
+        // every row in physical order. With data-filter pushdown the reader may
+        // skip rows that don't match, leaving `current_row_offset` decoupled
+        // from the true parquet row_index. Result: DV indexes get applied to the
+        // wrong rows (audit-5 finding: filter `id > 10 AND id < 25` over a DV-
+        // bearing single-file table dropped 8 of 14 expected rows). Suppress
+        // data-filter pushdown when emit_is_row_deleted=true; Spark's outer
+        // Filter still applies the predicates correctly, just without parquet
+        // pruning. Partition filters are unaffected (they prune file groups
+        // before this point).
+        let data_filters_for_parquet = if common.emit_is_row_deleted {
+            Vec::new()
+        } else {
+            data_filters?
+        };
         let delta_exec = init_datasource_exec(
             Arc::clone(&required_schema),
             Some(data_schema),
@@ -250,7 +268,7 @@ impl PhysicalPlanner {
             object_store_url,
             file_groups,
             Some(projection_vector),
-            Some(data_filters?),
+            Some(data_filters_for_parquet),
             None, // default_values
             common.session_timezone.as_str(),
             common.case_sensitive,

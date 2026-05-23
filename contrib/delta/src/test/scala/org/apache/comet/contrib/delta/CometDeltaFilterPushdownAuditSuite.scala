@@ -169,15 +169,15 @@ class CometDeltaFilterPushdownAuditSuite extends CometDeltaTestBase {
     }
   }
 
-  // DISCOVERED GAP (audit found): on a DV-bearing table written with one
-  // file containing rows 0..29, a range filter `id > 10 AND id < 25`
-  // through the native scan drops rows 11..18 -- native returns 19..24
-  // while vanilla returns 11..24 (the DELETE id%4=0 evidently writes a DV
-  // but the *filter* path silently mis-prunes). Suspect: stats-based data
-  // skipping on min/max boundaries when DV-bearing files report stats
-  // that exclude DV'd rows. Regression coverage filed; flip to a positive
-  // matches check when the underlying mis-pruning is fixed.
-  test("GAP: DV + range filter mis-prunes rows in native scan") {
+  // Regression: DV + range filter. On a DV-bearing single-file table
+  // (rows 0..29, DELETE id%4=0), `id > 10 AND id < 25` once dropped rows
+  // 11..18 because data-filter pushdown to parquet skipped non-matching
+  // rows, decoupling DeltaSyntheticColumnsStream's running row-offset
+  // counter from the true parquet row_index -- so the DV bitmap got
+  // applied to the wrong stream positions. Fixed by suppressing
+  // data-filter pushdown when `emit_is_row_deleted` is set (core_glue.rs).
+  // This MUST now match vanilla exactly.
+  test("DV + range filter returns correct rows (regression)") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("flt_dv") { tablePath =>
       val ss = spark
@@ -191,18 +191,14 @@ class CometDeltaFilterPushdownAuditSuite extends CometDeltaTestBase {
         .option("delta.minWriterVersion", "7")
         .save(tablePath)
       spark.sql(s"DELETE FROM delta.`$tablePath` WHERE id % 4 = 0")
-      val df = spark.read.format("delta").load(tablePath)
-        .filter(col("id") > 10 && col("id") < 25).orderBy("id")
-      val nativeRows = df.collect().toSeq
-      withSQLConf("spark.comet.scan.deltaNative.enabled" -> "false") {
-        val vanillaRows = spark.read.format("delta").load(tablePath)
-          .filter(col("id") > 10 && col("id") < 25).orderBy("id").collect().toSeq
-        assert(
-          nativeRows.length < vanillaRows.length,
-          s"GAP CLOSED: DV+range-filter native scan now returns " +
-            s"${nativeRows.length} rows matching vanilla's ${vanillaRows.length}; " +
-            "flip this to a positive `assertDeltaNativeMatches` assertion")
-      }
+      assertDeltaNativeMatches(
+        tablePath, _.filter(col("id") > 10 && col("id") < 25).orderBy("id"))
+      // Also exercise filters whose pushdown range straddles the DV'd
+      // indexes from both sides.
+      assertDeltaNativeMatches(
+        tablePath, _.filter(col("id") < 10).orderBy("id"))
+      assertDeltaNativeMatches(
+        tablePath, _.filter(col("id") >= 5 && col("id") <= 28).orderBy("id"))
     }
   }
 }
