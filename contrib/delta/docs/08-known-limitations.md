@@ -256,6 +256,39 @@ The originally-"untriaged" failures resolve into:
 - **Guard:** `CometDeltaEdgeCaseRegressionSuite` ("F6: reading a corrupted file
   ..."). `SparkErrorConverterSuite` (base) unaffected (covers cast overflow).
 
+### B7. Row-tracking MERGE drops rows (materialized col absent from some files) — FIXED
+
+- **Tests:** `RowTrackingMergeCommonNameBasedCDCOnSuite` "INSERT NOT MATCHED only
+  MERGE", "UPDATE only with source rows matching multiple target rows", "DELETE
+  only with source rows matching multiple target rows" (and the same family in
+  other generated `RowTrackingMerge*` suites). Surfaced by the full 4.1 run; not
+  in the original baseline because those suites weren't reached before the run was
+  stopped. Regression introduced by B3 (F3).
+- **Symptom:** After an INSERT/MERGE on a row-tracking table, reading it back with
+  `_metadata.row_id` non-deterministically returned far fewer rows than written
+  (e.g. 1600–4800 of 6000 across runs). The CDF test's fullouter join then flagged
+  the missing rows as "deleted" and failed asserting a CDF delete entry exists.
+- **Root cause:** B3 reads the materialized `_row-id-col-<uuid>` as a real parquet
+  data column. That column is physically present only in files rewritten by a
+  row-id-preserving op — ABSENT from freshly appended/inserted files (often absent
+  from *every* file). When one Spark partition packs several such files, the native
+  scan emits one parquet file-group per file (needed for per-file `row_index`), and
+  reading a column physically absent from some files **across the
+  concurrently-executed file-groups** non-deterministically drops whole
+  file-groups' rows. Forcing one file per Spark partition reads the full row set
+  correctly — confirming it's the cross-file-group concurrency, not the null-fill
+  value. (Underlying: a latent core issue null-filling a projected-but-absent
+  column across concurrent file-groups in one `DataSourceExec`.)
+- **Fix:** `CometDeltaNativeScan.createExec` sets `oneTaskPerPartition = true` when
+  the scan reads materialized row-tracking columns, so each such file is its own
+  Spark partition → each native plan is single-file-group → the absent-column
+  null-fill runs without cross-file-group concurrency. Same mechanism already used
+  for `input_file_name()`.
+- **Guard:** `CometDeltaRowTrackingMergeReproSuite` (INSERT-only MERGE on a
+  row-tracking table; native key set == vanilla, full row count). Verified against
+  the failing `RowTrackingMergeCommonNameBasedCDCOnSuite` (17/17 pass).
+- **Tracking:** internal task #204.
+
 ---
 
 ## How to use this doc

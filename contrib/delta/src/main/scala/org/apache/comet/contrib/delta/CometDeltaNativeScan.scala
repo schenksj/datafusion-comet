@@ -1482,7 +1482,21 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       } finally {
         lastTaskListBytes.remove()
       }
-    val oneTaskPerPartition = scanNeedsInputFileName(op)
+    // Force one file per Spark partition when the scan reads MATERIALISED row-tracking
+    // columns (`_row-id-col-*` / `_row-commit-version-col-*`). These are real parquet
+    // columns present only in files rewritten by a row-id-preserving operation
+    // (OPTIMIZE/UPDATE/MERGE) -- and ABSENT from freshly-appended/inserted files. When a
+    // single Spark partition packs several such files, `core_glue` emits one parquet
+    // file-group per file (needed for per-file row_index); reading a column that is
+    // physically absent from some of those files across the concurrently-executed
+    // file-groups non-deterministically drops whole file-groups' rows. Pinning one file
+    // per partition keeps each native plan single-file-group, so the absent-column
+    // null-fill happens without cross-file-group concurrency. (Same mechanism already
+    // used for `input_file_name()`.) See CometDeltaRowTrackingMergeReproSuite.
+    val readsMaterializedRowTracking =
+      op.requiredSchema.fields.exists(f =>
+        CometDeltaNativeScan.isMaterializedRowTrackingName(f.name))
+    val oneTaskPerPartition = scanNeedsInputFileName(op) || readsMaterializedRowTracking
 
     val dppFilters = op.partitionFilters.filter(
       _.exists(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.PlanExpression[_]]))
