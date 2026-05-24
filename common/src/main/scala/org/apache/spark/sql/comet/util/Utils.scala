@@ -428,9 +428,8 @@ object Utils extends CometTypeShim with Logging {
    * `allocator`, sized to exactly `numRows`, and pre-filled with the constant
    * value (or null when `cv.isNullAt(0)`).
    *
-   * Supported types: Boolean, Byte, Short, Int, Long, Float, Double, Date, Timestamp,
-   * String, Binary, Decimal. Throws for unsupported types (struct/array/map). Add
-   * cases as new constant-column-on-partition shapes surface.
+   * All Spark types are supported (delegates to the per-type ArrowFieldWriters, which include
+   * struct/array/map); throws only for a type Arrow itself can't represent.
    */
   def materializeConstantColumnVector(
       cv: ConstantColumnVector,
@@ -438,159 +437,12 @@ object Utils extends CometTypeShim with Logging {
       numRows: Int,
       name: String,
       allocator: BufferAllocator): FieldVector = {
-    val isNull = cv.isNullAt(0)
-    def fillAllNull(vec: FieldVector): Unit = {
-      vec.setInitialCapacity(numRows)
-      vec.allocateNew()
-      var i = 0
-      while (i < numRows) {
-        vec.setNull(i)
-        i += 1
-      }
-      vec.setValueCount(numRows)
-    }
-    dt match {
-      case _: org.apache.spark.sql.types.BooleanType =>
-        val v = new BitVector(name, allocator)
-        if (isNull) { fillAllNull(v) } else {
-          v.setInitialCapacity(numRows); v.allocateNew()
-          val bit = if (cv.getBoolean(0)) 1 else 0
-          var i = 0; while (i < numRows) { v.set(i, bit); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.ByteType =>
-        val v = new TinyIntVector(name, allocator)
-        if (isNull) fillAllNull(v) else {
-          v.setInitialCapacity(numRows); v.allocateNew()
-          val b = cv.getByte(0); var i = 0
-          while (i < numRows) { v.set(i, b); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.ShortType =>
-        val v = new SmallIntVector(name, allocator)
-        if (isNull) fillAllNull(v) else {
-          v.setInitialCapacity(numRows); v.allocateNew()
-          val s = cv.getShort(0); var i = 0
-          while (i < numRows) { v.set(i, s); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.IntegerType =>
-        val v = new IntVector(name, allocator)
-        if (isNull) fillAllNull(v) else {
-          v.setInitialCapacity(numRows); v.allocateNew()
-          val x = cv.getInt(0); var i = 0
-          while (i < numRows) { v.set(i, x); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.LongType =>
-        val v = new BigIntVector(name, allocator)
-        if (isNull) fillAllNull(v) else {
-          v.setInitialCapacity(numRows); v.allocateNew()
-          val x = cv.getLong(0); var i = 0
-          while (i < numRows) { v.set(i, x); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.FloatType =>
-        val v = new Float4Vector(name, allocator)
-        if (isNull) fillAllNull(v) else {
-          v.setInitialCapacity(numRows); v.allocateNew()
-          val x = cv.getFloat(0); var i = 0
-          while (i < numRows) { v.set(i, x); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.DoubleType =>
-        val v = new Float8Vector(name, allocator)
-        if (isNull) fillAllNull(v) else {
-          v.setInitialCapacity(numRows); v.allocateNew()
-          val x = cv.getDouble(0); var i = 0
-          while (i < numRows) { v.set(i, x); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.DateType =>
-        val v = new DateDayVector(name, allocator)
-        if (isNull) fillAllNull(v) else {
-          v.setInitialCapacity(numRows); v.allocateNew()
-          val x = cv.getInt(0); var i = 0
-          while (i < numRows) { v.set(i, x); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.TimestampType =>
-        // Spark stores TimestampType as microseconds since epoch, in UTC.
-        val arrowType = new ArrowType.Timestamp(
-          org.apache.arrow.vector.types.TimeUnit.MICROSECOND, "UTC")
-        val field = new Field(name,
-          new FieldType(true, arrowType, null), java.util.Collections.emptyList[Field])
-        val v = field.createVector(allocator).asInstanceOf[TimeStampMicroTZVector]
-        if (isNull) fillAllNull(v) else {
-          v.setInitialCapacity(numRows); v.allocateNew()
-          val x = cv.getLong(0); var i = 0
-          while (i < numRows) { v.set(i, x); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.TimestampNTZType =>
-        // Spark stores TimestampNTZType as microseconds since epoch with NO timezone.
-        val arrowType = new ArrowType.Timestamp(
-          org.apache.arrow.vector.types.TimeUnit.MICROSECOND, null)
-        val field = new Field(name,
-          new FieldType(true, arrowType, null), java.util.Collections.emptyList[Field])
-        val v = field.createVector(allocator).asInstanceOf[TimeStampMicroVector]
-        if (isNull) fillAllNull(v) else {
-          v.setInitialCapacity(numRows); v.allocateNew()
-          val x = cv.getLong(0); var i = 0
-          while (i < numRows) { v.set(i, x); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.StringType =>
-        val v = new VarCharVector(name, allocator)
-        if (isNull) fillAllNull(v) else {
-          val bytes = cv.getUTF8String(0).getBytes
-          v.setInitialCapacity(numRows)
-          v.allocateNew(bytes.length.toLong * numRows, numRows)
-          var i = 0
-          while (i < numRows) { v.setSafe(i, bytes); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.BinaryType =>
-        val v = new VarBinaryVector(name, allocator)
-        if (isNull) fillAllNull(v) else {
-          val bytes = cv.getBinary(0)
-          v.setInitialCapacity(numRows)
-          v.allocateNew(bytes.length.toLong * numRows, numRows)
-          var i = 0
-          while (i < numRows) { v.setSafe(i, bytes); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case decType: org.apache.spark.sql.types.DecimalType =>
-        val arrowType = new ArrowType.Decimal(decType.precision, decType.scale, 128)
-        val field = new Field(name,
-          new FieldType(true, arrowType, null), java.util.Collections.emptyList[Field])
-        val v = field.createVector(allocator).asInstanceOf[DecimalVector]
-        if (isNull) fillAllNull(v) else {
-          v.setInitialCapacity(numRows); v.allocateNew()
-          val dec = cv.getDecimal(0, decType.precision, decType.scale).toJavaBigDecimal
-          var i = 0
-          while (i < numRows) { v.set(i, dec); i += 1 }
-          v.setValueCount(numRows)
-        }
-        v
-      case _: org.apache.spark.sql.types.NullType =>
-        val v = new NullVector(name, numRows)
-        v
-      case other =>
-        throw new SparkException(
-          s"materializeConstantColumnVector: unsupported data type for column '$name': $other")
-    }
+    // Delegate to the per-type ArrowFieldWriters (org.apache.spark.sql.comet.execution.arrow),
+    // which cover every type -- including struct/array/map -- and stay in sync with Spark's
+    // type handling, rather than a hand-rolled per-type switch. TimestampType is materialised
+    // with a "UTC" zone to match the prior behaviour here (Spark stores it as micros in UTC);
+    // TimestampNTZ carries no zone regardless of this argument.
+    org.apache.spark.sql.comet.execution.arrow.ConstantColumnVectors
+      .materialize(cv, dt, numRows, name, allocator, "UTC")
   }
 }
