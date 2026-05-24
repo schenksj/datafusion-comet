@@ -91,9 +91,12 @@ class CometDeltaRowTrackingMergeReproSuite extends CometDeltaTestBase {
       val scans = collect(plan) { case s: CometDeltaNativeScanExec => s }
       assert(scans.nonEmpty, s"expected CometDeltaNativeScanExec in plan:\n$plan")
 
-      // Differential vs vanilla Delta reader (native scan disabled).
-      val vanillaKeys = withSQLConf("spark.comet.scan.deltaNative.enabled" -> "false") {
-        readBack().collect().map(_.getLong(0)).toSet
+      // Differential vs vanilla Delta reader (native scan disabled). Assign via a var
+      // because `withSQLConf` returns Unit on Spark 3.5 (it returns the block value only
+      // on Spark 4.x); this pattern compiles on both.
+      var vanillaKeys: Set[Long] = Set.empty
+      withSQLConf("spark.comet.scan.deltaNative.enabled" -> "false") {
+        vanillaKeys = readBack().collect().map(_.getLong(0)).toSet
       }
 
       val nativeKeys = nativeRows.map(_.getLong(0)).toSet
