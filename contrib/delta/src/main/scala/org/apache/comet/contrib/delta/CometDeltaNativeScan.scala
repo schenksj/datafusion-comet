@@ -166,6 +166,54 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       .contains("true")
 
   /**
+   * True when the native plan will emit one parquet file-group per file (core_glue's
+   * `need_per_file_groups`): any `_metadata.*` virtual column / per-file row-tracking
+   * constant (`base_row_id`, `default_row_commit_version`) is requested, or a synthesized
+   * row-index / is-row-deleted / row_id / row_commit_version column is. These are all
+   * per-file values, so each file becomes its own group. When a Spark partition packs
+   * several files, those per-file groups execute concurrently and the synthetic-column
+   * append can mis-align with / drop whole groups (non-deterministically) -- the same class
+   * of bug fixed for materialised row-tracking columns and `input_file_name()`. Forcing one
+   * file per partition keeps every native plan single-file-group. See
+   * CometDeltaDefaultRowCommitVersionReproSuite / DefaultRowCommitVersionSuite,
+   * [[isMaterializedRowTrackingName]], and `project_concurrent_missing_column_drop`.
+   */
+  private[delta] def needsPerFileGroups(scan: CometScanExec): Boolean = {
+    val outNames = scan.output.map(_.name.toLowerCase(Locale.ROOT)).toSet
+    val reqNames = scan.requiredSchema.fieldNames.map(_.toLowerCase(Locale.ROOT)).toSet
+    // `_metadata.*` virtual columns + per-file row-tracking constants (these always force
+    // per-file groups natively because each carries a per-file value).
+    val perFileMetadataNames = Set(
+      "file_path",
+      "file_name",
+      "file_size",
+      "file_block_start",
+      "file_block_length",
+      "file_modification_time",
+      "base_row_id",
+      "default_row_commit_version")
+    // Synthesized columns (never physical): row index + is-row-deleted.
+    val syntheticNames = Set(
+      "__delta_internal_row_index",
+      "_tmp_metadata_row_index",
+      "__delta_internal_is_row_deleted")
+    // row_id / row_commit_version are synthesized (-> per-file) only when row tracking is
+    // enabled; otherwise they are ordinary user column names (see the emit-flag gating in
+    // `convert`), so don't force per-file groups for them.
+    val rowTrackingEnabled =
+      DeltaReflection.extractMetadataConfiguration(scan.relation).exists { cfg =>
+        cfg.get(DeltaReflection.EnableRowTrackingProp).exists(_.equalsIgnoreCase("true")) ||
+          cfg.contains(DeltaReflection.MaterializedRowIdColumnProp) ||
+          cfg.contains(DeltaReflection.MaterializedRowCommitVersionColumnProp)
+      }
+    outNames.exists(perFileMetadataNames.contains) ||
+      reqNames.exists(syntheticNames.contains) ||
+      (rowTrackingEnabled &&
+        (reqNames.contains(DeltaReflection.RowIdColumnName) ||
+          reqNames.contains(DeltaReflection.RowCommitVersionColumnName)))
+  }
+
+  /**
    * Reflectively resolve Hadoop's AWSCredentialProviderList for an s3/s3a URI and merge
    * the resulting (access, secret, optional token) triple into `baseOptions` under the
    * standard `fs.s3a.access.key` / `fs.s3a.secret.key` / `fs.s3a.session.token` keys --
@@ -1552,7 +1600,8 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     val readsMaterializedRowTracking =
       op.requiredSchema.fields.exists(f =>
         CometDeltaNativeScan.isMaterializedRowTrackingName(f.name))
-    val oneTaskPerPartition = scanNeedsInputFileName(op) || readsMaterializedRowTracking
+    val oneTaskPerPartition = scanNeedsInputFileName(op) || readsMaterializedRowTracking ||
+      CometDeltaNativeScan.needsPerFileGroups(op)
 
     val dppFilters = op.partitionFilters.filter(
       _.exists(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.PlanExpression[_]]))
