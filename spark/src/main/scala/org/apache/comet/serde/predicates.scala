@@ -73,7 +73,9 @@ object CometAnd extends CometExpressionSerde[And] {
     // produce a shallow proto instead of a left-deep one that overflows protobuf's
     // recursion limit when the plan is re-parsed (see createBalancedBinaryExpr).
     val operands = flattenAssociative(
-      expr, { case _: And => true; case _ => false }, { case a: And => (a.left, a.right) })
+      expr,
+      { case _: And => true; case _ => false },
+      { case a: And => (a.left, a.right) })
     createBalancedBinaryExpr(
       expr,
       operands,
@@ -89,7 +91,9 @@ object CometOr extends CometExpressionSerde[Or] {
       inputs: Seq[Attribute],
       binding: Boolean): Option[ExprOuterClass.Expr] = {
     val operands = flattenAssociative(
-      expr, { case _: Or => true; case _ => false }, { case o: Or => (o.left, o.right) })
+      expr,
+      { case _: Or => true; case _ => false },
+      { case o: Or => (o.left, o.right) })
     createBalancedBinaryExpr(
       expr,
       operands,

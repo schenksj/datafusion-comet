@@ -199,8 +199,11 @@ case class CometScanRule(session: SparkSession)
         // ARE natively readable through the libhdfs object_store bridge, so they must NOT
         // be declined here (regression guarded by ParquetReadFromFakeHadoopFsSuite).
         val libhdfsSchemes: Set[String] = CometConf.COMET_LIBHDFS_SCHEMES.get() match {
-          case Some(s) => s.split(",").map(_.trim.toLowerCase(java.util.Locale.ROOT))
-              .filter(_.nonEmpty).toSet
+          case Some(s) =>
+            s.split(",")
+              .map(_.trim.toLowerCase(java.util.Locale.ROOT))
+              .filter(_.nonEmpty)
+              .toSet
           case None => Set.empty
         }
         val supportedSchemes =

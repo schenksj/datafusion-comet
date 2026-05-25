@@ -883,11 +883,10 @@ abstract class CometLeafExec extends CometNativeExec with LeafExecNode {
  * task bytes keyed by `sourceKey`) so that a parent `CometNativeExec` can find and inject the
  * data when the scan is fused into a larger native subtree.
  *
- * Implemented by `CometNativeScanExec` and the contrib's `CometDeltaNativeScanExec` --
- * without it, [[PlanDataInjector.findAllPlanData]] cannot collect the per-partition tasks
- * and the parent's native execution receives an empty input.
- * (`CometIcebergNativeScanExec` does NOT use this trait; it has a dedicated
- * `findAllPlanData` case.)
+ * Implemented by `CometNativeScanExec` and the contrib's `CometDeltaNativeScanExec` -- without
+ * it, [[PlanDataInjector.findAllPlanData]] cannot collect the per-partition tasks and the
+ * parent's native execution receives an empty input. (`CometIcebergNativeScanExec` does NOT use
+ * this trait; it has a dedicated `findAllPlanData` case.)
  *
  * Each implementation also resolves its own DPP subqueries via `ensureSubqueriesResolved`
  * (overridden from [[CometLeafExec]]) before `commonData`/`perPartitionData` are read.

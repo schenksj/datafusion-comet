@@ -776,25 +776,26 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
   }
 
   /**
-   * Serialize an associative boolean chain (`And` / `Or`) as a BALANCED BinaryExpr tree of
-   * depth O(log n) instead of the natural left-deep O(n). A query with many ANDed/ORed
-   * predicates (e.g. Delta data-skipping expressions, or a wide `WHERE a AND b AND ...`)
-   * otherwise builds a deeply-nested proto that overflows protobuf's default recursion
-   * limit (100) when the serialized plan is re-parsed -- on the JVM
-   * (`OperatorOuterClass.Operator.parseFrom`, e.g. `findShuffleScanIndices` / explain) and
-   * in the Rust prost decoder. Comet evaluates `And`/`Or` vectorially (both sides always
-   * evaluated, no row-level short-circuit), so rebalancing the associative chain is
-   * semantically identical -- it only changes the proto's shape.
+   * Serialize an associative boolean chain (`And` / `Or`) as a BALANCED BinaryExpr tree of depth
+   * O(log n) instead of the natural left-deep O(n). A query with many ANDed/ORed predicates (e.g.
+   * Delta data-skipping expressions, or a wide `WHERE a AND b AND ...`) otherwise builds a
+   * deeply-nested proto that overflows protobuf's default recursion limit (100) when the
+   * serialized plan is re-parsed -- on the JVM (`OperatorOuterClass.Operator.parseFrom`, e.g.
+   * `findShuffleScanIndices` / explain) and in the Rust prost decoder. Comet evaluates `And`/`Or`
+   * vectorially (both sides always evaluated, no row-level short-circuit), so rebalancing the
+   * associative chain is semantically identical -- it only changes the proto's shape.
    *
-   * `operands` are the flattened leaves of the chain (see `flattenAssociative`); `wrap`
-   * tags each combined BinaryExpr as `And` or `Or`.
+   * `operands` are the flattened leaves of the chain (see `flattenAssociative`); `wrap` tags each
+   * combined BinaryExpr as `And` or `Or`.
    */
   def createBalancedBinaryExpr(
       expr: Expression,
       operands: Seq[Expression],
       inputs: Seq[Attribute],
       binding: Boolean,
-      wrap: (ExprOuterClass.Expr.Builder, ExprOuterClass.BinaryExpr) => ExprOuterClass.Expr.Builder)
+      wrap: (
+          ExprOuterClass.Expr.Builder,
+          ExprOuterClass.BinaryExpr) => ExprOuterClass.Expr.Builder)
       : Option[ExprOuterClass.Expr] = {
     val protos = operands.map(exprToProtoInternal(_, inputs, binding))
     if (protos.exists(_.isEmpty)) {
@@ -819,10 +820,9 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
   }
 
   /**
-   * Flatten an associative binary chain into its leaf operands. `matches` identifies the
-   * same operator (e.g. `case _: And => true`) and `children` extracts its two operands.
-   * Used to rebalance deep `And`/`Or` chains before serialization (see
-   * `createBalancedBinaryExpr`).
+   * Flatten an associative binary chain into its leaf operands. `matches` identifies the same
+   * operator (e.g. `case _: And => true`) and `children` extracts its two operands. Used to
+   * rebalance deep `And`/`Or` chains before serialization (see `createBalancedBinaryExpr`).
    */
   def flattenAssociative(
       expr: Expression,

@@ -267,21 +267,21 @@ class CometExecIterator(
 object CometExecIterator extends Logging {
 
   /**
-   * True when a native error message indicates a per-file read failure that Spark would
-   * surface as `FAILED_READ_FILE.NO_HINT` (so we wrap it via
-   * `ShimSparkErrorConverter.wrapNativeParquetError` for error compatibility, e.g.
-   * DeltaSuite "SC-8810: skipping deleted file still throws on corrupted file").
+   * True when a native error message indicates a per-file read failure that Spark would surface
+   * as `FAILED_READ_FILE.NO_HINT` (so we wrap it via
+   * `ShimSparkErrorConverter.wrapNativeParquetError` for error compatibility, e.g. DeltaSuite
+   * "SC-8810: skipping deleted file still throws on corrupted file").
    *
    * Beyond DataFusion's "Parquet error: ..." (corrupt footer etc.), a truncated/empty or
-   * otherwise unreadable file fails earlier in the object_store layer, before parquet
-   * parsing -- e.g. a 0-byte file footer read gives "Requested range was invalid", and a
-   * deleted file gives "Object at location ... not found". These are still file-read
-   * failures and must wrap the same way.
+   * otherwise unreadable file fails earlier in the object_store layer, before parquet parsing --
+   * e.g. a 0-byte file footer read gives "Requested range was invalid", and a deleted file gives
+   * "Object at location ... not found". These are still file-read failures and must wrap the same
+   * way.
    *
-   * We match those specific IO phrasings rather than the broad object_store "Generic
-   * <Store> error:" prefix, because that prefix is also produced for NON-file config
-   * errors -- e.g. "Generic HadoopFileSystem error: Hdfs support is not enabled in this
-   * build" -- which must surface as-is, not masked behind FAILED_READ_FILE.
+   * We match those specific IO phrasings rather than the broad object_store "Generic <Store>
+   * error:" prefix, because that prefix is also produced for NON-file config errors -- e.g.
+   * "Generic HadoopFileSystem error: Hdfs support is not enabled in this build" -- which must
+   * surface as-is, not masked behind FAILED_READ_FILE.
    */
   def isFileReadError(message: String): Boolean = {
     if (message == null) return false

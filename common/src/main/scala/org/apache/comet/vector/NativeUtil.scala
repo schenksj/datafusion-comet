@@ -172,16 +172,10 @@ class NativeUtil {
           val rows = batch.numRows()
           numRows += rows
           val materialised = org.apache.spark.sql.comet.util.Utils
-            .materializeConstantColumnVector(cv, cv.dataType(), rows,
-              s"_const_$index", allocator)
+            .materializeConstantColumnVector(cv, cv.dataType(), rows, s"_const_$index", allocator)
           val arrowSchema = ArrowSchema.wrap(schemaAddrs(index))
           val arrowArray = ArrowArray.wrap(arrayAddrs(index))
-          Data.exportVector(
-            allocator,
-            materialised,
-            null,
-            arrowArray,
-            arrowSchema)
+          Data.exportVector(allocator, materialised, null, arrowArray, arrowSchema)
         case c =>
           throw new SparkException(
             "Comet execution only takes Arrow Arrays, but got " +

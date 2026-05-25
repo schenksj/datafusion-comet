@@ -415,18 +415,17 @@ object Utils extends CometTypeShim with Logging {
   }
 
   /**
-   * Materialize a Spark `ConstantColumnVector` into a fresh Arrow `FieldVector` whose
-   * value is the same constant repeated `numRows` times.
+   * Materialize a Spark `ConstantColumnVector` into a fresh Arrow `FieldVector` whose value is
+   * the same constant repeated `numRows` times.
    *
    * Spark wraps file-source partition columns and other per-batch constants in
-   * `ConstantColumnVector`; downstream Comet operators feeding `NativeUtil.exportBatch`
-   * trip on it because exportBatch only knows how to handle `CometVector`. This helper
-   * lets the export path materialise the constant into an Arrow vector inline.
+   * `ConstantColumnVector`; downstream Comet operators feeding `NativeUtil.exportBatch` trip on
+   * it because exportBatch only knows how to handle `CometVector`. This helper lets the export
+   * path materialise the constant into an Arrow vector inline.
    *
-   * The caller owns the returned vector and must close it (or hand it to Arrow's
-   * exporter which transfers ownership). The vector is allocated against
-   * `allocator`, sized to exactly `numRows`, and pre-filled with the constant
-   * value (or null when `cv.isNullAt(0)`).
+   * The caller owns the returned vector and must close it (or hand it to Arrow's exporter which
+   * transfers ownership). The vector is allocated against `allocator`, sized to exactly
+   * `numRows`, and pre-filled with the constant value (or null when `cv.isNullAt(0)`).
    *
    * All Spark types are supported (delegates to the per-type ArrowFieldWriters, which include
    * struct/array/map); throws only for a type Arrow itself can't represent.
