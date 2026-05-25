@@ -75,4 +75,18 @@ object DeltaConf {
    * `InputFileBlockHolder` to the correct path.
    */
   val NeedsInputFileNameOption: String = "comet.contrib.delta.needsInputFileName"
+
+  /**
+   * Relation-options key carrying the JSON of the analysis-time Delta schema
+   * (`DeltaParquetFileFormat.referenceSchema`), captured by `DeltaScanRule` while the original
+   * Delta file format is still present. Core Comet later replaces the file format with
+   * `CometParquetFileFormat` (dropping `referenceSchema`) and the FileIndex may re-resolve to
+   * the latest snapshot, so without this the native scan would resolve column-mapping physical
+   * names / field-ids against the LATEST schema instead of the one the query was analyzed with
+   * -- returning new data where a column was renamed/re-physicalised should read NULL
+   * (DeltaColumnMappingSuite "physical name changes" / "explicit id matching"). The value is a
+   * `StructType.json` whose fields preserve `delta.columnMapping.physicalName` /
+   * `delta.columnMapping.id` metadata.
+   */
+  val AnalyzedSchemaJsonOption: String = "comet.contrib.delta.analyzedSchemaJson"
 }

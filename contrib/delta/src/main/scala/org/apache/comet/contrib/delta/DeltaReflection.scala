@@ -194,6 +194,22 @@ object DeltaReflection extends Logging {
    * `delta.rowTracking.materializedRowIdColumnName`. Used by the CometScanRule row-tracking
    * support to discover the physical column name into which Delta has materialised `row_id`.
    */
+  /**
+   * The analysis-time Delta schema from `DeltaParquetFileFormat.referenceSchema` (= the
+   * captured `Metadata.schema`). Available only while the ORIGINAL Delta file format is still
+   * present (e.g. in `DeltaScanRule`, before core Comet replaces it with
+   * `CometParquetFileFormat`). Its fields preserve `delta.columnMapping.physicalName` /
+   * `delta.columnMapping.id` metadata, so it is the correct source for resolving column-mapping
+   * physical names / field-ids against the schema the query was analyzed with (rather than the
+   * latest snapshot). Returns None when the file format isn't a Delta format exposing it.
+   */
+  def extractFileFormatReferenceSchema(relation: HadoopFsRelation): Option[StructType] =
+    try {
+      invokeNoArg(relation.fileFormat, "referenceSchema").collect { case s: StructType => s }
+    } catch {
+      case scala.util.control.NonFatal(_) => None
+    }
+
   def extractMetadataConfiguration(relation: HadoopFsRelation): Option[Map[String, String]] = {
     try {
       val location: Any = relation.location

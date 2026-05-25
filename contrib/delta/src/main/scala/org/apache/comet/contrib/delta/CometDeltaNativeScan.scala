@@ -657,10 +657,22 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // `delta.columnMapping.physicalName` in its metadata when the table uses
     // column mapping. Without this the native scan can't translate logical
     // column references to physical parquet column names and returns nulls.
-    // Fetch the Snapshot-level schema via reflection once here; used both to populate column
-    // mappings from the data-schema side (metadata on relation.dataSchema is stripped) and
-    // later to physicalise nested field names before serialisation.
-    val snapshotSchemaEarly: Option[StructType] = DeltaReflection.extractSnapshotSchema(relation)
+    // Fetch the schema used to resolve column-mapping physical names / field-ids. Prefer the
+    // ANALYSIS-TIME schema that DeltaScanRule stashed from the original
+    // DeltaParquetFileFormat.referenceSchema (relation.options): the FileIndex / live snapshot
+    // may have moved on (RENAME COLUMN, overwriteSchema) since the query was analyzed, and the
+    // query must read against the schema it was planned with -- otherwise a column whose
+    // physical name / field-id changed reads the new data instead of NULL (DeltaColumnMapping
+    // Suite "physical name changes" / "explicit id matching"). Fall back to the live snapshot
+    // schema when the option is absent (e.g. the Delta-FileIndex-over-plain-ParquetFileFormat
+    // shape, where referenceSchema was never available).
+    val analyzedSchemaFromOption: Option[StructType] =
+      relation.options.get(DeltaConf.AnalyzedSchemaJsonOption).flatMap { json =>
+        try Some(DataType.fromJson(json).asInstanceOf[StructType])
+        catch { case scala.util.control.NonFatal(_) => None }
+      }
+    val snapshotSchemaEarly: Option[StructType] =
+      analyzedSchemaFromOption.orElse(DeltaReflection.extractSnapshotSchema(relation))
     // Only honour physicalName metadata when the table actually has column mapping
     // mode enabled. Some Delta test helpers (e.g. `DeltaSourceSuiteBase.withMetadata`)
     // call `DeltaColumnMapping.assignColumnIdAndPhysicalName` unconditionally, which

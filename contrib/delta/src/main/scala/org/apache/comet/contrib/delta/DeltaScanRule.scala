@@ -261,9 +261,27 @@ object DeltaScanRule {
       a.name.equalsIgnoreCase("file_path")
     }
     val needsOneTaskPerPartition = needsInputFileName || needsMetadataPerFile
-    val scanForDelta = if (needsOneTaskPerPartition) {
-      val taggedOptions = scanExec.relation.options +
-        (DeltaConf.NeedsInputFileNameOption -> "true")
+    // Capture the analysis-time Delta schema (DeltaParquetFileFormat.referenceSchema) NOW,
+    // while the original Delta file format is still present. Core Comet will replace the file
+    // format with CometParquetFileFormat (which drops referenceSchema) and the FileIndex may
+    // re-resolve to the latest snapshot, so this is the only point where the schema the query
+    // was analyzed with is available. Stash it in relation.options (which survive both copies)
+    // so the native scan resolves column-mapping physical names / field-ids against it rather
+    // than the latest snapshot. See DeltaColumnMappingSuite "physical name changes" /
+    // "explicit id matching" and CometDeltaColumnMappingPhysicalNameReproSuite.
+    val withInputFileName =
+      if (needsOneTaskPerPartition) {
+        scanExec.relation.options + (DeltaConf.NeedsInputFileNameOption -> "true")
+      } else {
+        scanExec.relation.options
+      }
+    val taggedOptions =
+      DeltaReflection.extractFileFormatReferenceSchema(scanExec.relation) match {
+        case Some(refSchema) =>
+          withInputFileName + (DeltaConf.AnalyzedSchemaJsonOption -> refSchema.json)
+        case None => withInputFileName
+      }
+    val scanForDelta = if (taggedOptions != scanExec.relation.options) {
       val taggedRelation = scanExec.relation.copy(options = taggedOptions)(
         scanExec.relation.sparkSession)
       scanExec.copy(relation = taggedRelation)
