@@ -210,6 +210,23 @@ index 0000000..dc3a297
 +    }
 +  }
 +}
+diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaErrorsSuite.scala b/spark/src/test/scala/org/apache/spark/sql/delta/DeltaErrorsSuite.scala
+index cf9c9b4..cc91cd0 100644
+--- a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaErrorsSuite.scala
++++ b/spark/src/test/scala/org/apache/spark/sql/delta/DeltaErrorsSuite.scala
+@@ -200,7 +200,11 @@ trait DeltaErrorsSuiteBase
+     }
+   }
+ 
+-  test("Validate that links to docs in DeltaErrors are correct") {
++  // Comet regression (contrib/delta/dev/diffs/3.3.2.diff): this test fetches live
++  // docs.delta.io URLs and fails them on any non-200 response. The docs site now 301-redirects
++  // some of these links (e.g. delta-update.html#operation-semantics), so the test fails for a
++  // reason entirely unrelated to Comet and dependent on external network state. Ignore it.
++  ignore("Validate that links to docs in DeltaErrors are correct") {
+     // verify DeltaErrors.errorsWithDocsLinks is consistent with DeltaErrorsSuite
+     assert(errorsToTest.keySet ++ otherMessagesToTest.keySet ==
+       DeltaErrors.errorsWithDocsLinks.toSet
 diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSinkSuite.scala b/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSinkSuite.scala
 index 0a2826c..d5e4100 100644
 --- a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSinkSuite.scala
