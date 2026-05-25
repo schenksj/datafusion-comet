@@ -335,6 +335,27 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       _.equalsIgnoreCase(DeltaReflection.RowIndexColumnName))
     val rowIndexTmpMetadataPresent = scan.requiredSchema.fieldNames.exists(
       _.equalsIgnoreCase(DeltaReflection.TmpMetadataRowIndexColumnName))
+    // Both names denote the same physical value (the parquet row index), but they can
+    // appear together in a single scan: DELETE/UPDATE/MERGE on a DV-enabled table with
+    // `spark.databricks.delta.deletionVectors.useMetadataRowIndex=false` reads files that
+    // already carry a deletion vector. There the scan needs `_metadata.row_index`
+    // (-> `_tmp_metadata_row_index`) to APPLY the existing DV and the explicit
+    // `__delta_internal_row_index` column to build the NEW DV bitmap. Native synthesis
+    // emits a single row-index column under one name, and the final-reorder Projection
+    // names its outputs from the wrapped (native) schema, so it cannot produce two
+    // distinctly-named row-index outputs. Rather than misname them, fall back to Spark's
+    // Delta reader for this scan. This shape only arises in Delta's internal DV-maintenance
+    // read (never a user query), so there is no user-facing perf impact; the common
+    // useMetadataRowIndex=true path (a single row-index name) is unaffected.
+    // Repro: CometDeltaDeleteWithDVReproSuite; regression: DeleteSQLWithDeletionVectorsSuite.
+    if (rowIndexCanonicalPresent && rowIndexTmpMetadataPresent) {
+      logInfo(
+        "CometDeltaNativeScan: scan.requiredSchema requests both " +
+          s"${DeltaReflection.RowIndexColumnName} and " +
+          s"${DeltaReflection.TmpMetadataRowIndexColumnName} (DV-maintenance read with " +
+          "useMetadataRowIndex=false); falling back to Spark's Delta reader for this scan.")
+      return None
+    }
     val emitRowIndex = rowIndexCanonicalPresent || rowIndexTmpMetadataPresent
     val rowIndexColumnAlias: String =
       if (rowIndexTmpMetadataPresent && !rowIndexCanonicalPresent)
