@@ -304,6 +304,14 @@ object DeltaReflection extends Logging {
     }
   }
 
+  /**
+   * Table property key set to "true" when row tracking is enabled (Delta's
+   * `DeltaConfigs.ROW_TRACKING_ENABLED`, key `enableRowTracking`). Only then are `row_id` /
+   * `row_commit_version` reserved synthetic column names; otherwise they are ordinary user
+   * column names.
+   */
+  val EnableRowTrackingProp: String = "delta.enableRowTracking"
+
   /** Property key for the physical column name Delta materialises row IDs into. */
   val MaterializedRowIdColumnProp: String =
     "delta.rowTracking.materializedRowIdColumnName"

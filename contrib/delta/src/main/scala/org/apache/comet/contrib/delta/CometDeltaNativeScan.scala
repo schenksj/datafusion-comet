@@ -363,9 +363,25 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       else ""
     val emitIsRowDeleted = scan.requiredSchema.fieldNames.exists(
       _.equalsIgnoreCase(DeltaReflection.IsRowDeletedColumnName))
-    val emitRowId = scan.requiredSchema.fieldNames.exists(_.equalsIgnoreCase(DeltaReflection.RowIdColumnName))
-    val emitRowCommitVersion = scan.requiredSchema.fieldNames.exists(
-      _.equalsIgnoreCase(DeltaReflection.RowCommitVersionColumnName))
+    // `row_id` / `row_commit_version` are reserved names ONLY when row tracking is enabled --
+    // then they are metadata columns we synthesize (baseRowId + row_index, etc.). With row
+    // tracking disabled they are ordinary user column names with no special meaning, and a
+    // user table may legitimately have a physical column called `row_id`. Deriving the emit
+    // flags purely from the column name mistook such a user column for the synthetic, stripped
+    // it from the parquet read, and synthesized garbage (RowIdSuite "row_id column with row ids
+    // disabled" -> NPE/wrong values). Gate the synthetic emit on row tracking actually being
+    // enabled on the table. Repro: CometDeltaRowIdColumnCollisionReproSuite.
+    val rowTrackingEnabled: Boolean =
+      DeltaReflection.extractMetadataConfiguration(relation).exists { cfg =>
+        cfg.get(DeltaReflection.EnableRowTrackingProp).exists(_.equalsIgnoreCase("true")) ||
+          cfg.contains(DeltaReflection.MaterializedRowIdColumnProp) ||
+          cfg.contains(DeltaReflection.MaterializedRowCommitVersionColumnProp)
+      }
+    val emitRowId = rowTrackingEnabled &&
+      scan.requiredSchema.fieldNames.exists(_.equalsIgnoreCase(DeltaReflection.RowIdColumnName))
+    val emitRowCommitVersion = rowTrackingEnabled &&
+      scan.requiredSchema.fieldNames.exists(
+        _.equalsIgnoreCase(DeltaReflection.RowCommitVersionColumnName))
 
     val ignoreMissingFiles =
       SQLConf.get.ignoreMissingFiles ||
