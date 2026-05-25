@@ -243,6 +243,32 @@ index 5cf16f3..ccbf713 100644
        }
  
        // Force the query to read files and generate metrics
+diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/perf/OptimizeGeneratedColumnSuite.scala b/spark/src/test/scala/org/apache/spark/sql/delta/perf/OptimizeGeneratedColumnSuite.scala
+index dc7197f..d0d9998 100644
+--- a/spark/src/test/scala/org/apache/spark/sql/delta/perf/OptimizeGeneratedColumnSuite.scala
++++ b/spark/src/test/scala/org/apache/spark/sql/delta/perf/OptimizeGeneratedColumnSuite.scala
+@@ -32,6 +32,7 @@ import org.apache.spark.sql.delta.test.DeltaTestImplicits._
+ import org.apache.spark.sql.{DataFrame, Row}
+ import org.apache.spark.sql.catalyst.TableIdentifier
+ import org.apache.spark.sql.catalyst.expressions.Expression
++import org.apache.spark.sql.comet.{CometDeltaNativeScanExec, CometScanExec}
+ import org.apache.spark.sql.execution.{FileSourceScanExec, QueryExecution}
+ import org.apache.spark.sql.types.TimestampType
+ import org.apache.spark.util.ThreadUtils
+@@ -46,6 +47,13 @@ class OptimizeGeneratedColumnSuite extends GeneratedColumnTest {
+   private def getPushedPartitionFilters(queryExecution: QueryExecution): Seq[Expression] = {
+     queryExecution.executedPlan.collectFirst {
+       case scan: FileSourceScanExec => scan.partitionFilters
++      // Comet wraps/replaces FileSourceScanExec. OptimizeGeneratedColumn is a logical
++      // optimizer rule, so it still attaches the partition filter -- visible on the Comet
++      // scan node (CometScanExec.partitionFilters; CometDeltaNativeScanExec keeps the
++      // original FileSourceScanExec as `originalPlan`). Without these cases the extractor
++      // returns Nil under Comet and every *PartitionExpr* assertion fails spuriously.
++      case scan: CometScanExec => scan.partitionFilters
++      case scan: CometDeltaNativeScanExec => scan.originalPlan.partitionFilters
+     }.getOrElse(Nil)
+   }
+ 
 diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/test/DeltaHiveTest.scala b/spark/src/test/scala/org/apache/spark/sql/delta/test/DeltaHiveTest.scala
 index ceece28..cd9948d 100644
 --- a/spark/src/test/scala/org/apache/spark/sql/delta/test/DeltaHiveTest.scala
