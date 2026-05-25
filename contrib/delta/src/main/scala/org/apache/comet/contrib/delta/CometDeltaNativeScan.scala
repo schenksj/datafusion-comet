@@ -697,9 +697,28 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // row_index)` needs). Treating them as synthetic (the previous behaviour) made the
     // scan synthesise base_row_id+row_index instead, so row IDs were not stable across
     // rewrites. See F3 in docs/08-known-limitations.md.
+    // Delta also allows the materialised row-id / row-commit-version columns to have a
+    // CUSTOM physical name, declared in the table config under
+    // `delta.rowTracking.materialized{RowId,RowCommitVersion}ColumnName` (e.g. tables
+    // CONVERTed from parquet, or set explicitly). Those names don't match the
+    // `_row-id-col-*` prefix, so detect them from the table configuration too. Missing
+    // this leaves such a column in `requiredSchema` but NOT in the file data schema, and
+    // `final_output_indices` then points past the native schema -> native plan_delta_scan
+    // index-out-of-bounds panic (RowIdSuite).
+    val customMaterializedColNames: Set[String] =
+      DeltaReflection
+        .extractMetadataConfiguration(relation)
+        .map { cfg =>
+          Seq(
+            DeltaReflection.MaterializedRowIdColumnProp,
+            DeltaReflection.MaterializedRowCommitVersionColumnProp).flatMap(cfg.get).toSet
+        }
+        .getOrElse(Set.empty)
     val materializedRowTrackingFields: Array[StructField] =
       scan.requiredSchema.fields
-        .filter(f => CometDeltaNativeScan.isMaterializedRowTrackingName(f.name))
+        .filter(f =>
+          CometDeltaNativeScan.isMaterializedRowTrackingName(f.name) ||
+            customMaterializedColNames.contains(f.name))
         .map(f => StructField(f.name, f.dataType, f.nullable))
     val fileDataSchemaFields =
       relation.dataSchema.fields.filterNot(f =>
