@@ -41,9 +41,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use comet_contrib_delta::planner::{
-    build_delta_partitioned_files, ColumnMappingFilterRewriter,
-};
+use comet_contrib_delta::planner::{build_delta_partitioned_files, ColumnMappingFilterRewriter};
 use comet_contrib_delta::DeltaDvFilterExec;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::tree_node::{TransformedResult, TreeNode};
@@ -96,11 +94,7 @@ impl PhysicalPlanner {
                 .iter()
                 .map(|f| {
                     if let Some(physical) = logical_to_physical.get(f.name()) {
-                        Arc::new(Field::new(
-                            physical,
-                            f.data_type().clone(),
-                            f.is_nullable(),
-                        ))
+                        Arc::new(Field::new(physical, f.data_type().clone(), f.is_nullable()))
                     } else {
                         Arc::clone(f)
                     }
@@ -191,9 +185,8 @@ impl PhysicalPlanner {
         let mut deleted_indexes_per_group: Vec<Vec<u64>> = Vec::new();
         let mut base_row_ids_per_group: Vec<Option<i64>> = Vec::new();
         let mut default_commit_versions_per_group: Vec<Option<i64>> = Vec::new();
-        let mut task_metadata_per_group: Vec<
-            comet_contrib_delta::synthetic_columns::TaskMetadata,
-        > = Vec::new();
+        let mut task_metadata_per_group: Vec<comet_contrib_delta::synthetic_columns::TaskMetadata> =
+            Vec::new();
         let mut non_dv_files: Vec<PartitionedFile> = Vec::new();
         for (file, task) in files.into_iter().zip(scan.tasks.iter()) {
             if !task.deleted_row_indexes.is_empty() || need_per_file_groups {
@@ -221,9 +214,8 @@ impl PhysicalPlanner {
             deleted_indexes_per_group.push(Vec::new());
             base_row_ids_per_group.push(None);
             default_commit_versions_per_group.push(None);
-            task_metadata_per_group.push(
-                comet_contrib_delta::synthetic_columns::TaskMetadata::default(),
-            );
+            task_metadata_per_group
+                .push(comet_contrib_delta::synthetic_columns::TaskMetadata::default());
         }
 
         // Pick any one file to register the object store (they all share the same root).
@@ -328,8 +320,7 @@ impl PhysicalPlanner {
                 .iter()
                 .enumerate()
                 .map(|(idx, phys_field)| {
-                    let col: Arc<dyn PhysicalExpr> =
-                        Arc::new(Column::new(phys_field.name(), idx));
+                    let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new(phys_field.name(), idx));
                     let alias = phys_to_logical
                         .get(phys_field.name().as_str())
                         .map(|s| s.to_string())
@@ -410,28 +401,26 @@ impl PhysicalPlanner {
         // index into the wrapped exec's output schema (parquet columns first, then
         // appended synthetics in the canonical row_index/is_row_deleted/row_id/
         // row_commit_version order). Empty => already in the right order.
-        let with_rename: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if !common
-            .final_output_indices
-            .is_empty()
-        {
-            let wrapped_schema = after_synthetics.schema();
-            let projections: Vec<(Arc<dyn PhysicalExpr>, String)> = common
-                .final_output_indices
-                .iter()
-                .map(|idx| {
-                    let i = *idx as usize;
-                    let field = wrapped_schema.field(i);
-                    let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), i));
-                    (col, field.name().clone())
-                })
-                .collect();
-            Arc::new(
-                ProjectionExec::try_new(projections, after_synthetics)
-                    .map_err(|e| GeneralError(format!("final reorder ProjectionExec: {e}")))?,
-            )
-        } else {
-            after_synthetics
-        };
+        let with_rename: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            if !common.final_output_indices.is_empty() {
+                let wrapped_schema = after_synthetics.schema();
+                let projections: Vec<(Arc<dyn PhysicalExpr>, String)> = common
+                    .final_output_indices
+                    .iter()
+                    .map(|idx| {
+                        let i = *idx as usize;
+                        let field = wrapped_schema.field(i);
+                        let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), i));
+                        (col, field.name().clone())
+                    })
+                    .collect();
+                Arc::new(
+                    ProjectionExec::try_new(projections, after_synthetics)
+                        .map_err(|e| GeneralError(format!("final reorder ProjectionExec: {e}")))?,
+                )
+            } else {
+                after_synthetics
+            };
 
         Ok((
             vec![],

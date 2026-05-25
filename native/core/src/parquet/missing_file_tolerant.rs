@@ -34,7 +34,9 @@ use arrow::array::RecordBatch;
 use datafusion::common::Result;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileScanConfig, FileSource};
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr};
+use datafusion::physical_expr::{
+    EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr,
+};
 use datafusion::physical_plan::filter_pushdown::FilterPushdownPropagation;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::projection::ProjectionExprs;
@@ -89,12 +91,14 @@ fn is_not_found(err: &datafusion::error::DataFusionError) -> bool {
     // would silently swallow unrelated parquet messages like "row group statistics
     // not found" or "page index not found" and produce wrong empty results.
     let msg = err.to_string();
-    matches!(err, DataFusionError::External(_) | DataFusionError::ObjectStore(_))
-        && (msg.contains("Object at location")
-            || msg.contains("Generic NotFound")
-            || msg.contains("NoSuchKey")
-            || msg.contains("NoSuchFile")
-            || msg.contains("No such file or directory"))
+    matches!(
+        err,
+        DataFusionError::External(_) | DataFusionError::ObjectStore(_)
+    ) && (msg.contains("Object at location")
+        || msg.contains("Generic NotFound")
+        || msg.contains("NoSuchKey")
+        || msg.contains("NoSuchFile")
+        || msg.contains("No such file or directory"))
 }
 
 impl FileOpener for IgnoreMissingFileOpener {
@@ -131,9 +135,9 @@ impl FileSource for IgnoreMissingFileSource {
         base_config: &FileScanConfig,
         partition: usize,
     ) -> Result<Arc<dyn FileOpener>> {
-        let inner_opener =
-            self.inner
-                .create_file_opener(object_store, base_config, partition)?;
+        let inner_opener = self
+            .inner
+            .create_file_opener(object_store, base_config, partition)?;
         Ok(Arc::new(IgnoreMissingFileOpener::new(inner_opener)))
     }
 
@@ -236,4 +240,3 @@ impl FileSource for IgnoreMissingFileSource {
             .map(IgnoreMissingFileSource::new))
     }
 }
-
