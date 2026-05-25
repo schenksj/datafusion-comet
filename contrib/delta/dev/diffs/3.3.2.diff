@@ -210,6 +210,23 @@ index 0000000..dc3a297
 +    }
 +  }
 +}
+diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSinkSuite.scala b/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSinkSuite.scala
+index 0a2826c..d5e4100 100644
+--- a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSinkSuite.scala
++++ b/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSinkSuite.scala
+@@ -259,6 +259,12 @@ class DeltaSinkSuite
+           val filePartitions = df.queryExecution.executedPlan.collect {
+             case scan: DataSourceScanExec if scan.inputRDDs().head.isInstanceOf[FileScanRDD] =>
+               scan.inputRDDs().head.asInstanceOf[FileScanRDD].filePartitions
++            // Comet regression (contrib/delta/dev/diffs/3.3.2.diff): Comet replaces the
++            // FileSourceScanExec with CometDeltaNativeScanExec, whose RDD is not a
++            // FileScanRDD. It exposes the same per-task FilePartitions via
++            // `synthesizedFilePartitions` for exactly this partition-pruning check.
++            case c: org.apache.spark.sql.comet.CometDeltaNativeScanExec =>
++              c.synthesizedFilePartitions
+           }.flatten
+           if (filePartitions.isEmpty) {
+             fail(s"No FileScan in query\n${df.queryExecution}")
 diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSuite.scala b/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSuite.scala
 index 5cf16f3..ccbf713 100644
 --- a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSuite.scala
