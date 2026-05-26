@@ -19,9 +19,10 @@ use crate::execution::operators::ExecutionError;
 use crate::parquet::encryption_support::{CometEncryptionConfig, ENCRYPTION_FACTORY_ID};
 use crate::parquet::missing_file_tolerant::IgnoreMissingFileSource;
 use crate::parquet::parquet_read_cached_factory::CachingParquetReaderFactory;
+use crate::parquet::row_number_opener::{RowNumberFileSource, ROW_NUMBER_COLUMN_NAME};
 use crate::parquet::parquet_support::SparkParquetOptions;
 use crate::parquet::schema_adapter::SparkPhysicalExprAdapterFactory;
-use arrow::datatypes::{Field, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{
@@ -79,6 +80,15 @@ pub(crate) fn init_datasource_exec(
     // (matches Spark's `spark.sql.files.ignoreMissingFiles=true`). Wired through to
     // a `FileSource` decorator that swallows the error as an empty stream.
     ignore_missing_files: bool,
+    // When true, append the parquet RowNumber virtual column
+    // (`__comet_delta_row_number`, Int64) to the scan output. Used by the Delta
+    // row-tracking path so synthetic `_metadata.row_id` columns can be computed
+    // from each row's TRUE physical position even under filter pushdown / row-group
+    // pruning. Wired through to a `RowNumberFileSource` decorator + a custom
+    // `FileOpener` that calls `with_virtual_columns`. See DataFusion #22517 --
+    // this knob (and the decorator) can go away once `ParquetSource` exposes
+    // virtual columns directly. Pass `false` on every non-Delta-row-tracking path.
+    emit_row_number: bool,
 ) -> Result<Arc<DataSourceExec>, ExecutionError> {
     let (table_parquet_options, mut spark_parquet_options) = get_options(
         session_timezone,
@@ -124,6 +134,38 @@ pub(crate) fn init_datasource_exec(
         }
         _ => (Arc::clone(&required_schema), None),
     };
+
+    // Delta row-tracking: append the parquet RowNumber virtual column to the
+    // file/table schema and project it as the LAST output column so the
+    // FileScanConfig's projected output schema = real projected columns +
+    // row_number. The custom opener (RowNumberFileSource) supplies the actual
+    // row_number values via `builder.with_virtual_columns`; the ProjectionMask it
+    // builds covers only the REAL columns (it excludes this trailing index).
+    // See DataFusion #22517 -- removable once ParquetSource exposes virtual cols.
+    let (base_schema, projection) = if emit_row_number {
+        // The RowNumber field must be Int64, non-null, tagged with the parquet
+        // RowNumber extension type so the reader recognises it as virtual. Here
+        // we only need the field present in the table schema with the right
+        // name/type; the opener re-creates the extension-typed field when calling
+        // `with_virtual_columns`.
+        let row_number_field = Field::new(ROW_NUMBER_COLUMN_NAME, DataType::Int64, false);
+        let mut fields: Vec<Arc<Field>> = base_schema.fields().iter().cloned().collect();
+        let row_number_index = fields.len();
+        fields.push(Arc::new(row_number_field));
+        let new_schema =
+            Arc::new(Schema::new_with_metadata(fields, base_schema.metadata().clone()));
+
+        // Project the row_number column last. When there was no explicit
+        // projection, the scan would otherwise output every real column in order
+        // (0..n); make that explicit so we can append the virtual index.
+        let mut proj = projection
+            .unwrap_or_else(|| (0..base_schema.fields().len()).collect::<Vec<usize>>());
+        proj.push(row_number_index);
+        (new_schema, Some(proj))
+    } else {
+        (base_schema, projection)
+    };
+
     let partition_fields: Vec<_> = partition_schema
         .iter()
         .flat_map(|s| s.fields().iter())
@@ -131,6 +173,11 @@ pub(crate) fn init_datasource_exec(
         .collect();
     let table_schema =
         TableSchema::from_file_schema(base_schema).with_table_partition_cols(partition_fields);
+
+    // Capture `reorder_filters` before `table_parquet_options` is moved into the
+    // source so we can pass it to `RowNumberFileSource` (the source's accessor is
+    // `pub(crate)`). Comet sets this `true` in `get_options`.
+    let reorder_filters = table_parquet_options.global.reorder_filters;
 
     let mut parquet_source =
         ParquetSource::new(table_schema).with_table_parquet_options(table_parquet_options);
@@ -145,8 +192,9 @@ pub(crate) fn init_datasource_exec(
 
     // Use caching reader factory to avoid redundant footer reads across partitions
     let store = session_ctx.runtime_env().object_store(&object_store_url)?;
-    parquet_source = parquet_source
-        .with_parquet_file_reader_factory(Arc::new(CachingParquetReaderFactory::new(store)));
+    let reader_factory = Arc::new(CachingParquetReaderFactory::new(store));
+    parquet_source =
+        parquet_source.with_parquet_file_reader_factory(Arc::clone(&reader_factory) as _);
 
     // Route data filters through `try_pushdown_filters` rather than calling
     // `with_predicate` directly. This is the contract DataFusion's optimizer
@@ -178,6 +226,18 @@ pub(crate) fn init_datasource_exec(
     // after pushdown to preserve all optimizer behaviour.
     let file_source: Arc<dyn FileSource> = if ignore_missing_files {
         IgnoreMissingFileSource::new(file_source)
+    } else {
+        file_source
+    };
+
+    // Delta row-tracking: wrap the final FileSource so its parquet opener emits
+    // the RowNumber virtual column. Done LAST (after pushdown + ignore-missing
+    // wrapping) so the predicate has already been pushed into the inner
+    // ParquetSource -- the wrapper reads it back via `filter()` and feeds it to
+    // `build_row_filter` in the custom opener. See DataFusion #22517; this
+    // wrapping disappears once ParquetSource exposes virtual columns directly.
+    let file_source: Arc<dyn FileSource> = if emit_row_number {
+        RowNumberFileSource::new(file_source, reader_factory as _, reorder_filters)
     } else {
         file_source
     };

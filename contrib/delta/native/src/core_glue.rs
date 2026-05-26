@@ -250,8 +250,30 @@ impl PhysicalPlanner {
         // predicates correctly, just without parquet pruning. `row_commit_version`
         // is a per-file constant (not position-derived) and partition filters prune
         // file groups before this point, so neither is affected.
-        let suppress_pushdown =
-            common.emit_is_row_deleted || common.emit_row_index || common.emit_row_id;
+        //
+        // EXCEPTION -- the RowNumber fast path (DataFusion #22517): when we're
+        // emitting `_metadata.row_id` AND there is a pushable data filter, we
+        // instead emit the parquet reader's RowNumber virtual column. That column
+        // reports each row's TRUE physical position even under row-group pruning /
+        // row filtering, so `DeltaSyntheticColumnsExec` can compute row_id /
+        // row_index / is_row_deleted from the true positions rather than the
+        // running counter. In that case we DON'T suppress pushdown (the filter
+        // reaches the custom opener and prunes row groups) and we ask
+        // `init_datasource_exec` to append the RowNumber column. This branch can be
+        // simplified once DataFusion exposes virtual columns on `ParquetSource` and
+        // the custom opener (`row_number_opener.rs`) can be deleted.
+        //
+        // For every OTHER read (DML / DV / MERGE / unfiltered) we keep the proven
+        // running-counter path: suppress pushdown so the reader returns every row
+        // in physical order. No regression to those paths.
+        let has_pushable_data_filters = data_filters
+            .as_ref()
+            .map(|f| !f.is_empty())
+            .unwrap_or(false);
+        let use_row_number = common.emit_row_id && has_pushable_data_filters;
+
+        let suppress_pushdown = !use_row_number
+            && (common.emit_is_row_deleted || common.emit_row_index || common.emit_row_id);
         let data_filters_for_parquet = if suppress_pushdown {
             Vec::new()
         } else {
@@ -274,6 +296,9 @@ impl PhysicalPlanner {
             common.use_field_id,
             false, // ignore_missing_field_id
             common.ignore_missing_files,
+            // emit_row_number: RowNumber fast path (DataFusion #22517). Only when
+            // we're synthesizing row_id AND a data filter can be pushed down.
+            use_row_number,
         )?;
 
         // Three mutually-exclusive wrap modes based on what the surrounding plan asks

@@ -31,6 +31,7 @@ pub mod schema_adapter;
 mod cast_column;
 mod missing_file_tolerant;
 mod objectstore;
+pub mod row_number_opener;
 
 use std::collections::HashMap;
 use std::task::Poll;
@@ -521,6 +522,9 @@ pub unsafe extern "system" fn Java_org_apache_comet_parquet_Native_initRecordBat
             false,
             false,
             // ignore_missing_files: iceberg-compat doesn't surface Spark's flag today.
+            false,
+            // emit_row_number: only the Delta row-tracking path needs the parquet
+            // RowNumber virtual column.
             false,
         )?;
 

@@ -92,6 +92,16 @@ pub const ROW_ID_MATERIALISED_PREFIX: &str = "_row-id-col-";
 /// semantics as `ROW_ID_MATERIALISED_PREFIX`.
 pub const ROW_COMMIT_VERSION_MATERIALISED_PREFIX: &str = "_row-commit-version-col-";
 
+/// Name of the parquet RowNumber virtual column appended by the Comet custom
+/// parquet opener (`row_number_opener.rs`) on the Delta row-tracking fast path.
+/// When present in this exec's INPUT schema, it carries each row's TRUE physical
+/// position within the file (correct even under filter pushdown / row-group
+/// pruning) and is used in place of the running `current_row_offset` counter.
+/// It is consumed here and never appears in the output. Keep this in sync with
+/// `crate::parquet::row_number_opener::ROW_NUMBER_COLUMN_NAME`. See DataFusion
+/// #22517 -- removable once ParquetSource exposes virtual columns directly.
+pub const ROW_NUMBER_COLUMN_NAME: &str = "__comet_delta_row_number";
+
 /// Per-task metadata pulled from `DeltaScanTask`. One entry per DataFusion partition;
 /// values are constant for every row in that file (except `byte_range_start` which is
 /// used to compute `file_block_start`).
@@ -151,7 +161,15 @@ fn build_output_schema(
     row_index_column_name: &str,
     metadata_column_names: &[String],
 ) -> SchemaRef {
-    let mut fields: Vec<Arc<Field>> = input.fields().iter().cloned().collect();
+    // Drop the parquet RowNumber virtual column from the output, if present. It is
+    // an INPUT-only column used to compute the synthetics from true physical row
+    // positions (DataFusion #22517) and must never surface in the output schema.
+    let mut fields: Vec<Arc<Field>> = input
+        .fields()
+        .iter()
+        .filter(|f| f.name() != ROW_NUMBER_COLUMN_NAME)
+        .cloned()
+        .collect();
     if emit_row_index {
         // Spark's row_index virtual column is `LongType` (signed Int64). Emit Int64
         // here regardless of whether the canonical `__delta_internal_row_index` or
@@ -227,6 +245,12 @@ pub struct DeltaSyntheticColumnsExec {
     /// the same way `deleted_row_indexes_by_partition` etc. are). Values come
     /// from the corresponding `DeltaScanTask`.
     task_metadata_by_partition: Vec<TaskMetadata>,
+    /// Index of the parquet RowNumber virtual column (`__comet_delta_row_number`)
+    /// in the INPUT schema, if present. `Some(i)` engages the true-row-number path
+    /// (DataFusion #22517): row_index / row_id / is_row_deleted are computed from
+    /// `input.column(i)[row]` instead of the running `current_row_offset` counter,
+    /// and the column is dropped from the output. `None` keeps the counter path.
+    row_number_input_index: Option<usize>,
     output_schema: SchemaRef,
     plan_properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -274,8 +298,17 @@ impl DeltaSyntheticColumnsExec {
                 task_metadata_by_partition.len()
             )));
         }
+        let input_schema = input.schema();
+        // Locate the parquet RowNumber virtual column in the INPUT schema (it's the
+        // trailing column appended by the custom opener on the row-tracking fast
+        // path). When present we compute synthetics from its true physical row
+        // positions instead of the running counter. See DataFusion #22517.
+        let row_number_input_index = input_schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == ROW_NUMBER_COLUMN_NAME);
         let output_schema = build_output_schema(
-            &input.schema(),
+            &input_schema,
             emit_row_index,
             emit_is_row_deleted,
             emit_row_id,
@@ -301,6 +334,7 @@ impl DeltaSyntheticColumnsExec {
             row_index_column_name: row_index_column_name.to_string(),
             metadata_column_names,
             task_metadata_by_partition,
+            row_number_input_index,
             output_schema,
             plan_properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -409,6 +443,7 @@ impl ExecutionPlan for DeltaSyntheticColumnsExec {
             default_row_commit_version,
             metadata_column_names: self.metadata_column_names.clone(),
             task_metadata: task_meta,
+            row_number_input_index: self.row_number_input_index,
             baseline_metrics: baseline,
         }))
     }
@@ -432,6 +467,11 @@ struct DeltaSyntheticColumnsStream {
     default_row_commit_version: Option<i64>,
     metadata_column_names: Vec<String>,
     task_metadata: TaskMetadata,
+    /// `Some(i)`: column `i` of the INPUT batch is the parquet RowNumber virtual
+    /// column. When set, synthetics are derived from `row_number[row]` (the true
+    /// physical position) and the column is dropped from the output. `None`: use
+    /// the running `current_row_offset` counter. See DataFusion #22517.
+    row_number_input_index: Option<usize>,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -441,38 +481,76 @@ impl DeltaSyntheticColumnsStream {
         let batch_start = self.current_row_offset;
         let batch_end = batch_start + batch_rows;
 
-        // Build the row_index column: monotonically increasing UInt64 starting at
-        // batch_start.
+        // Extract the per-row true physical positions when running the RowNumber
+        // fast path (DataFusion #22517). `row_numbers[i]` is the TRUE physical
+        // row index of output row `i` even though the parquet reader pruned /
+        // filtered rows (so they are NOT contiguous and NOT `batch_start + i`).
+        // When `None`, fall back to the running `current_row_offset` range.
+        let row_numbers: Option<&Int64Array> = match self.row_number_input_index {
+            Some(idx) => {
+                let col = batch.column(idx);
+                let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "DeltaSyntheticColumnsExec: '{ROW_NUMBER_COLUMN_NAME}' column is \
+                         not Int64 (got {:?})",
+                        col.data_type()
+                    ))
+                })?;
+                Some(arr)
+            }
+            None => None,
+        };
+
+        // Build the row_index column. With RowNumber present, each row's index is
+        // its true physical position; otherwise it's the running offset.
         let row_index_array: Option<Int64Array> = if self.emit_row_index {
-            Some(Int64Array::from_iter_values(
-                (batch_start..batch_end).map(|v| v as i64),
-            ))
+            match row_numbers {
+                Some(rn) => Some(Int64Array::from_iter_values(rn.values().iter().copied())),
+                None => Some(Int64Array::from_iter_values(
+                    (batch_start..batch_end).map(|v| v as i64),
+                )),
+            }
         } else {
             None
         };
 
-        // Build the is_row_deleted column: walk the deleted indexes alongside the batch
-        // row range, advancing `next_delete_idx` as we go. Both arrays share the same
-        // O(rows + deletes) sweep; allocation is one Int8Array (Delta schema = Byte)
-        // of length batch_rows.
+        // Build the is_row_deleted column.
         let is_deleted_array: Option<Int8Array> = if self.emit_is_row_deleted {
             let mut values = vec![0i8; batch_rows as usize];
-            // Skip deleted entries that fall before this batch.
-            while self.next_delete_idx < self.deleted.len()
-                && self.deleted[self.next_delete_idx] < batch_start
-            {
-                self.next_delete_idx += 1;
+            match row_numbers {
+                // RowNumber path: rows are not in contiguous physical order, so the
+                // monotonic-range sweep doesn't apply. Test membership of each row's
+                // true position in the sorted `deleted` vec via binary search.
+                Some(rn) => {
+                    for (local, &pos) in rn.values().iter().enumerate() {
+                        if self.deleted.binary_search(&(pos as u64)).is_ok() {
+                            values[local] = 1;
+                        }
+                    }
+                }
+                // Counter path: walk the sorted deleted indexes alongside the
+                // contiguous batch row range, advancing `next_delete_idx`. O(rows +
+                // deletes); single Int8Array allocation of length batch_rows.
+                None => {
+                    // Skip deleted entries that fall before this batch.
+                    while self.next_delete_idx < self.deleted.len()
+                        && self.deleted[self.next_delete_idx] < batch_start
+                    {
+                        self.next_delete_idx += 1;
+                    }
+                    // Mark every deleted index within [batch_start, batch_end).
+                    // Advance `self.next_delete_idx` past them so the next batch's
+                    // skip-before-start loop is O(1) instead of re-walking the prior
+                    // batch.
+                    let mut idx = self.next_delete_idx;
+                    while idx < self.deleted.len() && self.deleted[idx] < batch_end {
+                        let local = (self.deleted[idx] - batch_start) as usize;
+                        values[local] = 1;
+                        idx += 1;
+                    }
+                    self.next_delete_idx = idx;
+                }
             }
-            // Mark every deleted index within [batch_start, batch_end). Advance
-            // `self.next_delete_idx` past them so the next batch's skip-before-start
-            // loop is O(1) instead of re-walking the entire prior batch.
-            let mut idx = self.next_delete_idx;
-            while idx < self.deleted.len() && self.deleted[idx] < batch_end {
-                let local = (self.deleted[idx] - batch_start) as usize;
-                values[local] = 1;
-                idx += 1;
-            }
-            self.next_delete_idx = idx;
             Some(Int8Array::from(values))
         } else {
             None
@@ -484,9 +562,16 @@ impl DeltaSyntheticColumnsStream {
         let row_id_array: Option<Int64Array> = if self.emit_row_id {
             match self.base_row_id {
                 Some(base) => {
-                    let values: Vec<i64> = (batch_start..batch_end)
-                        .map(|idx| base.saturating_add(idx as i64))
-                        .collect();
+                    let values: Vec<i64> = match row_numbers {
+                        Some(rn) => rn
+                            .values()
+                            .iter()
+                            .map(|&pos| base.saturating_add(pos))
+                            .collect(),
+                        None => (batch_start..batch_end)
+                            .map(|idx| base.saturating_add(idx as i64))
+                            .collect(),
+                    };
                     Some(Int64Array::from(values))
                 }
                 None => Some(Int64Array::from(vec![None as Option<i64>; batch_rows as usize])),
@@ -509,8 +594,19 @@ impl DeltaSyntheticColumnsStream {
         self.current_row_offset = batch_end;
 
         // Append synthetic columns to the batch. Order matches build_output_schema:
-        // row_index, is_row_deleted, row_id, row_commit_version.
-        let mut columns: Vec<Arc<dyn arrow::array::Array>> = batch.columns().to_vec();
+        // row_index, is_row_deleted, row_id, row_commit_version. Drop the RowNumber
+        // virtual column (it's input-only): build_output_schema already excludes it,
+        // so the column vector must too (DataFusion #22517).
+        let mut columns: Vec<Arc<dyn arrow::array::Array>> = match self.row_number_input_index {
+            Some(rn_idx) => batch
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != rn_idx)
+                .map(|(_, c)| Arc::clone(c))
+                .collect(),
+            None => batch.columns().to_vec(),
+        };
         if let Some(arr) = row_index_array {
             columns.push(Arc::new(arr));
         }
@@ -697,8 +793,59 @@ mod tests {
             default_row_commit_version,
             metadata_column_names: Vec::new(),
             task_metadata: TaskMetadata::default(),
+            row_number_input_index: None,
             baseline_metrics: baseline,
         }
+    }
+
+    /// Helper: build a stream whose input carries a trailing
+    /// `__comet_delta_row_number` Int64 column, engaging the RowNumber fast path.
+    fn make_stream_with_row_number(
+        emit_row_index: bool,
+        emit_is_row_deleted: bool,
+        emit_row_id: bool,
+        deleted: Vec<u64>,
+        base_row_id: Option<i64>,
+    ) -> (DeltaSyntheticColumnsStream, SchemaRef) {
+        // Input schema = real column `v` + the appended row_number column.
+        let input_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, false),
+            Field::new(ROW_NUMBER_COLUMN_NAME, DataType::Int64, false),
+        ]));
+        let output_schema = build_output_schema(
+            &input_schema,
+            emit_row_index,
+            emit_is_row_deleted,
+            emit_row_id,
+            false,
+            ROW_INDEX_COLUMN_NAME,
+            &[],
+        );
+        let metrics = ExecutionPlanMetricsSet::new();
+        let baseline = BaselineMetrics::new(&metrics, 0);
+        let (_tx, rx) = futures::channel::mpsc::unbounded::<DFResult<RecordBatch>>();
+        let inner: SendableRecordBatchStream = Box::pin(EmptyStream {
+            schema: Arc::clone(&input_schema),
+            inner: rx,
+        });
+        let stream = DeltaSyntheticColumnsStream {
+            inner,
+            deleted,
+            current_row_offset: 0,
+            next_delete_idx: 0,
+            output_schema,
+            emit_row_index,
+            emit_is_row_deleted,
+            emit_row_id,
+            emit_row_commit_version: false,
+            base_row_id,
+            default_row_commit_version: None,
+            metadata_column_names: Vec::new(),
+            task_metadata: TaskMetadata::default(),
+            row_number_input_index: Some(1),
+            baseline_metrics: baseline,
+        };
+        (stream, input_schema)
     }
 
     struct EmptyStream {
@@ -951,6 +1098,98 @@ mod tests {
             .map(Option::unwrap)
             .collect();
         assert_eq!(cv, vec![42, 42, 42]);
+    }
+
+    // ---- RowNumber fast path (DataFusion #22517) ----
+
+    /// When the input carries a `__comet_delta_row_number` column with
+    /// NON-contiguous values (e.g. row groups were pruned by a pushed-down
+    /// filter), row_index and row_id must come from those true positions -- not
+    /// from a sequential 0,1,2 counter -- and the row_number column must NOT
+    /// appear in the output.
+    #[test]
+    fn augment_row_number_drives_row_id_and_row_index() {
+        let (mut s, input_schema) =
+            make_stream_with_row_number(true, false, true, vec![], Some(1000));
+
+        // Build an input batch: real column `v` + row_number = [100, 101, 102]
+        // (non-contiguous w.r.t. a 0-based counter).
+        let v: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, 30]));
+        let rn: ArrayRef = Arc::new(Int64Array::from(vec![100i64, 101, 102]));
+        let batch = RecordBatch::try_new(input_schema, vec![v, rn]).unwrap();
+
+        let out = s.augment(batch).unwrap();
+
+        // Output schema: v, row_index, row_id -- the row_number column is dropped.
+        let names: Vec<&str> = out
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["v", ROW_INDEX_COLUMN_NAME, ROW_ID_COLUMN_NAME]);
+        assert!(
+            !names.contains(&ROW_NUMBER_COLUMN_NAME),
+            "row_number column must not surface in the output"
+        );
+
+        // col 0: original data passes through.
+        let v_out: Vec<i64> = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(v_out, vec![10, 20, 30]);
+
+        // col 1: row_index = the TRUE physical positions 100,101,102 (NOT 0,1,2).
+        let ri: Vec<i64> = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(ri, vec![100, 101, 102]);
+
+        // col 2: row_id = base_row_id + true position (1000 + 100,101,102).
+        let id: Vec<i64> = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(id, vec![1100, 1101, 1102]);
+    }
+
+    /// is_row_deleted on the RowNumber path tests membership of each row's TRUE
+    /// position in the (sorted) deleted set via binary search.
+    #[test]
+    fn augment_row_number_is_row_deleted_uses_membership() {
+        // deleted positions {101} -- only the row whose true position is 101.
+        let (mut s, input_schema) =
+            make_stream_with_row_number(false, true, false, vec![101], None);
+        let v: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, 30]));
+        let rn: ArrayRef = Arc::new(Int64Array::from(vec![100i64, 101, 105]));
+        let batch = RecordBatch::try_new(input_schema, vec![v, rn]).unwrap();
+
+        let out = s.augment(batch).unwrap();
+        // Output: v, is_row_deleted (row_number dropped).
+        assert_eq!(out.schema().fields().len(), 2);
+        let flags: Vec<i8> = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(flags, vec![0, 1, 0]);
     }
 
     #[test]

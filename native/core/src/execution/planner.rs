@@ -1393,6 +1393,9 @@ impl PhysicalPlanner {
                     // scan proto today. Contribs (e.g. Delta) wire this through directly
                     // when they call init_datasource_exec.
                     false,
+                    // emit_row_number: only the Delta row-tracking path needs the
+                    // parquet RowNumber virtual column.
+                    false,
                 )?;
                 Ok((
                     vec![],
