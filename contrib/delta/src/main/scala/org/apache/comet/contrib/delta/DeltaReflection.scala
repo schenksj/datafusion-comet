@@ -664,8 +664,24 @@ object DeltaReflection extends Logging {
       val indexes = toArrayMethod.invoke(bitmap).asInstanceOf[Array[Long]]
       Some(indexes)
     } catch {
+      case e: java.lang.reflect.InvocationTargetException =>
+        // The reflective `read` (or bitmap decode) ran Delta's own DV-store logic, which
+        // threw a genuine DV-read error: the .bin is missing/corrupt (FileNotFoundException)
+        // or its on-disk path is malformed -- e.g. an absolute DV path with not-encoded
+        // special characters yields a URISyntaxException ("Malformed escape pair"). Spark/Delta
+        // surface these to the user; swallowing them here and reading WITHOUT the DV would
+        // silently resurface deleted rows (a correctness violation) and also masks the
+        // expected failure (DeletionVectorsSuite "resource leak" / "absolute DV path" tests).
+        // Propagate as a SparkException so the query fails the same way vanilla Delta does.
+        val cause = Option(e.getCause).getOrElse(e)
+        throw new org.apache.spark.SparkException(
+          s"Failed to read deletion vector for Delta table $tableRoot", cause)
       case scala.util.control.NonFatal(e) =>
-        logWarning(s"materializeDeletedRowIndexes failed for table $tableRoot: ${e.getMessage}")
+        // Reflective *setup* failure (Delta DV-store class/method absent or a different
+        // layout): we can't materialise via this path, so fall back to Spark+Delta, which
+        // can read the DV itself.
+        logWarning(
+          s"materializeDeletedRowIndexes setup failed for table $tableRoot: ${e.getMessage}")
         None
     }
   }
