@@ -68,13 +68,15 @@ object DeltaConf {
       .createWithDefault(1)
 
   /**
-   * Relation-options key the contrib reads to know whether the surrounding plan references
-   * `input_file_name()` / `input_file_block_*`. When set to `"true"`, the contrib emits
+   * Relation-options key signalling that the scan must emit one task per partition. Set by
+   * `DeltaScanRule` when the scan projects a per-file `_metadata.file_path` column: the native
+   * plan creates one parquet file-group per file, and Spark consumes a single DataFusion
+   * partition per Spark partition, so packing multiple files into one Spark partition would
+   * silently drop the 2nd+ files' rows. When `"true"`, the contrib emits
    * `oneTaskPerPartition = true` on the `CometDeltaNativeScanExec` so packTasks keeps each task
-   * in its own partition and `CometExecRDD.compute` (via `InputFileBlockHolder.set`) can set
-   * `InputFileBlockHolder` to the correct path.
+   * in its own partition.
    */
-  val NeedsInputFileNameOption: String = "comet.contrib.delta.needsInputFileName"
+  val OneTaskPerPartitionOption: String = "comet.contrib.delta.oneTaskPerPartition"
 
   /**
    * Relation-options key carrying the JSON of the analysis-time Delta schema

@@ -122,14 +122,17 @@ class CometDeltaMetadataColumnAuditSuite extends CometDeltaTestBase {
     }
   }
 
-  test("input_file_name() round-trip matches vanilla") {
+  test("input_file_name() falls back to Spark (native scan declines)") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("meta_ifn") { tablePath =>
       val ss = spark
       import ss.implicits._
       (0 until 6).map(i => (i.toLong, s"v_$i")).toDF("id", "v")
         .repartition(2).write.format("delta").save(tablePath)
-      assertDeltaNativeMatches(
+      // The native Delta scan bypasses Spark's FileScanRDD, which is the only thing that
+      // maintains the `InputFileBlockHolder` thread-local `input_file_name()` reads. So the
+      // scan declines and Spark handles it (consistent with CometScanRule's native scan).
+      assertDeltaFallback(
         tablePath,
         _.select(col("id"), input_file_name().as("ifn")).orderBy("id"))
     }

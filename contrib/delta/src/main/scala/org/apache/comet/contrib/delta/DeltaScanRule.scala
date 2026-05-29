@@ -226,20 +226,28 @@ object DeltaScanRule {
         "Leaving scan to Delta so its DV filter above can apply deletion vectors")
       return None
     }
-    // Detect references to `input_file_name()` / `input_file_block_*` anywhere in the
-    // surrounding plan tree. When present, the contrib's serde MUST emit one task per
-    // partition so `CometExecRDD`'s per-partition `InputFileBlockHolder` hook attributes
-    // every row to the correct file path. Delta's UPDATE/DELETE/MERGE flows use
-    // `input_file_name()` to find "touched files"; without this tag, multiple files
-    // packed into one Spark partition share the FIRST task's file path, and Delta
-    // rewrites the wrong files (or fails to find rows to rewrite at all). Triggered by
-    // tests like `UpdateBaseMiscTests "data and partition predicates -
-    // Partition=true Skipping=false"` which has multiple files in one partition.
-    val needsInputFileName = plan.exists { node =>
+    // `input_file_name()` / `input_file_block_start()` / `input_file_block_length()` read
+    // from Spark's `InputFileBlockHolder`, a thread-local that only `FileScanRDD` maintains.
+    // The native Delta scan runs through `CometExecRDD` (not `FileScanRDD`), so the holder is
+    // never set and these expressions would return empty/default values. Decline so vanilla
+    // Spark -- which reads via `FileScanRDD` and maintains the holder -- handles the scan.
+    // This mirrors `CometScanRule`'s native-DataFusion gate (the only other handler that
+    // bypasses `FileScanRDD`). Practical impact: Delta's copy-on-write UPDATE/DELETE/MERGE
+    // inject `input_file_name()` into `findTouchedFiles`, so those target scans fall back to
+    // Spark (still correct); deletion-vector DML uses `_metadata.row_index` instead and stays
+    // native.
+    val referencesInputFileName = plan.exists { node =>
       node.expressions.exists(_.exists {
         case _: InputFileName | _: InputFileBlockStart | _: InputFileBlockLength => true
         case _ => false
       })
+    }
+    if (referencesInputFileName) {
+      withInfo(
+        scanExec,
+        "Native Delta scan is not compatible with input_file_name, " +
+          "input_file_block_start, or input_file_block_length")
+      return None
     }
     // Scans that project `_metadata.file_path` ALSO need per-task partitioning:
     // when multiple files are packed into one Spark partition, we create
@@ -260,7 +268,7 @@ object DeltaScanRule {
     val needsMetadataPerFile = scanExec.output.exists { a =>
       a.name.equalsIgnoreCase("file_path")
     }
-    val needsOneTaskPerPartition = needsInputFileName || needsMetadataPerFile
+    val needsOneTaskPerPartition = needsMetadataPerFile
     // Capture the analysis-time Delta schema (DeltaParquetFileFormat.referenceSchema) NOW,
     // while the original Delta file format is still present. Core Comet will replace the file
     // format with CometParquetFileFormat (which drops referenceSchema) and the FileIndex may
@@ -269,17 +277,17 @@ object DeltaScanRule {
     // so the native scan resolves column-mapping physical names / field-ids against it rather
     // than the latest snapshot. See DeltaColumnMappingSuite "physical name changes" /
     // "explicit id matching" and CometDeltaColumnMappingPhysicalNameReproSuite.
-    val withInputFileName =
+    val withOneTaskPerPartition =
       if (needsOneTaskPerPartition) {
-        scanExec.relation.options + (DeltaConf.NeedsInputFileNameOption -> "true")
+        scanExec.relation.options + (DeltaConf.OneTaskPerPartitionOption -> "true")
       } else {
         scanExec.relation.options
       }
     val taggedOptions =
       DeltaReflection.extractFileFormatReferenceSchema(scanExec.relation) match {
         case Some(refSchema) =>
-          withInputFileName + (DeltaConf.AnalyzedSchemaJsonOption -> refSchema.json)
-        case None => withInputFileName
+          withOneTaskPerPartition + (DeltaConf.AnalyzedSchemaJsonOption -> refSchema.json)
+        case None => withOneTaskPerPartition
       }
     val scanForDelta = if (taggedOptions != scanExec.relation.options) {
       val taggedRelation = scanExec.relation.copy(options = taggedOptions)(

@@ -96,11 +96,15 @@ class CometDeltaSpecialCharFilenameSuite extends CometDeltaTestBase {
         s"input_file_name() round-trip must produce a key in the AddFile map. " +
           s"input_file_name=$ifn -> absolutePath=$resolved\n" +
           s"AddFile keys=$expectedKeys")
+      // input_file_name() makes the native Delta scan decline (it bypasses FileScanRDD,
+      // which is what maintains InputFileBlockHolder), so Spark handles it -- and the
+      // literal-% path still round-trips correctly through Spark's own reader (above).
       assert(
         collect(df.queryExecution.executedPlan) {
           case s: CometDeltaNativeScanExec => s
-        }.nonEmpty,
-        s"expected Comet native scan to engage:\n${df.queryExecution.executedPlan}")
+        }.isEmpty,
+        s"expected fallback (no Comet native scan) for input_file_name():\n" +
+          s"${df.queryExecution.executedPlan}")
     }
   }
 
@@ -171,7 +175,7 @@ class CometDeltaSpecialCharFilenameSuite extends CometDeltaTestBase {
     }
   }
 
-  test("CometDeltaNativeScanExec.oneTaskPerPartition is true when input_file_name is referenced") {
+  test("Delta scan falls back to Spark when input_file_name is referenced") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("ifn_diag") { tablePath =>
       val ss = spark
@@ -184,18 +188,13 @@ class CometDeltaSpecialCharFilenameSuite extends CometDeltaTestBase {
       val df = spark.read.format("delta").load(tablePath)
         .withColumn("ifn", input_file_name())
         .orderBy("id")
-      df.collect()  // materialise plan
+      df.collect() // materialise plan
       val plan = df.queryExecution.executedPlan
+      // input_file_name() reads InputFileBlockHolder, which only FileScanRDD maintains.
+      // The native Delta scan bypasses FileScanRDD, so it declines and Spark handles the
+      // scan (mirrors CometScanRule's native-DataFusion gate). Verify no Comet scan engaged.
       val scans = collect(plan) { case s: CometDeltaNativeScanExec => s }
-      assert(scans.nonEmpty, s"expected CometDeltaNativeScanExec:\n$plan")
-      // Show ALL CometDeltaNativeScanExec values + their oneTaskPerPartition flag.
-      val perScan = scans.zipWithIndex.map { case (s, i) =>
-        s"#$i otpp=${s.oneTaskPerPartition} numPartitions=${s.numPartitions}"
-      }
-      assert(scans.forall(_.oneTaskPerPartition),
-        "all CometDeltaNativeScanExec instances should have " +
-          "oneTaskPerPartition=true when input_file_name() is in the plan, " +
-          s"got:\n${perScan.mkString("\n")}\n\nfull plan:\n$plan")
+      assert(scans.isEmpty, s"expected fallback (no CometDeltaNativeScanExec):\n$plan")
     }
   }
 
@@ -219,8 +218,8 @@ class CometDeltaSpecialCharFilenameSuite extends CometDeltaTestBase {
       val rows = df.collect()
       assert(rows.length === 9)
       // Every row must report a NON-EMPTY input_file_name that ends in `.parquet`.
-      // The Delta v4.1 regression failure mode is `ifn == ""` here because our hook
-      // skips multi-file partitions and falls through to vanilla Spark's empty default.
+      // Because the native scan declines on input_file_name(), Spark's own FileScanRDD
+      // reader handles it and attributes each row to its source file correctly.
       rows.foreach { r =>
         val ifn = r.getString(2)
         assert(ifn != null && ifn.nonEmpty,
@@ -237,16 +236,15 @@ class CometDeltaSpecialCharFilenameSuite extends CometDeltaTestBase {
     }
   }
 
-  test("MERGE INTO when target has MULTIPLE files (no oneTaskPerPartition shortcut)") {
+  test("MERGE INTO when target has MULTIPLE files") {
     assume(deltaSparkAvailable, "delta-spark not on the test classpath; skipping")
     withDeltaTable("merge_multi") { tablePath =>
       val ss = spark
       import ss.implicits._
-      // Three separate writes -> three files. Then MERGE forces Delta to look
-      // up input_file_name() against ALL of them. With multiple files per Spark
-      // partition (typical of Delta MERGE row matching), CometExecRDD's
-      // single-file InputFileBlockHolder hook doesn't fire, and Delta sees
-      // input_file_name() == "" -> DELTA_FILE_TO_OVERWRITE_NOT_FOUND.
+      // Three separate writes -> three files. MERGE's findTouchedFiles references
+      // input_file_name(), so the native Delta scan declines and Spark's reader handles
+      // it -- which attributes each row to its source file, so the MERGE resolves the
+      // touched files correctly across all three.
       (0 until 3).map(i => (i.toLong, s"a_$i")).toDF("id", "v")
         .write.format("delta").save(tablePath)
       (3 until 6).map(i => (i.toLong, s"b_$i")).toDF("id", "v")

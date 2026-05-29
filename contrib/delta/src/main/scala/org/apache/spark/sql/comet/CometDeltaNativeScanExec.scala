@@ -62,10 +62,12 @@ case class CometDeltaNativeScanExec(
     @transient dppFilters: Seq[Expression] = Seq.empty,
     partitionSchema: StructType = new StructType(),
     /**
-     * #75 design A: when true, `packTasks` emits one group (= one partition) per task so
-     * `CometExecRDD.compute` (via `InputFileBlockHolder.set`) correctly sets `InputFileBlockHolder` to the
-     * partition's only file path. Set by `CometDeltaNativeScan.createExec` when the surrounding
-     * plan references `input_file_name()` / `input_file_block_*`.
+     * When true, `packTasks` emits one group (= one partition) per task so the native plan's
+     * per-file file-groups stay 1:1 with Spark partitions (Spark consumes a single DataFusion
+     * partition per Spark partition, so multiple files in one partition would drop the 2nd+
+     * files' rows). Set by `CometDeltaNativeScan.createExec` when the scan projects per-file
+     * `_metadata.file_path`, reads materialized row-tracking columns, or otherwise needs
+     * per-file groups.
      */
     oneTaskPerPartition: Boolean = false)
     extends CometLeafExec
@@ -255,10 +257,9 @@ case class CometDeltaNativeScanExec(
     }.toArray
   }
 
-  // #75 design A: when input_file_name() is needed (signal threaded from CometScanRule
-  // via CometDeltaNativeScan.createExec into `oneTaskPerPartition`), short-circuit
-  // packing so each task gets its own partition. `CometExecRDD.compute` reads
-  // task[0]'s path; with 1 task per partition that path correctly attributes every row.
+  // When `oneTaskPerPartition` is set (per-file `_metadata.file_path` / materialized
+  // row-tracking / per-file groups), short-circuit packing so each task gets its own
+  // partition, keeping the native plan's per-file file-groups 1:1 with Spark partitions.
   private def packTasks(
       tasks: Seq[OperatorOuterClass.DeltaScanTask]): Seq[Seq[OperatorOuterClass.DeltaScanTask]] = {
     if (oneTaskPerPartition) return tasks.map(t => Seq(t))
@@ -360,12 +361,9 @@ case class CometDeltaNativeScanExec(
   // by `taskGroups`; only the tasks within each group are pruned.
   def perPartitionData: Array[Array[Byte]] = buildPerPartitionBytes()
 
-  // Surface per-partition file paths to the unified `CometExecRDD` path in
-  // `operators.scala` so `InputFileBlockHolder` is populated when this scan
-  // is embedded inside a larger Comet native tree (e.g. Delta MERGE's
-  // `findTouchedFiles`). Without this, the parent operator's
-  // `CometExecRDD.compute` sees empty filePaths -> `input_file_name()`
-  // returns "" -> `DELTA_FILE_TO_OVERWRITE_NOT_FOUND`.
+  // Surface per-partition file paths to the unified `CometExecRDD` path so a per-file read
+  // failure can be reported as `FAILED_READ_FILE.NO_HINT` with the offending path (see
+  // `CometExecIterator.wrapNativeParquetError`), matching Spark's own error for that file.
   override def perPartitionFilePaths: Array[Seq[String]] = {
     perPartitionData.map { bytes =>
       OperatorOuterClass.DeltaScan.parseFrom(bytes)
@@ -463,10 +461,9 @@ case class CometDeltaNativeScanExec(
       } else {
         (None, Seq.empty[String])
       }
-    // Per-partition file paths so `CometExecRDD.compute` can populate
-    // `InputFileBlockHolder` for `input_file_name()` lookups. With
-    // `oneTaskPerPartition` enforced by `DeltaScanRule` whenever
-    // `input_file_name()` is referenced, each partition holds a single file.
+    // Per-partition file paths so `CometExecRDD` can report a per-file read failure as
+    // `FAILED_READ_FILE.NO_HINT` with the offending path (see
+    // `CometExecIterator.wrapNativeParquetError`).
     val perPartitionFilePaths: Array[Seq[String]] = execPerPartitionBytes.map { bytes =>
       OperatorOuterClass.DeltaScan.parseFrom(bytes)
         .getTasksList.asScala.map(_.getFilePath).toSeq
@@ -485,10 +482,6 @@ case class CometDeltaNativeScanExec(
       encryptedFilePaths = encryptedFilePaths,
       perPartitionFilePaths = perPartitionFilePaths)
 
-    // InputFileBlockHolder for downstream `input_file_name()` is populated in
-    // `CometExecRDD.compute` (via `InputFileBlockHolder.set`) so it also fires when this scan
-    // is embedded inside a larger Comet native tree (where this exec's own
-    // `doExecuteColumnar` is bypassed in favour of the parent's).
     baseRDD
   }
 
@@ -502,11 +495,9 @@ case class CometDeltaNativeScanExec(
     // IMPORTANT: forward `oneTaskPerPartition` to the rebuilt exec. The case
     // class has `oneTaskPerPartition: Boolean = false` as the last constructor
     // param with a default; if we don't pass it explicitly here, every call to
-    // `convertBlock()` silently downgrades the flag to false and
-    // `CometExecRDD`'s per-partition `InputFileBlockHolder` hook stops firing
-    // (multi-file partitions return empty `input_file_name()`, which breaks
-    // Delta's MERGE / UPDATE / DELETE `findTouchedFiles` lookup with
-    // DELTA_FILE_TO_OVERWRITE_NOT_FOUND).
+    // `convertBlock()` silently downgrades the flag to false, packing multiple
+    // files into one partition and dropping the 2nd+ files' rows for scans that
+    // emit per-file `_metadata.file_path` / materialized row-tracking columns.
     CometDeltaNativeScanExec(
       nativeOp,
       output,

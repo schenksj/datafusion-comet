@@ -93,15 +93,12 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
   // during planning so a simple ThreadLocal is safe.
   private val lastTaskListBytes = new ThreadLocal[Array[Byte]]()
 
-  // #75 design A: when the surrounding plan references `input_file_name()` /
-  // `input_file_block_*`, CometScanRule tags the relation's options with
-  // `CometScanRule.NeedsInputFileNameOption`. We read it here to (a) skip
-  // byte-range splitting in splitTasks and (b) emit `oneTaskPerPartition = true`
-  // on the CometDeltaNativeScanExec so packTasks keeps each task in its own
-  // partition. With 1 task per partition, `CometExecRDD.compute` (via `InputFileBlockHolder.set`)
-  // sets InputFileBlockHolder to the correct path and Spark's JVM-side
-  // input_file_name() evaluation (no native serde exists) returns the right
-  // value.
+  // When a scan projects a per-file `_metadata.file_path` column, `DeltaScanRule` tags the
+  // relation's options with `DeltaConf.OneTaskPerPartitionOption`. We read it here to (a) skip
+  // byte-range splitting in splitTasks and (b) emit `oneTaskPerPartition = true` on the
+  // CometDeltaNativeScanExec so packTasks keeps each task in its own partition -- the native
+  // plan emits one parquet file-group per file, so multiple files in one Spark partition would
+  // drop the 2nd+ files' rows.
   /**
    * Translate Delta's `delta.columnMapping.id` metadata key to Spark+parquet's standard
    * `parquet.field.id` key on every StructField at every level of nesting. Required for
@@ -160,9 +157,9 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     }
 
   /** Visible to `DeltaOperatorSerdeExtension.matchOperator` for routing decisions. */
-  private[delta] def scanNeedsInputFileName(scan: CometScanExec): Boolean =
+  private[delta] def scanNeedsOneTaskPerPartition(scan: CometScanExec): Boolean =
     scan.relation.options
-      .get(DeltaConf.NeedsInputFileNameOption)
+      .get(DeltaConf.OneTaskPerPartitionOption)
       .contains("true")
 
   /**
@@ -1434,12 +1431,11 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       scan: CometScanExec,
       tasks: Seq[OperatorOuterClass.DeltaScanTask]): Seq[OperatorOuterClass.DeltaScanTask] = {
     if (tasks.isEmpty) return tasks
-    // #75 design A: when the plan needs input_file_name(), keep each task 1:1 with
-    // a file so `CometExecRDD.compute` (which reads only the first task) sets
-    // the correct path. Without this, byte-range chunking would create multiple
-    // tasks for one file -- still same path -- BUT combined with packTasks below
-    // could end up with multiple FILES per partition.
-    if (scanNeedsInputFileName(scan)) return tasks
+    // When the scan needs one task per partition (per-file `_metadata.file_path`), keep each
+    // task 1:1 with a file: byte-range chunking would create multiple tasks for one file which,
+    // combined with packTasks below, could end up with multiple FILES per partition and drop
+    // the 2nd+ files' rows.
+    if (scanNeedsOneTaskPerPartition(scan)) return tasks
     val sizes = tasks.map(_.getFileSize)
     val msb = maxSplitBytes(scan, sizes)
     if (msb <= 0) return tasks
@@ -1587,12 +1583,12 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // physically absent from some of those files across the concurrently-executed
     // file-groups non-deterministically drops whole file-groups' rows. Pinning one file
     // per partition keeps each native plan single-file-group, so the absent-column
-    // null-fill happens without cross-file-group concurrency. (Same mechanism already
-    // used for `input_file_name()`.) See CometDeltaRowTrackingMergeReproSuite.
+    // null-fill happens without cross-file-group concurrency. (Same mechanism used for
+    // per-file `_metadata.file_path`.) See CometDeltaRowTrackingMergeReproSuite.
     val readsMaterializedRowTracking =
       op.requiredSchema.fields.exists(f =>
         CometDeltaNativeScan.isMaterializedRowTrackingName(f.name))
-    val oneTaskPerPartition = scanNeedsInputFileName(op) || readsMaterializedRowTracking ||
+    val oneTaskPerPartition = scanNeedsOneTaskPerPartition(op) || readsMaterializedRowTracking ||
       CometDeltaNativeScan.needsPerFileGroups(op)
 
     val dppFilters = op.partitionFilters.filter(

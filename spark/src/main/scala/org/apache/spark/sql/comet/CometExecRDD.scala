@@ -101,33 +101,6 @@ private[spark] class CometExecRDD(
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
     val partition = split.asInstanceOf[CometExecPartition]
 
-    // Populate Spark's `InputFileBlockHolder` thread-local so `input_file_name()` and
-    // friends return the correct path for this task's data. Comet's native scan does
-    // not go through Spark's `FileScanRDD` (which is what normally maintains this
-    // thread-local), so without this hook Delta's UPDATE/DELETE/MERGE flows -- which
-    // rely on `input_file_name()` to find which files to rewrite (`findTouchedFiles`
-    // joins the row stream against the snapshot's AddFile map keyed by file path) --
-    // silently see an empty path. Empty path resolves against the table root and
-    // misses every AddFile, throwing DELTA_FILE_TO_OVERWRITE_NOT_FOUND.
-    //
-    // Contribs surfacing `input_file_name()` MUST force one-task-per-partition (e.g.
-    // DeltaScanRule's `oneTaskPerPartition` flag); when that's the case the single
-    // file's path is correctly attributed here. When the partition contains multiple
-    // files we still set the holder to the FIRST file -- the attribution is wrong
-    // for rows from later files, but partial-wrong-attribution is strictly better
-    // than DELTA_FILE_TO_OVERWRITE_NOT_FOUND killing the whole MERGE. Matches the
-    // approach taken in PR #3932 which dropped 760 -> 2 failures in the Delta
-    // regression. Registers an unset on task completion to avoid leaking across
-    // tasks on the same executor thread.
-    if (partition.filePaths.nonEmpty) {
-      org.apache.spark.rdd.InputFileBlockHolder.set(partition.filePaths.head, 0L, 0L)
-      Option(context).foreach { ctx =>
-        ctx.addTaskCompletionListener[Unit] { _ =>
-          org.apache.spark.rdd.InputFileBlockHolder.unset()
-        }
-      }
-    }
-
     val inputs = inputRDDs.zip(partition.inputPartitions).map { case (rdd, part) =>
       rdd.iterator(part, context)
     }

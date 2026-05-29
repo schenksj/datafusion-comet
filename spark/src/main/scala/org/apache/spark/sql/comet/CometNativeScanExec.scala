@@ -231,8 +231,7 @@ case class CometNativeScanExec(
 
     // File paths per partition -- threaded through CometExecRDD to CometExecIterator
     // so wrapNativeParquetError can populate FAILED_READ_FILE.NO_HINT exceptions with
-    // the actual file path. CometNativeScanExec bypasses Spark's FileScanRDD, so the
-    // standard InputFileBlockHolder thread-local isn't set.
+    // the actual file path.
     val perPartitionPaths = filePartitions.map(_.files.map(_.filePath.toString).toSeq).toArray
 
     (commonBytes, perPartitionBytes, perPartitionPaths)
