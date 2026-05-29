@@ -323,7 +323,6 @@ index cf9c9b4..cc91cd0 100644
      assert(errorsToTest.keySet ++ otherMessagesToTest.keySet ==
        DeltaErrors.errorsWithDocsLinks.toSet
 diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/IdentityColumnAdmissionSuite.scala b/spark/src/test/scala/org/apache/spark/sql/delta/IdentityColumnAdmissionSuite.scala
-index 0000000..1111111 100644
 --- a/spark/src/test/scala/org/apache/spark/sql/delta/IdentityColumnAdmissionSuite.scala
 +++ b/spark/src/test/scala/org/apache/spark/sql/delta/IdentityColumnAdmissionSuite.scala
 @@ -270,7 +270,13 @@ trait IdentityColumnAdmissionSuiteBase

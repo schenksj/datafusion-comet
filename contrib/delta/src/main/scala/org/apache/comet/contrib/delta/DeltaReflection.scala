@@ -690,9 +690,16 @@ object DeltaReflection extends Logging {
               case _: IllegalArgumentException => tableRoot
             }
           val tablePath = new org.apache.hadoop.fs.Path(singleEncoded)
-          val abs = dvDescriptor
-            .asInstanceOf[org.apache.spark.sql.delta.actions.DeletionVectorDescriptor]
-            .absolutePath(tablePath)
+          // Reflective invocation preserves this file's no-compile-time-dep on `spark-delta`
+          // invariant (see header) -- a direct `asInstanceOf[DeletionVectorDescriptor]` would
+          // import that class at compile time, and a Delta version that renames/relocates
+          // it would surface as a NoClassDefFoundError that bypasses the
+          // ReflectiveOperationException catch below. `getDeclaredMethod` is safe across
+          // the supported Delta versions (3.3.2 / 4.0.0 / 4.1.0) because the
+          // `absolutePath(Path): Path` signature is stable.
+          val absMethod = cls.getDeclaredMethod("absolutePath", classOf[org.apache.hadoop.fs.Path])
+          val abs = absMethod.invoke(dvDescriptor, tablePath)
+            .asInstanceOf[org.apache.hadoop.fs.Path]
           // Use Hadoop's URI form (which Delta itself uses for "p" descriptors via
           // `copyWithAbsolutePath` -> `SparkPath.fromPath(...).urlEncoded`).
           ("p", abs.toUri.toString)
@@ -707,20 +714,35 @@ object DeltaReflection extends Logging {
       offsetOpt.foreach(o => b.setOffset(o.toLong))
       Some(b.build())
     } catch {
-      // Only swallow REFLECTION setup failures (Delta version drift -- field rename,
-      // class missing): falling back to a None DV here would silently mis-read rows,
-      // so callers should be aware. Logging keeps that visible.
-      case e: ReflectiveOperationException =>
+      // `InvocationTargetException` wraps anything Delta's own code threw -- e.g.
+      // `URISyntaxException` from `absolutePath` parsing a malformed "p" path. We
+      // MUST re-throw the inner cause unchanged so vanilla Delta's error contract
+      // is preserved (DeletionVectorsSuite "absolute DV path with not-encoded
+      // special characters" expects `interceptWithUnwrapping[URISyntaxException]`
+      // to match it). Swallowing here would turn the failure into a silent
+      // wrong-result. NoSuchMethodException / IllegalAccessException are the
+      // only ReflectiveOperationException variants that count as "reflection
+      // setup failure" (Delta version drift -- field rename, class missing) and
+      // are safe to log + return None for.
+      case e: java.lang.reflect.InvocationTargetException
+          if e.getCause != null => throw e.getCause
+      case e: NoSuchMethodException =>
         logWarning(
-          s"addFileDvToProto: failed to read DeletionVectorDescriptor via reflection " +
+          s"addFileDvToProto: missing method on DeletionVectorDescriptor " +
             s"(class=${dvDescriptor.getClass.getName}): ${e.getMessage}")
         None
-      // Genuine errors from Delta's own `absolutePath` -- in particular
-      // `URISyntaxException` for malformed "p" descriptors -- MUST propagate up the
-      // driver chain. Vanilla Delta throws the same exception at read time and tests
-      // (e.g. DeletionVectorsSuite "absolute DV path with not-encoded special characters")
-      // `interceptWithUnwrapping[URISyntaxException]` against it. Swallowing here would
-      // turn the failure into a silent wrong-result.
+      case e: IllegalAccessException =>
+        logWarning(
+          s"addFileDvToProto: illegal access on DeletionVectorDescriptor " +
+            s"(class=${dvDescriptor.getClass.getName}): ${e.getMessage}")
+        None
+      // ClassCastException from the .asInstanceOf calls on reflected getters --
+      // also Delta-version-drift territory (a field's runtime type changed).
+      case e: ClassCastException =>
+        logWarning(
+          s"addFileDvToProto: unexpected field type on DeletionVectorDescriptor " +
+            s"(class=${dvDescriptor.getClass.getName}): ${e.getMessage}")
+        None
     }
   }
 

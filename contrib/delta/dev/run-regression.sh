@@ -232,7 +232,7 @@ LOG_SUFFIX=""
 if [[ -n "${SHARD_ID:-}" && -n "${NUM_SHARDS:-}" ]]; then
   LOG_SUFFIX="-shard${SHARD_ID}of${NUM_SHARDS}"
 fi
-LOG="$LOG_DIR/regression-${DELTA_VERSION}-${TEST_FILTER}${LOG_SUFFIX}-$(date +%Y%m%d-%H%M%S).log"
+LOG="$LOG_DIR/regression-${DELTA_VERSION}-${TEST_FILTER}${LOG_SUFFIX}-$(date +%Y%m%d-%H%M%S)-$$.log"
 echo "==> logging to $LOG"
 
 case "$TEST_FILTER" in

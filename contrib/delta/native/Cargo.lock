@@ -734,6 +734,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "datafusion",
+ "datafusion-comet-common",
  "datafusion-comet-jni-bridge",
  "datafusion-comet-proto",
  "delta_kernel",

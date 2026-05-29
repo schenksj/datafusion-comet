@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow::array::{
-    Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Int64Array, Int8Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::common::{DataFusionError, Result as DFResult};
@@ -191,8 +191,8 @@ fn build_output_schema(
 }
 
 /// `ExecutionPlan` wrapper that appends Delta's synthetic `__delta_internal_row_index`
-/// (UInt64) and/or `__delta_internal_is_row_deleted` (Int32) columns to its child's
-/// output batches.
+/// (Int64) and/or `__delta_internal_is_row_deleted` (Int8, matching Delta's ByteType
+/// representation) columns to its child's output batches.
 ///
 /// `dv_descriptors_by_partition[i]` is the DV descriptor for partition `i`. When
 /// `emit_is_row_deleted` is true, each row's is-deleted column is computed by checking
@@ -464,8 +464,8 @@ impl DeltaSyntheticColumnsStream {
         let batch_start = self.current_row_offset;
         let batch_end = batch_start + batch_rows;
 
-        // Build the row_index column: monotonically increasing UInt64 starting at
-        // batch_start.
+        // Build the row_index column: monotonically increasing Int64 starting at
+        // batch_start (Delta represents row_index as Long).
         let row_index_array: Option<Int64Array> = if self.emit_row_index {
             Some(Int64Array::from_iter_values(
                 (batch_start..batch_end).map(|v| v as i64),
@@ -836,12 +836,13 @@ mod tests {
     fn augment_is_row_deleted_marks_correct_indexes() {
         let mut s = make_stream(false, true, false, false, vec![1, 3], None, None);
         let out = s.augment(batch(&[10, 20, 30, 40, 50])).unwrap();
+        // is_row_deleted is Int8 (Delta's ByteType), see build_output_schema().
         let flags = out
             .column(1)
             .as_any()
-            .downcast_ref::<Int32Array>()
+            .downcast_ref::<Int8Array>()
             .unwrap();
-        let vals: Vec<i32> = flags.iter().map(Option::unwrap).collect();
+        let vals: Vec<i8> = flags.iter().map(Option::unwrap).collect();
         assert_eq!(vals, vec![0, 1, 0, 1, 0]);
     }
 
@@ -853,10 +854,10 @@ mod tests {
         let _ = s.augment(batch(&[10, 20, 30])).unwrap(); // 0,1,2 deleted, next_delete_idx -> 3
         assert_eq!(s.next_delete_idx, 3);
         let out2 = s.augment(batch(&[40, 50, 60, 70, 80])).unwrap(); // covers 3..8; 7 deleted
-        let flags: Vec<i32> = out2
+        let flags: Vec<i8> = out2
             .column(1)
             .as_any()
-            .downcast_ref::<Int32Array>()
+            .downcast_ref::<Int8Array>()
             .unwrap()
             .iter()
             .map(Option::unwrap)
@@ -944,11 +945,11 @@ mod tests {
             .map(Option::unwrap)
             .collect();
         assert_eq!(ri, vec![0i64, 1, 2]);
-        // col 2: is_row_deleted 0,1,0
-        let dl: Vec<i32> = out
+        // col 2: is_row_deleted 0,1,0 (Int8 per Delta's ByteType)
+        let dl: Vec<i8> = out
             .column(2)
             .as_any()
-            .downcast_ref::<Int32Array>()
+            .downcast_ref::<Int8Array>()
             .unwrap()
             .iter()
             .map(Option::unwrap)
@@ -988,10 +989,11 @@ mod tests {
     fn new_validates_partition_count_mismatch() {
         use datafusion::physical_plan::empty::EmptyExec;
         let inner = Arc::new(EmptyExec::new(input_schema())) as Arc<dyn ExecutionPlan>;
-        // EmptyExec has 1 partition; pass 2 entries.
+        // EmptyExec has 1 partition; pass 2 DV / row-tracking / task-metadata entries.
         let err = DeltaSyntheticColumnsExec::new(
             inner,
-            vec![vec![], vec![]],
+            vec![None, None],
+            Url::parse("file:///tmp/").unwrap(),
             vec![None, None],
             vec![None, None],
             true,
@@ -1003,6 +1005,10 @@ mod tests {
             vec![TaskMetadata::default(), TaskMetadata::default()],
         )
         .unwrap_err();
-        assert!(format!("{err}").contains("partition count mismatch") || format!("{err}").contains("partitions"));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("don't match input partitions") || msg.contains("partitions"),
+            "unexpected error: {msg}"
+        );
     }
 }

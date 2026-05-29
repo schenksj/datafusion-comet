@@ -108,6 +108,16 @@ jobs:
         env:
           RUSTFLAGS: "-Ctarget-cpu=x86-64-v3 -Clink-arg=-fuse-ld=bfd"
 
+      - name: Run cargo tests for contrib-delta crate
+        run: |
+          # The crate's own unit + integration tests (e.g. proto<->kernel descriptor
+          # round-trip, DV-decode error mapping, schema-adapter behaviour) live in the
+          # contrib-delta crate itself. Without this step, broken tests can slip past
+          # CI because the build step only validates compilation, not behaviour.
+          cd contrib/delta/native && cargo test --release
+        env:
+          RUSTFLAGS: "-Ctarget-cpu=x86-64-v3 -Clink-arg=-fuse-ld=bfd"
+
       - name: Save Cargo cache
         uses: actions/cache/save@v5
         if: github.ref == 'refs/heads/main'

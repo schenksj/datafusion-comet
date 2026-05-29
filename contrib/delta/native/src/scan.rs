@@ -197,10 +197,11 @@ pub fn plan_delta_scan_with_predicate(
     };
 
     // `Snapshot::build()` returns `Arc<Snapshot>`, and `scan_builder` consumes
-    // it. Clone the Arc so we can still reach `table_root()` after building
-    // the scan — we need the URL to materialize DVs below.
+    // it. Clone the Arc so we keep a stable handle through scan construction
+    // (driver no longer needs `table_root()` here -- DV decode now happens on the
+    // executor via `dv_reader::read_dv_indexes` -- but the Arc retention is still
+    // wanted for any future post-scan-build kernel API that wants the snapshot).
     let snapshot_arc: Arc<_> = snapshot;
-    let table_root_url = snapshot_arc.table_root().clone();
     let mut scan_builder = Arc::clone(&snapshot_arc).scan_builder();
     if let Some(pred) = kernel_predicate {
         scan_builder = scan_builder.with_predicate(Arc::new(pred));
@@ -292,7 +293,6 @@ pub fn plan_delta_scan_with_predicate(
     // reads + decodes the RoaringBitmap on-task. Pre-refactor this loop called
     // `DvInfo::get_row_indexes` and produced a `Vec<u64>` per file, which on the
     // 99 M-row "huge table delete" DV reached ~800 MB per scan exec (task #218).
-    let _ = &table_root_url; // table_root_url no longer needed for driver-side DV reads
     let mut entries: Vec<DeltaFileEntry> = Vec::with_capacity(raw.len());
     for r in raw {
         entries.push(DeltaFileEntry {
