@@ -53,6 +53,10 @@ use datafusion::physical_plan::metrics::{
 };
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{Stream, StreamExt};
+use url::Url;
+
+use crate::dv_reader::{map_dv_error_to_datafusion, read_dv_indexes};
+use crate::proto::DeltaDvDescriptor;
 
 /// Delta's internal name for the row-index column.
 pub const ROW_INDEX_COLUMN_NAME: &str = "__delta_internal_row_index";
@@ -190,7 +194,7 @@ fn build_output_schema(
 /// (UInt64) and/or `__delta_internal_is_row_deleted` (Int32) columns to its child's
 /// output batches.
 ///
-/// `deleted_row_indexes_by_partition[i]` is the sorted DV for partition `i`. When
+/// `dv_descriptors_by_partition[i]` is the DV descriptor for partition `i`. When
 /// `emit_is_row_deleted` is true, each row's is-deleted column is computed by checking
 /// membership in this list. When `emit_row_index` is true, each row's row_index column
 /// is set to its physical position within the file (running offset across batches).
@@ -202,8 +206,15 @@ fn build_output_schema(
 pub struct DeltaSyntheticColumnsExec {
     input: Arc<dyn ExecutionPlan>,
     /// One entry per output partition. Length must match the input's partition count.
-    /// Empty vec means no DV for that partition (all rows are kept).
-    deleted_row_indexes_by_partition: Vec<Vec<u64>>,
+    /// `None` means no DV for that partition. When `emit_is_row_deleted` is true,
+    /// each `Some` descriptor is decoded on the executor (one kernel read against
+    /// `<table_root>/_delta_log/deletion_vectors/...`) on first `execute()` --
+    /// matching `DeltaDvFilterExec`'s lazy-decode model so the driver no longer
+    /// retains the full `Vec<u64>` (was the 1 GB `long[]` dominator before #218).
+    dv_descriptors_by_partition: Vec<Option<DeltaDvDescriptor>>,
+    /// Trailing-slash-normalised table-root URL for DV decode (only consulted
+    /// when `emit_is_row_deleted` is true and some partition has `Some` DV).
+    table_root_url: Url,
     /// `AddFile.baseRowId` per partition; `None` when the table doesn't have row
     /// tracking enabled for this file. Required to be present (Some(_)) on every
     /// partition when `emit_row_id` is true.
@@ -224,7 +235,7 @@ pub struct DeltaSyntheticColumnsExec {
     /// value sourced from `task_metadata_by_partition`.
     metadata_column_names: Vec<String>,
     /// Per-partition file metadata (one entry per DataFusion partition, indexed
-    /// the same way `deleted_row_indexes_by_partition` etc. are). Values come
+    /// the same way `dv_descriptors_by_partition` etc. are). Values come
     /// from the corresponding `DeltaScanTask`.
     task_metadata_by_partition: Vec<TaskMetadata>,
     output_schema: SchemaRef,
@@ -236,7 +247,8 @@ impl DeltaSyntheticColumnsExec {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        deleted_row_indexes_by_partition: Vec<Vec<u64>>,
+        dv_descriptors_by_partition: Vec<Option<DeltaDvDescriptor>>,
+        table_root_url: Url,
         base_row_ids_by_partition: Vec<Option<i64>>,
         default_row_commit_versions_by_partition: Vec<Option<i64>>,
         emit_row_index: bool,
@@ -259,7 +271,7 @@ impl DeltaSyntheticColumnsExec {
         }
         let input_props = input.properties();
         let num_partitions = input_props.output_partitioning().partition_count();
-        if deleted_row_indexes_by_partition.len() != num_partitions
+        if dv_descriptors_by_partition.len() != num_partitions
             || base_row_ids_by_partition.len() != num_partitions
             || default_row_commit_versions_by_partition.len() != num_partitions
             || task_metadata_by_partition.len() != num_partitions
@@ -268,7 +280,7 @@ impl DeltaSyntheticColumnsExec {
                 "DeltaSyntheticColumnsExec: per-partition vec lengths don't match input partitions \
                  ({}): dv={}, base_row_ids={}, default_commit_versions={}, task_metadata={}",
                 num_partitions,
-                deleted_row_indexes_by_partition.len(),
+                dv_descriptors_by_partition.len(),
                 base_row_ids_by_partition.len(),
                 default_row_commit_versions_by_partition.len(),
                 task_metadata_by_partition.len()
@@ -291,7 +303,8 @@ impl DeltaSyntheticColumnsExec {
         ));
         Ok(Self {
             input,
-            deleted_row_indexes_by_partition,
+            dv_descriptors_by_partition,
+            table_root_url,
             base_row_ids_by_partition,
             default_row_commit_versions_by_partition,
             emit_row_index,
@@ -359,7 +372,8 @@ impl ExecutionPlan for DeltaSyntheticColumnsExec {
         }
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
-            self.deleted_row_indexes_by_partition.clone(),
+            self.dv_descriptors_by_partition.clone(),
+            self.table_root_url.clone(),
             self.base_row_ids_by_partition.clone(),
             self.default_row_commit_versions_by_partition.clone(),
             self.emit_row_index,
@@ -378,11 +392,20 @@ impl ExecutionPlan for DeltaSyntheticColumnsExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let child_stream = self.input.execute(partition, context)?;
-        let deleted = self
-            .deleted_row_indexes_by_partition
-            .get(partition)
-            .cloned()
-            .unwrap_or_default();
+        // Lazy DV decode -- only when this exec actually consults the bitmap
+        // (emit_is_row_deleted=true). For the row_id / row_commit_version /
+        // metadata-only paths the DV isn't read at all, so the descriptor is
+        // ignored (matching the pre-#218 behaviour where the upstream passed
+        // `vec![Vec::new(); n]` for the synthetic-only case).
+        let deleted = if self.emit_is_row_deleted {
+            match self.dv_descriptors_by_partition.get(partition) {
+                Some(Some(desc)) => read_dv_indexes(desc, &self.table_root_url)
+                    .map_err(|e| map_dv_error_to_datafusion(e, desc))?,
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         let base_row_id = self.base_row_ids_by_partition.get(partition).copied().flatten();
         let default_row_commit_version = self
             .default_row_commit_versions_by_partition

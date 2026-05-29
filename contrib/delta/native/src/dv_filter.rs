@@ -32,11 +32,15 @@
 //!     "subtract deleted indexes by tracking a running row offset" strategy
 //!     to be correct.
 //!
-//!   - **Indexes are pre-materialized.** Kernel already turned the DV
-//!     (inline bitmap / on-disk file / UUID reference) into a sorted
-//!     `Vec<u64>` on the driver via `DvInfo::get_row_indexes`. That's what
-//!     `plan_delta_scan` returns. We don't touch DV bytes on the executor
-//!     side at all.
+//!   - **Indexes are decoded on the executor.** The driver ships a per-partition
+//!     [`DeltaDvDescriptor`] (storage type / path / offset / size, KB-scale)
+//!     instead of the expanded `Vec<u64>`. `execute()` calls
+//!     `crate::dv_reader::read_dv_indexes` once per partition to materialise the
+//!     sorted index list locally -- pre-#218 the driver did this work and the
+//!     resulting `long[]` (up to 1 GB for 99.9 M-row DVs) was retained on the
+//!     driver heap for the lifetime of the scan. The decoded indexes still live
+//!     in memory per partition, but only inside the executor task that needs
+//!     them, and they go away when the stream finishes.
 //!
 //!   - **Filter uses arrow `filter_record_batch`.** Builds a per-batch
 //!     `BooleanArray` mask where `true` means "keep". One mask per batch,
@@ -61,19 +65,27 @@ use datafusion::physical_plan::metrics::{
 };
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{Stream, StreamExt};
+use url::Url;
+
+use crate::dv_reader::{map_dv_error_to_datafusion, read_dv_indexes};
+use crate::proto::DeltaDvDescriptor;
 
 /// Execution-plan wrapper that applies per-partition deletion-vector filters
 /// to the output of a child parquet scan.
 ///
-/// `deleted_row_indexes_by_partition[i]` is the sorted list of physical row
-/// indexes to drop from partition `i`'s output. An empty vec means "no DV
-/// for this partition — pass through untouched".
+/// `dv_descriptors_by_partition[i]` is `Some(descriptor)` when partition `i`
+/// carries a DV (decoded on the executor on first `execute()`), and `None` when
+/// it doesn't -- the no-DV partitions stream straight through.
 #[derive(Debug)]
 pub struct DeltaDvFilterExec {
     input: Arc<dyn ExecutionPlan>,
     /// One entry per output partition. Length must match the input's
     /// partition count.
-    deleted_row_indexes_by_partition: Vec<Vec<u64>>,
+    dv_descriptors_by_partition: Vec<Option<DeltaDvDescriptor>>,
+    /// Trailing-slash-normalised table-root URL used by
+    /// `kernel::DeletionVectorDescriptor::read` to resolve relative ("u") and
+    /// inline ("i") DV paths against `<root>/_delta_log/deletion_vectors/`.
+    table_root_url: Url,
     plan_properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -81,14 +93,15 @@ pub struct DeltaDvFilterExec {
 impl DeltaDvFilterExec {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        deleted_row_indexes_by_partition: Vec<Vec<u64>>,
+        dv_descriptors_by_partition: Vec<Option<DeltaDvDescriptor>>,
+        table_root_url: Url,
     ) -> DFResult<Self> {
         let input_props = input.properties();
         let num_partitions = input_props.output_partitioning().partition_count();
-        if deleted_row_indexes_by_partition.len() != num_partitions {
+        if dv_descriptors_by_partition.len() != num_partitions {
             return Err(DataFusionError::Internal(format!(
                 "DeltaDvFilterExec: got {} DV entries for {} partitions",
-                deleted_row_indexes_by_partition.len(),
+                dv_descriptors_by_partition.len(),
                 num_partitions
             )));
         }
@@ -100,7 +113,8 @@ impl DeltaDvFilterExec {
         ));
         Ok(Self {
             input,
-            deleted_row_indexes_by_partition,
+            dv_descriptors_by_partition,
+            table_root_url,
             plan_properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -109,20 +123,22 @@ impl DeltaDvFilterExec {
 
 impl DisplayAs for DeltaDvFilterExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        let total_dv: usize = self
-            .deleted_row_indexes_by_partition
-            .iter()
-            .map(|v| v.len())
-            .sum();
+        // Total deleted rows are only known after on-task decode, so we display
+        // partition counts + cumulative cardinality (a cheap field on the descriptor).
         let dv_partitions = self
-            .deleted_row_indexes_by_partition
+            .dv_descriptors_by_partition
             .iter()
-            .filter(|v| !v.is_empty())
+            .filter(|d| d.is_some())
             .count();
+        let total_card: u64 = self
+            .dv_descriptors_by_partition
+            .iter()
+            .filter_map(|d| d.as_ref().map(|x| x.cardinality))
+            .sum();
         write!(
             f,
             "DeltaDvFilterExec: {dv_partitions} partitions with DVs, \
-             {total_dv} total deleted rows"
+             {total_card} total deleted rows (cardinality)"
         )
     }
 }
@@ -170,7 +186,8 @@ impl ExecutionPlan for DeltaDvFilterExec {
         }
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
-            self.deleted_row_indexes_by_partition.clone(),
+            self.dv_descriptors_by_partition.clone(),
+            self.table_root_url.clone(),
         )?))
     }
 
@@ -180,11 +197,25 @@ impl ExecutionPlan for DeltaDvFilterExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let child_stream = self.input.execute(partition, context)?;
-        let deleted = self
-            .deleted_row_indexes_by_partition
-            .get(partition)
-            .cloned()
-            .unwrap_or_default();
+        // Decode the DV on the executor task. For non-DV partitions this is a
+        // no-op (empty Vec); for DV partitions it issues one kernel read against
+        // <table_root>/_delta_log/deletion_vectors/<uuid> (or decodes inline
+        // bytes for storageType="i"). The decoded indexes live only for the
+        // lifetime of this stream -- not retained on the driver heap as before.
+        //
+        // Errors are mapped to structured `SparkError` variants so the JVM
+        // shim (`ShimSparkErrorConverter`) can attach the right `Throwable`
+        // chain -- in particular, a missing/corrupted DV file surfaces as
+        // `SparkError::FileNotFound` so the shim wraps it via
+        // `QueryExecutionErrors.readCurrentFileNotFoundError(new FileNotFoundException(...))`.
+        // DeletionVectorsSuite "Check no resource leak when DV files are missing"
+        // asserts the cause chain contains a `FileNotFoundException`; without the
+        // structured mapping the test only sees a plain `CometNativeException`.
+        let deleted = match self.dv_descriptors_by_partition.get(partition) {
+            Some(Some(desc)) => read_dv_indexes(desc, &self.table_root_url)
+                .map_err(|e| map_dv_error_to_datafusion(e, desc))?,
+            _ => Vec::new(),
+        };
         let metrics = DeltaDvFilterMetrics::new(&self.metrics, partition);
         metrics.num_deleted.add(deleted.len());
         Ok(Box::pin(DeltaDvFilterStream {
@@ -493,8 +524,23 @@ mod tests {
         use datafusion::physical_plan::empty::EmptyExec;
         let inner = StdArc::new(EmptyExec::new(schema())) as Arc<dyn ExecutionPlan>;
         // EmptyExec has 1 partition; passing 2 DV entries must be rejected.
-        let err =
-            DeltaDvFilterExec::new(inner, vec![vec![1u64], vec![2u64]]).unwrap_err();
+        let root = Url::parse("file:///tmp/").unwrap();
+        let err = DeltaDvFilterExec::new(
+            inner,
+            vec![
+                Some(DeltaDvDescriptor {
+                    storage_type: "i".into(),
+                    path_or_inline_dv: String::new(),
+                    offset: None,
+                    size_in_bytes: 0,
+                    cardinality: 0,
+                    inline_bytes: Vec::new(),
+                }),
+                None,
+            ],
+            root,
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("got 2 DV entries for 1 partitions"));
     }
 }

@@ -34,6 +34,7 @@
 //! `#[cfg(feature = "contrib-delta")]`.
 
 pub mod dv_filter;
+pub mod dv_reader;
 pub mod engine;
 pub mod error;
 pub mod jni;
@@ -48,8 +49,8 @@ pub mod synthetic_columns;
 /// access to the typed variants).
 pub mod proto {
     pub use datafusion_comet_proto::spark_operator::{
-        DeltaColumnMapping, DeltaPartitionValue, DeltaScan, DeltaScanCommon, DeltaScanTask,
-        DeltaScanTaskList,
+        DeltaColumnMapping, DeltaDvDescriptor, DeltaPartitionValue, DeltaScan, DeltaScanCommon,
+        DeltaScanTask, DeltaScanTaskList,
     };
 }
 

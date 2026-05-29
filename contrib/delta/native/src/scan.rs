@@ -55,11 +55,14 @@ pub struct DeltaFileEntry {
     pub num_records: Option<u64>,
     /// Partition column → value mapping from the add action.
     pub partition_values: HashMap<String, String>,
-    /// Deleted row indexes materialized from the file's deletion vector by
-    /// kernel on the driver. Empty vector means the file has no DV in use.
-    /// Sorted ascending; indexes are 0-based into the file's physical parquet
-    /// row space, matching `DvInfo::get_row_indexes` semantics.
-    pub deleted_row_indexes: Vec<u64>,
+    /// Deletion-vector descriptor for this file, when one is in use. `None`
+    /// when the file has no DV. Carries everything the EXECUTOR needs to read
+    /// the DV bitmap on-task -- the driver no longer materialises the deleted
+    /// row indexes (which could reach ~1 GB long[] for a 99 M-row DV on the
+    /// 2 B-row "huge table delete" test). See task #218 / the Iceberg-style
+    /// refactor: the driver ships KB-scale descriptors, the executor calls
+    /// `kernel::DeletionVectorDescriptor::read` once per partition.
+    pub dv_descriptor: Option<crate::proto::DeltaDvDescriptor>,
     /// `AddFile.baseRowId` for row-tracking-enabled tables. `None` when the
     /// table doesn't have row tracking. `row_id` for any row in this file is
     /// `base_row_id + physical_row_index`.
@@ -72,7 +75,7 @@ pub struct DeltaFileEntry {
 impl DeltaFileEntry {
     /// True if this entry has a deletion vector in use.
     pub fn has_deletion_vector(&self) -> bool {
-        !self.deleted_row_indexes.is_empty()
+        self.dv_descriptor.is_some()
     }
 }
 
@@ -204,51 +207,55 @@ pub fn plan_delta_scan_with_predicate(
     }
     let scan = scan_builder.build()?;
 
-    // Temporary collection that keeps the raw kernel `DvInfo` alongside the
-    // rest of the metadata. We need the `DvInfo` to materialize the deleted
-    // row indexes below; it doesn't escape this function.
+    // Per-row state extracted directly from each scan_metadata RecordBatch -- avoids
+    // both `DvInfo` (whose `deletion_vector` field is `pub(crate)`) and the per-DV
+    // `get_row_indexes` driver-side read that previously materialised a Vec<u64>.
     //
-    // `base_row_id` / `default_row_commit_version` are extracted from each
-    // scan-files batch's underlying RecordBatch via direct column access --
-    // `ScanFile` (what kernel's `visit_scan_files` callback receives) doesn't
-    // surface them. Comet's native synthetic-columns exec uses them to
-    // synthesise Delta's logical `row_id` (= baseRowId + row_index) and
-    // `row_commit_version` (= defaultRowCommitVersion, constant per file) so
-    // row-tracking-enabled tables can stay on the native path instead of
-    // falling back to Spark's Delta reader for these projections.
+    // Two parallel vecs (indexed by visit order over SELECTED rows):
+    //   - row_tracking: (baseRowId, defaultRowCommitVersion). `ScanFile` doesn't
+    //     surface these; we extract from the `fileConstantValues` struct column.
+    //   - dv_descriptors: per-row DV descriptor as a proto message. None = no DV.
+    //     The executor calls `kernel::DeletionVectorDescriptor::read` on-task --
+    //     the driver no longer holds the expanded indexes.
+    //
+    // Comet's native synthetic-columns exec uses base_row_id / default_row_commit_version
+    // to synthesise Delta's logical `row_id` and `row_commit_version`.
     struct RawEntry {
         path: String,
         size: i64,
         modification_time: i64,
         num_records: Option<u64>,
         partition_values: HashMap<String, String>,
-        dv_info: delta_kernel::scan::state::DvInfo,
+        dv_descriptor: Option<crate::proto::DeltaDvDescriptor>,
         base_row_id: Option<i64>,
         default_row_commit_version: Option<i64>,
     }
 
     // Kernel's `visit_scan_files` requires a `fn` callback (not `FnMut`), so any
     // per-call state must live in the `context` we pass in. Use a struct that carries
-    // both the accumulator AND the row-tracking lookup for the current batch.
+    // both the accumulator AND the per-row lookups for the current batch.
     struct RawEntryAcc {
         entries: Vec<RawEntry>,
         row_tracking: Vec<(Option<i64>, Option<i64>)>,
+        dv_descriptors: Vec<Option<crate::proto::DeltaDvDescriptor>>,
         next_idx: usize,
     }
     let mut acc = RawEntryAcc {
         entries: Vec::new(),
         row_tracking: Vec::new(),
+        dv_descriptors: Vec::new(),
         next_idx: 0,
     };
     let scan_metadata = scan.scan_metadata(&*engine)?;
 
     for meta_result in scan_metadata {
         let meta: delta_kernel::scan::ScanMetadata = meta_result?;
-        // Pre-extract baseRowId / defaultRowCommitVersion for the SELECTED rows in
-        // this batch. Kernel's `visit_scan_files` walks selected rows in order; we
-        // build a parallel vec indexed by visit order, so the callback can pull each
-        // row's tracking values via a shared counter.
+        // Pre-extract per-row state for the SELECTED rows in this batch. Kernel's
+        // `visit_scan_files` walks selected rows in order; we build parallel vecs
+        // indexed by visit order, so the callback pulls each row's values via a
+        // shared counter.
         acc.row_tracking = extract_row_tracking_for_selected(&meta)?;
+        acc.dv_descriptors = extract_dv_descriptors_for_selected(&meta)?;
         acc.next_idx = 0;
         acc = meta.visit_scan_files(
             acc,
@@ -259,6 +266,11 @@ pub fn plan_delta_scan_with_predicate(
                     .get(acc.next_idx)
                     .copied()
                     .unwrap_or((None, None));
+                let dv_descriptor = acc
+                    .dv_descriptors
+                    .get(acc.next_idx)
+                    .cloned()
+                    .unwrap_or(None);
                 acc.next_idx += 1;
                 acc.entries.push(RawEntry {
                     path: scan_file.path,
@@ -266,7 +278,7 @@ pub fn plan_delta_scan_with_predicate(
                     modification_time: scan_file.modification_time,
                     num_records,
                     partition_values: scan_file.partition_values,
-                    dv_info: scan_file.dv_info,
+                    dv_descriptor,
                     base_row_id,
                     default_row_commit_version,
                 });
@@ -275,36 +287,21 @@ pub fn plan_delta_scan_with_predicate(
     }
     let raw = acc.entries;
 
-    // For each file that has a DV attached, ask kernel to materialize the
-    // deleted row indexes. Kernel handles inline bitmaps, on-disk DV files,
-    // and the various storage-type variants transparently. This runs on the
-    // driver (same process that's building the scan plan), so we only pay
-    // the DV-fetch latency once per query.
-    //
-    // Note: for very large tables (millions of files), this collects all
-    // entries into memory before returning. Consider streaming/chunked
-    // processing if driver OOM becomes an issue at extreme scale.
+    // No more driver-side DV materialisation -- just forward the descriptor. The
+    // executor (`dv_reader::read_dv_indexes` invoked from `DeltaDvFilterExec`)
+    // reads + decodes the RoaringBitmap on-task. Pre-refactor this loop called
+    // `DvInfo::get_row_indexes` and produced a `Vec<u64>` per file, which on the
+    // 99 M-row "huge table delete" DV reached ~800 MB per scan exec (task #218).
+    let _ = &table_root_url; // table_root_url no longer needed for driver-side DV reads
     let mut entries: Vec<DeltaFileEntry> = Vec::with_capacity(raw.len());
     for r in raw {
-        let deleted_row_indexes = if r.dv_info.has_vector() {
-            r.dv_info
-                .get_row_indexes(&*engine, &table_root_url)?
-                .ok_or_else(|| {
-                    DeltaError::Internal(format!(
-                        "DV has_vector() true but get_row_indexes() returned None for {}",
-                        r.path
-                    ))
-                })?
-        } else {
-            Vec::new()
-        };
         entries.push(DeltaFileEntry {
             path: r.path,
             size: r.size,
             modification_time: r.modification_time,
             num_records: r.num_records,
             partition_values: r.partition_values,
-            deleted_row_indexes,
+            dv_descriptor: r.dv_descriptor,
             base_row_id: r.base_row_id,
             default_row_commit_version: r.default_row_commit_version,
         });
@@ -435,6 +432,109 @@ fn extract_row_tracking_for_selected(
         let b = base_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
         let d = default_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
         out.push((b, d));
+    }
+    Ok(out)
+}
+
+/// Per-row DV descriptors extracted from kernel's `scan_metadata.scan_files`
+/// RecordBatch, indexed by SELECTED row position (parallel to row_tracking,
+/// consumed in `visit_scan_files` order).
+///
+/// `None` for rows without a DV (no deletion vector attached to that AddFile).
+///
+/// We extract directly from the RecordBatch instead of via `ScanFile.dv_info`
+/// because kernel 0.19's `DvInfo` only exposes `has_vector()` + `get_row_indexes()`
+/// publicly (the descriptor itself is `pub(crate)`), and `get_row_indexes()`
+/// materialises the full bitmap on the DRIVER -- which was the 1 GB long[]
+/// retention bug we're fixing (task #218). Reading the fields from the kernel
+/// scan_files schema directly lets us ship the descriptor instead of the indices.
+///
+/// Schema reference: `delta_kernel::scan::log_replay::SCAN_ROW_SCHEMA` includes a
+/// `deletionVector` struct column with fields `storageType` (utf8),
+/// `pathOrInlineDv` (utf8), `offset` (int32, nullable), `sizeInBytes` (int32),
+/// `cardinality` (int64). When the AddFile has no DV the whole struct is null.
+fn extract_dv_descriptors_for_selected(
+    meta: &delta_kernel::scan::ScanMetadata,
+) -> DeltaResult<Vec<Option<crate::proto::DeltaDvDescriptor>>> {
+    use delta_kernel::arrow::array::{Array, Int32Array, Int64Array, StringArray, StructArray};
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    let engine_data = meta.scan_files.data();
+    let arrow = match engine_data.any_ref().downcast_ref::<ArrowEngineData>() {
+        Some(a) => a,
+        // Non-Arrow engine (shouldn't happen for our DefaultEngine path); return
+        // empty so downstream sees None per row -- which matches the no-DV case.
+        None => return Ok(Vec::new()),
+    };
+    let batch = arrow.record_batch();
+    let total_rows = batch.num_rows();
+
+    let dv_struct = batch
+        .column_by_name("deletionVector")
+        .and_then(|c| c.as_any().downcast_ref::<StructArray>());
+    let (storage_arr, path_arr, offset_arr, size_arr, card_arr) = match dv_struct {
+        Some(s) => (
+            s.column_by_name("storageType")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>()),
+            s.column_by_name("pathOrInlineDv")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>()),
+            s.column_by_name("offset")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>()),
+            s.column_by_name("sizeInBytes")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>()),
+            s.column_by_name("cardinality")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>()),
+        ),
+        None => (None, None, None, None, None),
+    };
+
+    let sel = meta.scan_files.selection_vector();
+    let bounded_rows = total_rows.min(sel.len());
+    let mut out: Vec<Option<crate::proto::DeltaDvDescriptor>> =
+        Vec::with_capacity(sel.iter().filter(|b| **b).count());
+    for i in 0..bounded_rows {
+        if !sel[i] {
+            continue;
+        }
+        // A row has a DV iff the outer struct is non-null AND storageType is present
+        // and non-null. Kernel materialises the entire struct as null when there's
+        // no DV; the field-level null check is a belt-and-braces for engines that
+        // might emit a non-null struct with null fields.
+        let struct_null = dv_struct.map(|s| s.is_null(i)).unwrap_or(true);
+        if struct_null {
+            out.push(None);
+            continue;
+        }
+        let storage_null = storage_arr.map(|a| a.is_null(i)).unwrap_or(true);
+        if storage_null {
+            out.push(None);
+            continue;
+        }
+        let storage_type = storage_arr.unwrap().value(i).to_string();
+        let path_or_inline_dv = path_arr.map(|a| a.value(i).to_string()).unwrap_or_default();
+        // offset is `optional uint64` on the proto side -- preserve the null/non-null
+        // distinction from the source (Delta inline DVs sometimes lack an offset).
+        let offset = offset_arr.and_then(|a| {
+            if a.is_null(i) {
+                None
+            } else {
+                Some(a.value(i) as u64)
+            }
+        });
+        let size_in_bytes = size_arr.map(|a| a.value(i) as u64).unwrap_or(0);
+        let cardinality = card_arr.map(|a| a.value(i) as u64).unwrap_or(0);
+        out.push(Some(crate::proto::DeltaDvDescriptor {
+            storage_type,
+            path_or_inline_dv,
+            offset,
+            size_in_bytes,
+            cardinality,
+            // inline_bytes is reserved for a future optimisation where the driver
+            // pre-decodes inline DVs (rare + already small). For now the executor
+            // decodes via `path_or_inline_dv` (kernel's
+            // `DeletionVectorDescriptor::read` handles all three storage types
+            // uniformly when reconstructed with the original `path_or_inline_dv`).
+            inline_bytes: Vec::new(),
+        }));
     }
     Ok(out)
 }

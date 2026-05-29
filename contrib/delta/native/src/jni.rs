@@ -168,10 +168,12 @@ pub unsafe extern "system" fn Java_org_apache_comet_contrib_delta_Native_planDel
                         }
                     })
                     .collect(),
-                // Phase 3: the DV is already materialized into a sorted
-                // `Vec<u64>` of deleted row indexes by `plan_delta_scan`
-                // (which calls `DvInfo::get_row_indexes` on the driver).
-                deleted_row_indexes: entry.deleted_row_indexes,
+                // Deletion-vector descriptor (path/offset/size) -- the executor's
+                // `DeltaDvFilterExec` calls `kernel::DeletionVectorDescriptor::read`
+                // to decode the bitmap on-task. The driver-side `plan_delta_scan`
+                // no longer materialises the indexes (task #218 / Iceberg-style
+                // refactor: per-scan-exec heap stays KB-scale regardless of DV size).
+                dv: entry.dv_descriptor,
                 // Row tracking: extracted from each scan-files RecordBatch's
                 // `fileConstantValues.baseRowId` / `defaultRowCommitVersion` columns
                 // in scan.rs (see `extract_row_tracking_for_selected`). Kernel's

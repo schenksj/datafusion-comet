@@ -353,6 +353,12 @@ message DeltaScanCommon {
 message DeltaScan {
   DeltaScanCommon common = 1;
   repeated DeltaScanTask tasks = 2;
+  // Absolute URL of the Delta table root, used by the executor to resolve relative
+  // ("u" storage-type) DV paths via kernel's `absolute_path` -- kernel joins
+  // `_delta_log/deletion_vectors/<uuid>` onto this, so it MUST end with `/` (the
+  // driver normalises before sending). Empty for tables with no DVs (executor
+  // simply never decodes), but populate it whenever known.
+  string table_root = 3;
 }
 
 message DeltaScanTask {
@@ -360,9 +366,13 @@ message DeltaScanTask {
   uint64 file_size = 2;
   optional uint64 record_count = 3;
   repeated DeltaPartitionValue partition_values = 4;
-  // Pre-materialised deleted row indexes (kernel resolves the DV bitmap on the driver).
-  // Empty = no DV on this file.
-  repeated uint64 deleted_row_indexes = 5;
+  // Field 5 (repeated uint64 deleted_row_indexes) removed in the Iceberg-style DV refactor:
+  // the driver used to materialise the FULL deletion-vector bitmap to a Vec<u64> here, which
+  // could reach ~1 GB for a single DV with ~99 M deleted rows (DELETE/MERGE on huge tables).
+  // The executor now resolves the DV itself via the `dv` field below -- matches the contrib's
+  // own Iceberg integration (IcebergScanCommon.delete_files_pool + IcebergFileScanTask.delete_files_idx).
+  reserved 5;
+  reserved "deleted_row_indexes";
   optional int64 base_row_id = 6;
   optional int64 default_row_commit_version = 7;
   // File-splitting byte range. Both unset = read whole file.
@@ -373,6 +383,30 @@ message DeltaScanTask {
   // includes "file_modification_time". Unset = 0 (rare; AddFile usually
   // carries one).
   optional int64 modification_time = 10;
+  // Deletion-vector descriptor for this file (absent = no DV applies). Mirrors
+  // delta_kernel::actions::deletion_vector::DeletionVectorDescriptor. The executor reads
+  // the actual DV bitmap on-task via dv_reader::read_dv_indexes -- the driver only ships
+  // the path/offset/size, so the per-scan-exec heap stays KB-scale regardless of DV size.
+  optional DeltaDvDescriptor dv = 11;
+}
+
+// Mirrors delta_kernel::actions::deletion_vector::DeletionVectorDescriptor. Carries everything
+// an executor needs to read + decode the DV bitmap, without materialising it on the driver.
+message DeltaDvDescriptor {
+  // "u" (UUID-named, relative to <table_root>/_delta_log/deletion_vectors/)
+  // "p" (absolute URI in path_or_inline_dv)
+  // "i" (inline -- bytes carried in inline_bytes)
+  string storage_type = 1;
+  // For "u": Delta-encoded UUID path component. For "p": absolute URI. For "i": empty.
+  string path_or_inline_dv = 2;
+  // Byte offset within the DV file ("u"/"p" only). Absent ≡ 0.
+  optional uint64 offset = 3;
+  // Size in bytes of the serialised RoaringBitmap entry.
+  uint64 size_in_bytes = 4;
+  // Number of deleted rows (descriptor metadata; the executor doesn't need to count).
+  uint64 cardinality = 5;
+  // Inline-DV bytes (storage_type="i" only). Empty for "u"/"p".
+  bytes inline_bytes = 6;
 }
 
 message DeltaPartitionValue {

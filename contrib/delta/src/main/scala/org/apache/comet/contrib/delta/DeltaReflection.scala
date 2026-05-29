@@ -24,6 +24,8 @@ import org.apache.spark.sql.connector.read.{Scan => V2Scan}
 import org.apache.spark.sql.execution.datasources.{FileFormat, HadoopFsRelation}
 import org.apache.spark.sql.types.StructType
 
+import org.apache.comet.serde.OperatorOuterClass
+
 /**
  * Class-name-based probes for Delta Lake plan nodes.
  *
@@ -603,6 +605,126 @@ object DeltaReflection extends Logging {
   }
 
   /**
+   * Convert Delta's `DeletionVectorDescriptor` into the proto `DeltaDvDescriptor` so the
+   * native executor (not the driver) reads the DV bitmap. Pre-#218 the driver called
+   * [[materializeDeletedRowIndexes]] up-front and shipped the full `Vec<u64>` to native --
+   * for a 99 M-row DV that's a ~1 GB `long[]` retained on the driver heap. The descriptor
+   * is KB-scale and the executor decodes via `kernel::DeletionVectorDescriptor::read`,
+   * matching what the Iceberg contrib already does with `IcebergScanCommon.delete_files_pool`.
+   *
+   * Returns `None` when:
+   *   - `dvDescriptor` is null (no DV on this file -- caller skips the field)
+   *   - reflection setup fails (Delta DeletionVectorDescriptor layout drifted)
+   *
+   * Reflection layout (stable since Delta 2.0):
+   * {{{
+   *   case class DeletionVectorDescriptor(
+   *     storageType: String,           // "u" UUID rel, "p" absolute, "i" inline
+   *     pathOrInlineDv: String,
+   *     offset: Option[Int],
+   *     sizeInBytes: Int,
+   *     cardinality: Long,
+   *     maxRowIndex: Option[Long])
+   * }}}
+   */
+  def addFileDvToProto(
+      dvDescriptor: AnyRef,
+      tableRoot: String): Option[OperatorOuterClass.DeltaDvDescriptor] = {
+    if (dvDescriptor == null) return None
+    try {
+      val cls = dvDescriptor.getClass
+      // `storageType` is a String field on the case class -- read it directly.
+      val storageType = cls.getMethod("storageType").invoke(dvDescriptor).asInstanceOf[String]
+      val pathOrInline =
+        cls.getMethod("pathOrInlineDv").invoke(dvDescriptor).asInstanceOf[String]
+      val sizeInBytes = cls.getMethod("sizeInBytes").invoke(dvDescriptor).asInstanceOf[Int]
+      val cardinality = cls.getMethod("cardinality").invoke(dvDescriptor).asInstanceOf[Long]
+      val offsetOpt = cls.getMethod("offset").invoke(dvDescriptor).asInstanceOf[Option[Int]]
+
+      val b = OperatorOuterClass.DeltaDvDescriptor.newBuilder()
+      // For "u" (UUID-relative) storage we PRE-RESOLVE the absolute path via Delta's own
+      // `DeletionVectorDescriptor.absolutePath` (which honours Delta's JVM-static
+      // `DELETION_VECTOR_FILE_NAME_PREFIX` from `DeltaSQLConf.TEST_DV_NAME_PREFIX` --
+      // `"test%dv%prefix-"` under `Utils.isTesting`) and ship as "p" (absolute). Reason:
+      // delta-kernel-rs follows the protocol literally (file name is `deletion_vector_<uuid>.bin`,
+      // any optional prefix is recovered from `pathOrInlineDv.length - 20`), but Delta's test
+      // fixtures bake a NON-protocol filename prefix into the on-disk name that's recoverable
+      // ONLY via the JVM static. Pre-resolving here keeps the executor's kernel read working
+      // against a real URL (no reconstruction) and also future-proofs against any other Delta
+      // path-resolution extensions the JVM side might add.
+      val (finalStorage, finalPath) = storageType match {
+        case "i" =>
+          // Inline DV: bytes carried in pathOrInlineDv as base85; no resolution needed.
+          (storageType, if (pathOrInline == null) "" else pathOrInline)
+        case "u" | "p" if tableRoot != null && tableRoot.nonEmpty =>
+          // For BOTH "u" (UUID-relative) and "p" (absolute) we delegate to Delta's
+          // `DeletionVectorDescriptor.absolutePath` and ship the resolved absolute URL
+          // as storage-type "p". Two reasons:
+          //
+          //  1. For "u" tables, Delta honours its JVM-static
+          //     `DELETION_VECTOR_FILE_NAME_PREFIX` (`DeltaSQLConf.TEST_DV_NAME_PREFIX`,
+          //     `"test%dv%prefix-"` under `Utils.isTesting`). delta-kernel-rs doesn't
+          //     know about that JVM hack and would compute the wrong filename. Doing the
+          //     resolution here means the executor reads a pre-resolved absolute URL.
+          //
+          //  2. For "p" tables, calling `absolutePath` exercises Delta's own
+          //     `new URI(pathOrInlineDv)` parse, which throws `URISyntaxException` for
+          //     malformed inputs (e.g. DeletionVectorsSuite's
+          //     "absolute DV path with not-encoded special characters" test) -- exactly
+          //     the same exception vanilla Delta would throw at read time, so
+          //     `interceptWithUnwrapping[URISyntaxException]` matches. If we left "p"
+          //     paths verbatim the URI parse would fail on the executor and surface as a
+          //     plain `CometNativeException`, breaking the assertion.
+          //
+          // `tableRoot` from the contrib is DOUBLE-URL-encoded (see
+          // `materializeDeletedRowIndexes` lines 641-659 for the full note); the Hadoop FS
+          // path on disk is the SINGLE-decoded form, so we URLDecode once before building
+          // the Path. Without this, tables in dirs like `s p a r k %2a-uuid` (literal
+          // spaces + literal `%2a`) end up double-encoded.
+          val singleEncoded =
+            try {
+              java.net.URLDecoder.decode(
+                tableRoot,
+                java.nio.charset.StandardCharsets.UTF_8.name())
+            } catch {
+              case _: IllegalArgumentException => tableRoot
+            }
+          val tablePath = new org.apache.hadoop.fs.Path(singleEncoded)
+          val abs = dvDescriptor
+            .asInstanceOf[org.apache.spark.sql.delta.actions.DeletionVectorDescriptor]
+            .absolutePath(tablePath)
+          // Use Hadoop's URI form (which Delta itself uses for "p" descriptors via
+          // `copyWithAbsolutePath` -> `SparkPath.fromPath(...).urlEncoded`).
+          ("p", abs.toUri.toString)
+        case _ =>
+          (storageType, if (pathOrInline == null) "" else pathOrInline)
+      }
+      b.setStorageType(finalStorage)
+      b.setPathOrInlineDv(finalPath)
+      // sizeInBytes/cardinality are non-negative by construction; cast widens to u64 wire.
+      b.setSizeInBytes(sizeInBytes.toLong)
+      b.setCardinality(cardinality)
+      offsetOpt.foreach(o => b.setOffset(o.toLong))
+      Some(b.build())
+    } catch {
+      // Only swallow REFLECTION setup failures (Delta version drift -- field rename,
+      // class missing): falling back to a None DV here would silently mis-read rows,
+      // so callers should be aware. Logging keeps that visible.
+      case e: ReflectiveOperationException =>
+        logWarning(
+          s"addFileDvToProto: failed to read DeletionVectorDescriptor via reflection " +
+            s"(class=${dvDescriptor.getClass.getName}): ${e.getMessage}")
+        None
+      // Genuine errors from Delta's own `absolutePath` -- in particular
+      // `URISyntaxException` for malformed "p" descriptors -- MUST propagate up the
+      // driver chain. Vanilla Delta throws the same exception at read time and tests
+      // (e.g. DeletionVectorsSuite "absolute DV path with not-encoded special characters")
+      // `interceptWithUnwrapping[URISyntaxException]` against it. Swallowing here would
+      // turn the failure into a silent wrong-result.
+    }
+  }
+
+  /**
    * Materialize a `DeletionVectorDescriptor` into the list of deleted row indexes (0-based,
    * sorted ascending) using Delta's own `HadoopFileSystemDVStore` + `RoaringBitmapArray.toArray`.
    *
@@ -616,7 +738,12 @@ object DeltaReflection extends Logging {
    * Driver-side only: don't call this on executors, since it touches the filesystem and the DV
    * store may not be initialised. The native side then plumbs the row-index array into the proto
    * task's `deleted_row_indexes` field, which `DeltaDvFilterExec` already consumes.
+   *
+   * @deprecated Superseded by [[addFileDvToProto]] (driver ships descriptor, executor decodes).
+   *             Retained only for tests that exercise the pre-refactor path; remove once the
+   *             pushdown-suite 1 g run is green.
    */
+  @deprecated("Use addFileDvToProto + executor-side decode", "0.18")
   def materializeDeletedRowIndexes(
       dvDescriptor: AnyRef,
       tableRoot: String,

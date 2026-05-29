@@ -246,6 +246,10 @@ case class CometDeltaNativeScanExec(
         case None => group
       }
       val builder = OperatorOuterClass.DeltaScan.newBuilder()
+      // Thread the table root through to the executor; required by the executor-side
+      // DV decoder (kernel `absolute_path` joins `_delta_log/deletion_vectors/...` onto
+      // this) and harmless to set even when no task in this partition has a DV.
+      if (tableRoot != null && tableRoot.nonEmpty) builder.setTableRoot(tableRoot)
       kept.foreach(builder.addTasks)
       builder.build().toByteArray
     }.toArray
@@ -420,7 +424,7 @@ case class CometDeltaNativeScanExec(
       sparkContext.register(totalFiles, "total files")
 
       val dvFiles = new ImmutableSQLMetric("sum")
-      dvFiles.set(taskList.getTasksList.asScala.count(!_.getDeletedRowIndexesList.isEmpty).toLong)
+      dvFiles.set(taskList.getTasksList.asScala.count(_.hasDv).toLong)
       sparkContext.register(dvFiles, "files with deletion vectors")
 
       // `numFiles` alias mirrors Spark's `FileSourceScanExec` metric name so

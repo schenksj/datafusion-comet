@@ -572,51 +572,23 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
                 None
               }
             }.toMap
-            // DV materialization for the pre-materialised-index path (streaming + MERGE).
-            // For AddFiles that carry a DeletionVectorDescriptor, read the DV via Delta's
-            // `HadoopFileSystemDVStore` on the driver and feed the resulting row-index list
-            // through the proto's existing `deleted_row_indexes` field. The native side then
-            // wraps the file group in `DeltaDvFilterExec` (planner.rs ~1460) which already
-            // honours per-file deleted row indexes. If any DV fails to materialise we have
-            // to fall back -- silently dropping a DV is a correctness violation (would
-            // return rows that should have been hidden).
-            val hadoopConf = relation.sparkSession.sessionState
-              .newHadoopConfWithOptions(relation.options)
-            val deletedRowIndexesByPath: Map[String, Array[Long]] = {
-              val builder = scala.collection.mutable.Map.empty[String, Array[Long]]
-              val it = addFiles.iterator
-              var failed = false
-              while (it.hasNext && !failed) {
-                val af = it.next()
-                if (af.hasDeletionVector) {
-                  DeltaReflection.materializeDeletedRowIndexes(
-                    af.dvDescriptor,
-                    tableRoot,
-                    hadoopConf) match {
-                    case Some(arr) => builder.put(af.path, arr)
-                    case None => failed = true
-                  }
-                }
-              }
-              if (failed) {
-                import org.apache.comet.CometSparkSessionExtensions.withInfo
-                withInfo(
-                  scan,
-                  "Native Delta scan: pre-materialised FileIndex with deletion vectors " +
-                    "but failed to materialise one or more DVs (DV file missing, unsupported " +
-                    "Delta version, or read error); falling back to Spark+Delta.")
-                return None
-              }
-              builder.toMap
-            }
+            // DV handling: the driver only ships a DV DESCRIPTOR per AddFile
+            // (storage type / path / offset / size, KB-scale). The executor decodes
+            // via `dv_reader::read_dv_indexes` on first poll. Pre-#218 we called
+            // `materializeDeletedRowIndexes` here and shipped the expanded
+            // `Vec<u64>` -- a single 99M-row DV is a ~1 GB `long[]` retained on the
+            // driver heap until the scan finishes. Matches the Iceberg contrib's
+            // `IcebergScanCommon.delete_files_pool` pattern (driver = references,
+            // executor = decode). If a DV file is missing/corrupt the executor
+            // surfaces a `SparkException` -- same observable behaviour as before,
+            // just at execution rather than planning.
             buildTaskListFromAddFiles(
               tableRoot,
               snapshotVersion,
               addFiles,
               nativeOp = null,
               columnNames,
-              physicalToLogicalPartitionNames = physToLogical,
-              deletedRowIndexesByPath = deletedRowIndexesByPath).toByteArray
+              physicalToLogicalPartitionNames = physToLogical).toByteArray
           case None =>
             // Reflection failed; fall back conservatively.
             import org.apache.comet.CometSparkSessionExtensions.withInfo
@@ -1365,6 +1337,13 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // at execution time, and merged via DeltaPlanDataInjector.
     val deltaScanBuilder = DeltaScan.newBuilder()
     deltaScanBuilder.setCommon(commonBuilder.build())
+    // table_root is also threaded into each per-partition DeltaScan in
+    // CometDeltaNativeScanExec.packTasks; set it here as well so the planning-time
+    // proto carries it for any consumer that reads the parent DeltaScan directly.
+    val plannedTableRoot = taskList.getTableRoot
+    if (plannedTableRoot != null && plannedTableRoot.nonEmpty) {
+      deltaScanBuilder.setTableRoot(plannedTableRoot)
+    }
     // No addAllTasks: tasks stay in taskListBytes for the exec's lazy split.
 
     // Stash the full task-list bytes for createExec to retrieve. The ThreadLocal
@@ -1544,8 +1523,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       addFiles: Seq[DeltaReflection.ExtractedAddFile],
       nativeOp: AnyRef,
       columnNames: Array[String],
-      physicalToLogicalPartitionNames: Map[String, String] = Map.empty,
-      deletedRowIndexesByPath: Map[String, Array[Long]] = Map.empty)
+      physicalToLogicalPartitionNames: Map[String, String] = Map.empty)
       : OperatorOuterClass.DeltaScanTaskList = {
     val tlBuilder = OperatorOuterClass.DeltaScanTaskList.newBuilder()
     tlBuilder.setTableRoot(tableRoot)
@@ -1578,12 +1556,14 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       af.baseRowId.foreach(taskBuilder.setBaseRowId)
       af.defaultRowCommitVersion.foreach(taskBuilder.setDefaultRowCommitVersion)
       af.modificationTime.foreach(taskBuilder.setModificationTime)
-      deletedRowIndexesByPath.get(af.path).foreach { rowIndexes =>
-        var i = 0
-        while (i < rowIndexes.length) {
-          taskBuilder.addDeletedRowIndexes(rowIndexes(i))
-          i += 1
-        }
+      // Ship the DV descriptor (KB-scale) instead of the materialised row-index
+      // list (was up to 1 GB per file -- the #218 dominator). Executor decodes
+      // via dv_reader::read_dv_indexes on first poll of the DV-bearing partition.
+      if (af.hasDeletionVector) {
+        // Pass tableRoot so addFileDvToProto can pre-resolve "u" -> "p" via Delta's
+        // own absolutePath (handles Delta's test-only filename prefix; see helper).
+        DeltaReflection.addFileDvToProto(af.dvDescriptor, tableRoot)
+          .foreach(taskBuilder.setDv)
       }
       tlBuilder.addTasks(taskBuilder.build())
     }

@@ -37,6 +37,12 @@ crate-type = ["rlib"]
 # Typed Delta proto messages live in core's proto crate (alongside IcebergScan, ...)
 # so the dispatcher arm has direct access. We re-export them as `crate::proto::*`.
 datafusion-comet-proto = { path = "../../../native/proto" }
+# `SparkError` enum (JSON-serialised, mapped to specific Throwables by
+# `ShimSparkErrorConverter` on the JVM side -- including `FileNotFound` -> Java's
+# `FileNotFoundException`, which `dv_filter::map_dv_error_to_datafusion` emits when
+# a DV file is missing so `DeletionVectorsSuite "Check no resource leak"` can find
+# the right cause via `findIfResponsible[FileNotFoundException]`).
+datafusion-comet-common = { path = "../../../native/common" }
 # JNI helpers (CometError, CometResult, try_unwrap_or_throw). jni-bridge is a leaf
 # crate -- depending on it doesn't drag any Comet logic into the contrib.
 datafusion-comet-jni-bridge = { path = "../../../native/jni-bridge" }

@@ -182,16 +182,20 @@ impl PhysicalPlanner {
             || common.emit_row_commit_version
             || !common.metadata_column_names.is_empty();
         let mut file_groups: Vec<Vec<PartitionedFile>> = Vec::new();
-        let mut deleted_indexes_per_group: Vec<Vec<u64>> = Vec::new();
+        // Per-group DV descriptor (None = no DV). Lazily decoded on the executor
+        // by DeltaDvFilterExec / DeltaSyntheticColumnsExec via dv_reader::read_dv_indexes
+        // -- this is the per-file/per-group analog of Iceberg's delete_files_idx.
+        let mut dv_descriptors_per_group: Vec<Option<comet_contrib_delta::proto::DeltaDvDescriptor>> =
+            Vec::new();
         let mut base_row_ids_per_group: Vec<Option<i64>> = Vec::new();
         let mut default_commit_versions_per_group: Vec<Option<i64>> = Vec::new();
         let mut task_metadata_per_group: Vec<comet_contrib_delta::synthetic_columns::TaskMetadata> =
             Vec::new();
         let mut non_dv_files: Vec<PartitionedFile> = Vec::new();
         for (file, task) in files.into_iter().zip(scan.tasks.iter()) {
-            if !task.deleted_row_indexes.is_empty() || need_per_file_groups {
+            if task.dv.is_some() || need_per_file_groups {
                 file_groups.push(vec![file]);
-                deleted_indexes_per_group.push(task.deleted_row_indexes.clone());
+                dv_descriptors_per_group.push(task.dv.clone());
                 base_row_ids_per_group.push(task.base_row_id);
                 default_commit_versions_per_group.push(task.default_row_commit_version);
                 task_metadata_per_group.push(
@@ -211,7 +215,7 @@ impl PhysicalPlanner {
         }
         if !non_dv_files.is_empty() {
             file_groups.push(non_dv_files);
-            deleted_indexes_per_group.push(Vec::new());
+            dv_descriptors_per_group.push(None);
             base_row_ids_per_group.push(None);
             default_commit_versions_per_group.push(None);
             task_metadata_per_group
@@ -345,7 +349,27 @@ impl PhysicalPlanner {
         //     to see every row to decide what to do.
         //   - When only DV filtering is needed (no synthetic emission): use
         //     `DeltaDvFilterExec` directly.
-        let has_dv = deleted_indexes_per_group.iter().any(|v| !v.is_empty());
+        let has_dv = dv_descriptors_per_group.iter().any(Option::is_some);
+        // Resolve the table-root URL once (kernel needs trailing slash for DV path joins).
+        // scan.table_root is the authoritative driver-supplied value; fall back to deriving
+        // from the first file's URL only on legacy/empty input to keep older proto payloads
+        // working through a single build cycle. After cutover the fallback can drop.
+        let table_root_for_dv = if has_dv {
+            let raw = if !scan.table_root.is_empty() {
+                scan.table_root.clone()
+            } else {
+                scan.tasks
+                    .first()
+                    .map(|t| t.file_path.clone())
+                    .unwrap_or_default()
+            };
+            Some(
+                comet_contrib_delta::dv_reader::normalize_table_root(&raw)
+                    .map_err(|e| GeneralError(format!("DeltaScan table_root: {e}")))?,
+            )
+        } else {
+            None
+        };
         let after_synthetics: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if need_synthetics
         {
             let row_index_alias = if common.row_index_column_alias.is_empty() {
@@ -353,18 +377,25 @@ impl PhysicalPlanner {
             } else {
                 common.row_index_column_alias.as_str()
             };
-            // Pre-build the DV partition list -- if we'll wrap with DvFilterExec next
-            // we still need a per-partition vector; otherwise pass empty so the
-            // synthetic exec doesn't try to use stale indexes for is_row_deleted.
-            let synthetic_dv_indexes = if common.emit_is_row_deleted {
-                deleted_indexes_per_group.clone()
-            } else {
-                vec![Vec::new(); deleted_indexes_per_group.len()]
-            };
+            // SyntheticColumnsExec only consults the DV when emit_is_row_deleted is on;
+            // otherwise pass `None`s so it never decodes (matches the pre-refactor behaviour
+            // where callers shipped `vec![Vec::new(); n]` for the synthetic-only path).
+            let synthetic_dvs: Vec<Option<comet_contrib_delta::proto::DeltaDvDescriptor>> =
+                if common.emit_is_row_deleted {
+                    dv_descriptors_per_group.clone()
+                } else {
+                    vec![None; dv_descriptors_per_group.len()]
+                };
+            // table_root for synthetics: only meaningful when emit_is_row_deleted; use the
+            // resolved one if we computed it, else a placeholder (never consulted).
+            let synth_root = table_root_for_dv
+                .clone()
+                .unwrap_or_else(|| url::Url::parse("file:///").expect("static URL"));
             let synth: Arc<dyn datafusion::physical_plan::ExecutionPlan> = Arc::new(
                 comet_contrib_delta::synthetic_columns::DeltaSyntheticColumnsExec::new(
                     after_rename,
-                    synthetic_dv_indexes,
+                    synthetic_dvs,
+                    synth_root,
                     base_row_ids_per_group,
                     default_commit_versions_per_group,
                     common.emit_row_index,
@@ -380,16 +411,20 @@ impl PhysicalPlanner {
             // Apply DV filter on top of synthetic emission, EXCEPT when the upstream
             // is consuming is_row_deleted -- then it needs every row.
             if has_dv && !common.emit_is_row_deleted {
+                let root = table_root_for_dv
+                    .clone()
+                    .expect("table_root_for_dv set when has_dv");
                 Arc::new(
-                    DeltaDvFilterExec::new(synth, deleted_indexes_per_group)
+                    DeltaDvFilterExec::new(synth, dv_descriptors_per_group, root)
                         .map_err(|e| GeneralError(format!("DeltaDvFilterExec: {e}")))?,
                 )
             } else {
                 synth
             }
         } else if has_dv {
+            let root = table_root_for_dv.expect("table_root_for_dv set when has_dv");
             Arc::new(
-                DeltaDvFilterExec::new(after_rename, deleted_indexes_per_group)
+                DeltaDvFilterExec::new(after_rename, dv_descriptors_per_group, root)
                     .map_err(|e| GeneralError(format!("DeltaDvFilterExec: {e}")))?,
             )
         } else {
