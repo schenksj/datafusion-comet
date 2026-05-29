@@ -302,6 +302,32 @@ index cf9c9b4..cc91cd0 100644
      // verify DeltaErrors.errorsWithDocsLinks is consistent with DeltaErrorsSuite
      assert(errorsToTest.keySet ++ otherMessagesToTest.keySet ==
        DeltaErrors.errorsWithDocsLinks.toSet
+diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/IdentityColumnAdmissionSuite.scala b/spark/src/test/scala/org/apache/spark/sql/delta/IdentityColumnAdmissionSuite.scala
+index 0000000..1111111 100644
+--- a/spark/src/test/scala/org/apache/spark/sql/delta/IdentityColumnAdmissionSuite.scala
++++ b/spark/src/test/scala/org/apache/spark/sql/delta/IdentityColumnAdmissionSuite.scala
+@@ -270,7 +270,13 @@ trait IdentityColumnAdmissionSuiteBase
+       val path = DeltaLog.forTable(spark, TableIdentifier(tblName)).dataPath.toString
+       withTempDir { checkpointDir =>
+         val ex = intercept[StreamingQueryException] {
++          // Comet regression (contrib/delta/dev/diffs/3.3.2.diff): pre-populate the
++          // MemoryStream BEFORE start() because the original `stream.addData(...)`-after-
++          // `start()` ordering races `Trigger.AvailableNow`, which processes only data
++          // present at trigger time and exits before late data arrives -- the expected
++          // StreamingQueryException is then never thrown. Upstream Delta test bug; file.
+           val stream = MemoryStream[Int]
++          stream.addData(1 to 10)
+           val q = stream
+             .toDF
+             .map(_ => Tuple2(1L, 1))
+@@ -281,7 +287,6 @@ trait IdentityColumnAdmissionSuiteBase
+             .option("checkpointLocation", checkpointDir.getCanonicalPath)
+             .trigger(Trigger.AvailableNow)
+             .start(path)
+-          stream.addData(1 to 10)
+           q.processAllAvailable()
+           q.stop()
+         }
 diff --git a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSinkSuite.scala b/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSinkSuite.scala
 index 0a2826c..d5e4100 100644
 --- a/spark/src/test/scala/org/apache/spark/sql/delta/DeltaSinkSuite.scala
