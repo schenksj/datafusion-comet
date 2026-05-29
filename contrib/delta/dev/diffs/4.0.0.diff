@@ -1,5 +1,5 @@
 diff --git a/build.sbt b/build.sbt
-index e89a99c..093aa66 100644
+index e89a99c..9cf8341 100644
 --- a/build.sbt
 +++ b/build.sbt
 @@ -54,6 +54,9 @@ Global / default_scala_version := scala213
@@ -49,6 +49,29 @@ index e89a99c..093aa66 100644
      ),
  
      // Required for testing table features see https://github.com/delta-io/delta/issues/1602
+@@ -482,9 +506,19 @@ lazy val spark = (project in file("spark"))
+     },
+     TestParallelization.settings,
+     // Java-/Scala-/Uni-Doc Settings
+-    scalacOptions ++= Seq(
+-      "-P:genjavadoc:strictVisibility=true" // hide package private types and methods in javadoc
+-    ),
++    // Comet regression testing (added by dev/diffs/delta/4.0.0.diff): removed the
++    // unconditional `-P:genjavadoc:strictVisibility=true` scalacOption. In vanilla
++    // Delta 4.0 it's set on `spark/scalacOptions` regardless of whether the
++    // `genjavadoc-plugin` compilerPlugin is on the classpath, and on our regression
++    // environment (Scala 2.13.13 + genjavadoc-plugin 0.18 + JDK 17) the plugin fails
++    // to register, causing scalac to reject the unknown `-P:genjavadoc:...` option
++    // with `bad option: -P:genjavadoc:strictVisibility=true` (one-line compile
++    // failure -- whole build aborts before any test runs). 4.1 doesn't have this
++    // because Unidoc.scala there inlines the option ONLY when the plugin loads
++    // (genjavadoc-plugin bumped from 0.18 to 0.19). The option is purely a
++    // javadoc-visibility tweak; the regression doesn't generate javadoc, so
++    // removing it has no effect on what we test.
++    scalacOptions ++= Seq.empty[String],
+     unidocSourceFilePatterns := Seq(SourceFilePattern("io/delta/tables/", "io/delta/exceptions/"))
+   ).configureUnidoc(
+   generatedJavaDoc = true,
 diff --git a/build/sbt-config/repositories b/build/sbt-config/repositories
 index 22987ef..600374c 100644
 --- a/build/sbt-config/repositories
