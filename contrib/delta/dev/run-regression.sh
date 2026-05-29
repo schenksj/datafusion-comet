@@ -148,7 +148,12 @@ echo "  Published: $(ls -1 "$COMET_PUBLISH_DIR/org/apache/datafusion/" | wc -l |
 # so Delta's `target/` (and SBT's zinc cache inside it) is preserved.
 echo
 echo "[2/4] Cloning Delta $DELTA_VERSION..."
-if [[ -d "$DELTA_WORKDIR/.git" ]]; then
+# Robust reuse check: `[[ -d $WORKDIR/.git ]]` passes for an orphaned/empty .git/
+# directory (seen in practice when a prior run was force-killed mid-checkout); the
+# subsequent `git fetch` then dies with `not a git repository`. Use `git rev-parse
+# --git-dir` to confirm the workdir is a usable repo before reusing it.
+if [[ -d "$DELTA_WORKDIR" ]] \
+   && git -C "$DELTA_WORKDIR" rev-parse --git-dir >/dev/null 2>&1; then
   echo "  Reusing existing checkout at $DELTA_WORKDIR"
   cd "$DELTA_WORKDIR"
   git fetch --depth 1 origin "refs/tags/v$DELTA_VERSION:refs/tags/v$DELTA_VERSION" 2>/dev/null || true
@@ -156,6 +161,9 @@ if [[ -d "$DELTA_WORKDIR/.git" ]]; then
   git clean -fd
   rm -rf spark/spark-warehouse
 else
+  if [[ -e "$DELTA_WORKDIR" ]]; then
+    echo "  Existing $DELTA_WORKDIR is not a valid git repo; removing and re-cloning."
+  fi
   rm -rf "$DELTA_WORKDIR"
   git clone --depth 1 --branch "v$DELTA_VERSION" https://github.com/delta-io/delta.git "$DELTA_WORKDIR"
   cd "$DELTA_WORKDIR"
