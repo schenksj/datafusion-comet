@@ -208,17 +208,32 @@ if [[ -n "${NUM_SHARDS:-}" && "${NUM_SHARDS}" -gt 1 ]]; then
   echo "  Sharding      : shard ${SHARD_ID} of ${NUM_SHARDS}, ${TEST_PARALLELISM_COUNT} fork(s)/shard"
 fi
 
+# Capture the SBT test phase into a timestamped log under the Comet repo, mirroring
+# `run-test.sh`'s approach. Lets the user / background-task watchers tail progress in
+# real time (the prior behaviour piped only to stdout, so any caller wrapping this in
+# `... | tail` saw nothing until the run finished -- minutes to hours later for the
+# full sweep). The Delta version and shard id (when sharded) go in the filename so
+# parallel CI shards don't clobber one another.
+LOG_DIR="$COMET_ROOT/target/delta-regression-logs"
+mkdir -p "$LOG_DIR"
+LOG_SUFFIX=""
+if [[ -n "${SHARD_ID:-}" && -n "${NUM_SHARDS:-}" ]]; then
+  LOG_SUFFIX="-shard${SHARD_ID}of${NUM_SHARDS}"
+fi
+LOG="$LOG_DIR/regression-${DELTA_VERSION}-${TEST_FILTER}${LOG_SUFFIX}-$(date +%Y%m%d-%H%M%S).log"
+echo "==> logging to $LOG"
+
 case "$TEST_FILTER" in
   smoke)
-    build/sbt "$SBT_MODULE/testOnly org.apache.spark.sql.delta.CometSmokeTest"
+    build/sbt "$SBT_MODULE/testOnly org.apache.spark.sql.delta.CometSmokeTest" 2>&1 | tee "$LOG"
     ;;
   full)
-    build/sbt "$SBT_MODULE/test"
+    build/sbt "$SBT_MODULE/test" 2>&1 | tee "$LOG"
     ;;
   *)
-    build/sbt "$SBT_MODULE/testOnly $TEST_FILTER"
+    build/sbt "$SBT_MODULE/testOnly $TEST_FILTER" 2>&1 | tee "$LOG"
     ;;
 esac
 
 echo
-echo "Done."
+echo "Done. Log: $LOG"
