@@ -21,7 +21,7 @@ index 280efcc..a7e39c9 100644
      ),
      Compile / packageBin / mappings := (Compile / packageBin / mappings).value ++
          listPythonFiles(baseDirectory.value.getParentFile / "python"),
-@@ -459,9 +464,55 @@ lazy val spark = (project in file("spark"))
+@@ -459,9 +464,75 @@ lazy val spark = (project in file("spark"))
        "-Ddelta.log.cacheSize=3",
        "-Dspark.databricks.delta.delta.log.cacheSize=3",
        "-Dspark.sql.sources.parallelPartitionDiscovery.parallelism=5",
@@ -70,9 +70,29 @@ index 280efcc..a7e39c9 100644
 +    // resolution in the SCAN, exercised by the FOCUSED `DeltaColumnMappingSuite` (kept) and the
 +    // contrib's own `CometDeltaColumnMappingSuite`; the per-feature clones add ~no Comet coverage.
 +    // Exclude the clones to mirror 4.1's matrix. (Coverage-reducing; remove to run the full sweep.)
++    //
++    // LITE MODE (`DELTA_LITE=1` env var, surfaced as `run-regression.sh 3.3.2 lite`):
++    // also drop the other Delta-3.3.2-only clone families that 4.1 dropped --
++    // `*WithCoordinatedCommitsBatch{1,2,100}Suite` (20 suites), `*RowTracking*Suite`
++    // (45 suites), `*WithDeletionVectors*Suite` (6 suites) -- which together with the
++    // 70 column-mapping clones above account for the bulk of 3.3.2's per-suite cost.
++    // Total reduction: ~141/385 base suites suppressed -> regression runtime drops
++    // from ~29h to a few hours, matching 4.0/4.1's shape. Each excluded clone re-runs
++    // its base suite's tests under one Delta TABLE FEATURE flag; Comet has no
++    // table-feature-specific code path, so the lost coverage is the *interaction*
++    // between feature-flag and base behaviour -- exercised in 4.0/4.1 by their
++    // (smaller, but present) clone matrices. Use `full` for the comprehensive sweep.
 +    Test / testOptions += Tests.Filter { name =>
 +      val simple = name.substring(name.lastIndexOf('.') + 1)
-+      !(simple.endsWith("IdColumnMappingSuite") || simple.endsWith("NameColumnMappingSuite"))
++      val isColumnMappingClone =
++        simple.endsWith("IdColumnMappingSuite") || simple.endsWith("NameColumnMappingSuite")
++      val liteMode = sys.env.contains("DELTA_LITE")
++      val isExtraClone = liteMode && (
++        simple.contains("WithCoordinatedCommitsBatch") ||
++        simple.contains("RowTracking") ||
++        simple.contains("WithDeletionVectors")
++      )
++      !(isColumnMappingClone || isExtraClone)
 +    },
 +
      // Required for testing table features see https://github.com/delta-io/delta/issues/1602

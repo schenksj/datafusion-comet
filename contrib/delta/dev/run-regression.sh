@@ -33,6 +33,10 @@
 #   dev/run-delta-regression.sh                             # smoke on default (4.1.0)
 #   dev/run-delta-regression.sh 4.1.0                       # smoke on Delta 4.1.0
 #   dev/run-delta-regression.sh 4.1.0 full                  # full Delta test suite
+#   dev/run-delta-regression.sh 3.3.2 lite                  # 3.3.2 minus the Delta-only
+#                                                           # clone families (~few hours
+#                                                           # vs ~29h `full`) -- see
+#                                                           # 3.3.2.diff comment
 #   dev/run-delta-regression.sh 4.1.0 DeltaTimeTravelSuite  # one specific test class
 #   DELTA_WORKDIR=/tmp/my-delta dev/run-delta-regression.sh # reuse a checkout
 
@@ -228,6 +232,17 @@ case "$TEST_FILTER" in
     build/sbt "$SBT_MODULE/testOnly org.apache.spark.sql.delta.CometSmokeTest" 2>&1 | tee "$LOG"
     ;;
   full)
+    build/sbt "$SBT_MODULE/test" 2>&1 | tee "$LOG"
+    ;;
+  lite)
+    # `lite` is `full` minus Delta-3.3.2-only clone families (Id/Name column-mapping,
+    # WithCoordinatedCommits, RowTracking, WithDeletionVectors -- ~141 of 385 base
+    # suites) that 4.1 dropped upstream. Maps to ~few hours instead of ~29h while still
+    # covering every BASE suite. The DELTA_LITE env var is consumed by the
+    # `Test/testOptions += Tests.Filter` block the 3.3.2 diff adds to `build.sbt`; the
+    # column-mapping subset is excluded unconditionally (see diff comment) and the rest
+    # only when DELTA_LITE is set. No-op on 4.0/4.1 (their diffs don't add the filter).
+    export DELTA_LITE=1
     build/sbt "$SBT_MODULE/test" 2>&1 | tee "$LOG"
     ;;
   *)
