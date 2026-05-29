@@ -173,39 +173,29 @@ jobs:
     strategy:
       matrix:
         include:
-          # Delta 3.3.2 is the slow target (~29h single-fork: it clones nearly every base
-          # suite into Id/Name column-mapping + CoordinatedCommits/RowTracking variants, which
-          # Delta 4.1 dropped upstream). Shard it 4x with 2 forks/shard via Delta's
-          # project/TestParallelization.scala (NUM_SHARDS x TEST_PARALLELISM_COUNT = 8-way
-          # split, balanced by its built-in slow-suite duration table) -> ~3-4h/runner.
+          # Delta 3.3.2 runs in `lite` mode -- `full` would be ~29h single-fork because it
+          # clones nearly every base suite into per-feature variants (~70 Id/Name column-
+          # mapping, ~20 WithCoordinatedCommits, ~45 RowTracking, ~6 WithDeletionVectors)
+          # that 4.1 dropped upstream. Lite skips those clone families and runs only base
+          # suites -- ~few hours, matching 4.0/4.1's shape. Column-mapping clones are
+          # always excluded (build.sbt patch in 3.3.2.diff); DELTA_LITE=1 (set by
+          # run-regression.sh when TEST_FILTER=lite) drops the other three clone families.
+          # Lost coverage is *only* the feature-flag × base interaction; the same code
+          # paths are covered by base suites here AND by 4.0/4.1 (smaller clone matrices
+          # still present). Switch to `full` (and re-add the sharding env vars below) if
+          # comprehensive 3.3.2 coverage is ever needed before a release.
           - delta-version: '3.3.2'
             spark-short: '3.5'
-            num-shards: 4
-            shard-id: 0
-            test-parallelism: 2
-          - delta-version: '3.3.2'
-            spark-short: '3.5'
-            num-shards: 4
-            shard-id: 1
-            test-parallelism: 2
-          - delta-version: '3.3.2'
-            spark-short: '3.5'
-            num-shards: 4
-            shard-id: 2
-            test-parallelism: 2
-          - delta-version: '3.3.2'
-            spark-short: '3.5'
-            num-shards: 4
-            shard-id: 3
-            test-parallelism: 2
-          # 4.0.0 / 4.1.0 run in a few hours single-fork; no sharding (num-shards unset ->
-          # run-regression.sh leaves TestParallelization off).
+            test-filter: 'lite'
+          # 4.0.0 / 4.1.0 run in a few hours single-fork; full sweep.
           - delta-version: '4.0.0'
             spark-short: '4.0'
+            test-filter: 'full'
           - delta-version: '4.1.0'
             spark-short: '4.1'
+            test-filter: 'full'
       fail-fast: false
-    name: full/delta-${{ matrix.delta-version }}${{ matrix.shard-id != null && format('/shard{0}', matrix.shard-id) || '' }}
+    name: ${{ matrix.test-filter }}/delta-${{ matrix.delta-version }}
     runs-on: ubuntu-24.04
     container:
       image: amd64/rust
@@ -226,20 +216,15 @@ jobs:
           name: native-lib-delta-regression
           path: native/target/release/
 
-      - name: Run Delta full suite with Comet
+      - name: Run Delta ${{ matrix.test-filter }} suite with Comet
         timeout-minutes: 240
-        env:
-          # Empty for the 4.0/4.1 matrix entries -> run-regression.sh leaves sharding off.
-          NUM_SHARDS: ${{ matrix.num-shards }}
-          SHARD_ID: ${{ matrix.shard-id }}
-          TEST_PARALLELISM_COUNT: ${{ matrix.test-parallelism }}
         run: |
-          FAST=1 bash contrib/delta/dev/run-regression.sh ${{ matrix.delta-version }} full
+          FAST=1 bash contrib/delta/dev/run-regression.sh ${{ matrix.delta-version }} ${{ matrix.test-filter }}
 
       - name: Upload regression log on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: full-log-delta-${{ matrix.delta-version }}-shard${{ matrix.shard-id || 'x' }}
+          name: ${{ matrix.test-filter }}-log-delta-${{ matrix.delta-version }}
           path: target/delta-regression-logs/
           retention-days: 5
