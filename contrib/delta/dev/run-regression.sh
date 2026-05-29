@@ -190,6 +190,24 @@ fi
 pkill -f 'GradleDaemon' 2>/dev/null || true
 rm -rf ~/.gradle/caches/7.5.1/scripts ~/.gradle/caches/7.6.3/scripts 2>/dev/null || true
 
+# Optional test sharding for the `full` sweep. Delta ships project/TestParallelization.scala,
+# which splits Test/testGrouping into parallel forked JVMs and selects this run's shard --
+# but only when NUM_SHARDS>1, SHARD_ID>=0, and TEST_PARALLELISM_COUNT>1 are ALL set (env).
+# Set NUM_SHARDS>1 to split the ~29h Delta-3.3.2 sweep across parallel invocations (one per
+# CI runner: matrix SHARD_ID=0..NUM_SHARDS-1); each invocation runs its slice in
+# TEST_PARALLELISM_COUNT forks. Default the companions so `NUM_SHARDS=N` alone is enough.
+#
+# MEMORY: every fork gets the full Test/javaOptions -Xmx (4g) AND spark.memory.offHeap.size
+# (10g). Keep TEST_PARALLELISM_COUNT low (1-2) on memory-constrained hosts -- the DV / 2B-row
+# huge-table suites need ~4g heap + offheap PER fork, so over-parallelizing OOMs the box.
+# Default (NUM_SHARDS unset) = single sequential fork, unchanged.
+if [[ -n "${NUM_SHARDS:-}" && "${NUM_SHARDS}" -gt 1 ]]; then
+  export NUM_SHARDS
+  export SHARD_ID="${SHARD_ID:-0}"
+  export TEST_PARALLELISM_COUNT="${TEST_PARALLELISM_COUNT:-2}"
+  echo "  Sharding      : shard ${SHARD_ID} of ${NUM_SHARDS}, ${TEST_PARALLELISM_COUNT} fork(s)/shard"
+fi
+
 case "$TEST_FILTER" in
   smoke)
     build/sbt "$SBT_MODULE/testOnly org.apache.spark.sql.delta.CometSmokeTest"

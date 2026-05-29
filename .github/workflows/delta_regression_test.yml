@@ -173,14 +173,39 @@ jobs:
     strategy:
       matrix:
         include:
+          # Delta 3.3.2 is the slow target (~29h single-fork: it clones nearly every base
+          # suite into Id/Name column-mapping + CoordinatedCommits/RowTracking variants, which
+          # Delta 4.1 dropped upstream). Shard it 4x with 2 forks/shard via Delta's
+          # project/TestParallelization.scala (NUM_SHARDS x TEST_PARALLELISM_COUNT = 8-way
+          # split, balanced by its built-in slow-suite duration table) -> ~3-4h/runner.
           - delta-version: '3.3.2'
             spark-short: '3.5'
+            num-shards: 4
+            shard-id: 0
+            test-parallelism: 2
+          - delta-version: '3.3.2'
+            spark-short: '3.5'
+            num-shards: 4
+            shard-id: 1
+            test-parallelism: 2
+          - delta-version: '3.3.2'
+            spark-short: '3.5'
+            num-shards: 4
+            shard-id: 2
+            test-parallelism: 2
+          - delta-version: '3.3.2'
+            spark-short: '3.5'
+            num-shards: 4
+            shard-id: 3
+            test-parallelism: 2
+          # 4.0.0 / 4.1.0 run in a few hours single-fork; no sharding (num-shards unset ->
+          # run-regression.sh leaves TestParallelization off).
           - delta-version: '4.0.0'
             spark-short: '4.0'
           - delta-version: '4.1.0'
             spark-short: '4.1'
       fail-fast: false
-    name: full/delta-${{ matrix.delta-version }}
+    name: full/delta-${{ matrix.delta-version }}${{ matrix.shard-id != null && format('/shard{0}', matrix.shard-id) || '' }}
     runs-on: ubuntu-24.04
     container:
       image: amd64/rust
@@ -203,6 +228,11 @@ jobs:
 
       - name: Run Delta full suite with Comet
         timeout-minutes: 240
+        env:
+          # Empty for the 4.0/4.1 matrix entries -> run-regression.sh leaves sharding off.
+          NUM_SHARDS: ${{ matrix.num-shards }}
+          SHARD_ID: ${{ matrix.shard-id }}
+          TEST_PARALLELISM_COUNT: ${{ matrix.test-parallelism }}
         run: |
           FAST=1 bash contrib/delta/dev/run-regression.sh ${{ matrix.delta-version }} full
 
@@ -210,6 +240,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: full-log-delta-${{ matrix.delta-version }}
+          name: full-log-delta-${{ matrix.delta-version }}-shard${{ matrix.shard-id || 'x' }}
           path: target/delta-regression-logs/
           retention-days: 5
