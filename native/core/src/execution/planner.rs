@@ -21,18 +21,14 @@ pub mod expression_registry;
 pub mod macros;
 pub mod operator_registry;
 
-// The DeltaScan dispatcher body lives PHYSICALLY under `contrib/delta/native/src/`
-// (next to the rest of the Delta integration) but is compiled HERE as part of the
-// core crate because it implements `PhysicalPlanner::plan_delta_scan` and uses
-// core's `pub(crate)` helpers (`create_expr`, `init_datasource_exec`,
-// `prepare_object_store_with_configs`). Rust forbids a true cross-crate `impl`
-// block, and cargo forbids a contrib→core dep (cycle with core's optional dep on
-// contrib), so `#[path]` is what lets the file's HOME be with Delta while its
-// COMPILATION unit stays in core. Build gate (`cfg(feature = "contrib-delta")`)
-// is preserved -- default builds carry zero Delta surface.
+// Glue that wires the optional Delta integration into core's plan-tree builder.
+// Compiled only under `--features contrib-delta`; default builds carry zero Delta
+// surface. The bulk of the Delta logic lives in the `comet-contrib-delta` crate --
+// this module is just the bridge that reaches into core's `pub(crate)` planner
+// helpers (`create_expr`, `init_datasource_exec`, `prepare_object_store_with_configs`)
+// and calls into that crate.
 #[cfg(feature = "contrib-delta")]
-#[path = "../../../../contrib/delta/native/src/core_glue.rs"]
-mod contrib_delta_scan;
+mod delta_scan;
 
 use crate::execution::operators::init_csv_datasource_exec;
 use crate::execution::operators::IcebergScanExec;
@@ -1389,10 +1385,6 @@ impl PhysicalPlanner {
                     common.encryption_enabled,
                     common.use_field_id,
                     common.ignore_missing_field_id,
-                    // ignore_missing_files: not exposed through the native_datafusion
-                    // scan proto today. Contribs (e.g. Delta) wire this through directly
-                    // when they call init_datasource_exec.
-                    false,
                 )?;
                 Ok((
                     vec![],
@@ -1527,7 +1519,7 @@ impl PhysicalPlanner {
                 }
                 #[cfg(feature = "contrib-delta")]
                 {
-                    self.plan_delta_scan(spark_plan, scan)
+                    delta_scan::plan_delta_scan(self, spark_plan, scan)
                 }
             }
             OpStruct::ShuffleWriter(writer) => {
@@ -3113,7 +3105,7 @@ pub fn from_protobuf_eval_mode(value: i32) -> Result<EvalMode, prost::UnknownEnu
     }
 }
 
-fn convert_spark_types_to_arrow_schema(
+pub(crate) fn convert_spark_types_to_arrow_schema(
     spark_types: &[spark_operator::SparkStructField],
 ) -> SchemaRef {
     let arrow_fields = spark_types

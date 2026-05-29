@@ -118,12 +118,12 @@ impl FileOpener for IgnoreMissingFileOpener {
 /// FileSource decorator that wraps the inner source's `FileOpener` in
 /// `IgnoreMissingFileOpener`. All other methods delegate verbatim.
 #[derive(Clone)]
-pub(crate) struct IgnoreMissingFileSource {
+pub struct IgnoreMissingFileSource {
     inner: Arc<dyn FileSource>,
 }
 
 impl IgnoreMissingFileSource {
-    pub(crate) fn new(inner: Arc<dyn FileSource>) -> Arc<dyn FileSource> {
+    pub fn new(inner: Arc<dyn FileSource>) -> Arc<dyn FileSource> {
         Arc::new(Self { inner })
     }
 }

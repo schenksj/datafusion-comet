@@ -17,7 +17,6 @@
 
 use crate::execution::operators::ExecutionError;
 use crate::parquet::encryption_support::{CometEncryptionConfig, ENCRYPTION_FACTORY_ID};
-use crate::parquet::missing_file_tolerant::IgnoreMissingFileSource;
 use crate::parquet::parquet_read_cached_factory::CachingParquetReaderFactory;
 use crate::parquet::parquet_support::SparkParquetOptions;
 use crate::parquet::schema_adapter::SparkPhysicalExprAdapterFactory;
@@ -75,10 +74,6 @@ pub(crate) fn init_datasource_exec(
     encryption_enabled: bool,
     use_field_id: bool,
     ignore_missing_field_id: bool,
-    // When true, files that fail to open with NotFound errors are silently skipped
-    // (matches Spark's `spark.sql.files.ignoreMissingFiles=true`). Wired through to
-    // a `FileSource` decorator that swallows the error as an empty stream.
-    ignore_missing_files: bool,
 ) -> Result<Arc<DataSourceExec>, ExecutionError> {
     let (table_parquet_options, mut spark_parquet_options) = get_options(
         session_timezone,
@@ -171,15 +166,6 @@ pub(crate) fn init_datasource_exec(
                 .unwrap_or_else(|| Arc::new(parquet_source))
         }
         _ => Arc::new(parquet_source),
-    };
-
-    // Honour Spark's `ignoreMissingFiles` by wrapping the final FileSource so its
-    // FileOpener swallows object-store NotFound errors as empty streams. Wrapped
-    // after pushdown to preserve all optimizer behaviour.
-    let file_source: Arc<dyn FileSource> = if ignore_missing_files {
-        IgnoreMissingFileSource::new(file_source)
-    } else {
-        file_source
     };
 
     let expr_adapter_factory: Arc<dyn PhysicalExprAdapterFactory> = Arc::new(

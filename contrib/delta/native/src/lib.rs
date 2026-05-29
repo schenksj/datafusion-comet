@@ -38,6 +38,7 @@ pub mod dv_reader;
 pub mod engine;
 pub mod error;
 pub mod jni;
+pub mod missing_file_tolerant;
 pub mod planner;
 pub mod predicate;
 pub mod scan;
@@ -56,5 +57,6 @@ pub mod proto {
 
 pub use dv_filter::DeltaDvFilterExec;
 pub use engine::{create_engine, DeltaStorageConfig};
+pub use missing_file_tolerant::IgnoreMissingFileSource;
 pub use error::{DeltaError, DeltaResult};
 pub use scan::{list_delta_files, plan_delta_scan, DeltaFileEntry, DeltaScanPlan};

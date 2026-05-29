@@ -1716,6 +1716,7 @@ dependencies = [
  "datafusion-comet-common",
  "datafusion-comet-jni-bridge",
  "datafusion-comet-proto",
+ "datafusion-datasource",
  "delta_kernel",
  "futures",
  "jni 0.22.4",
