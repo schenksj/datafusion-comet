@@ -124,12 +124,15 @@ case class CometScanRule(session: SparkSession)
       case scan if !CometConf.COMET_NATIVE_SCAN_ENABLED.get(conf) =>
         withFallbackReason(scan, "Comet Scan is not enabled")
 
-      case scan if hasMetadataCol(scan) =>
-        withFallbackReason(scan, "Metadata column is not supported")
-
-      // data source V1
+      // V1 scans go through `transformV1Scan` which itself first delegates to any
+      // available V1 contrib (today: Delta) and only then applies generic Comet
+      // bailouts like the metadata-column rejection. This keeps the metadata-col
+      // guard in place for V2 and non-contrib V1 paths without referencing any
+      // specific contrib class from this outer match.
       case scanExec: FileSourceScanExec =>
         transformV1Scan(fullPlan, scanExec)
+      case scan if hasMetadataCol(scan) =>
+        withFallbackReason(scan, "Metadata column is not supported")
 
       // data source V2
       case scanExec: BatchScanExec =>
@@ -162,8 +165,63 @@ case class CometScanRule(session: SparkSession)
 
     scanExec.relation match {
       case r: HadoopFsRelation =>
+        // Try the optional Delta contrib first. When this build wasn't compiled with
+        // `-Pcontrib-delta`, the bridge returns None and we fall through to the
+        // vanilla scan path. When the Delta classes are on the classpath, the contrib
+        // either claims the scan (returning a CometScanExec marker) or declines via
+        // its own `withFallbackReason` fallback message.
+        DeltaIntegration.transformV1IfDelta(plan, session, scanExec, r) match {
+          case Some(handled) => return handled
+          case None => // proceed with vanilla logic
+        }
+        // Metadata-col bailout moved here so V1 contribs (Delta) get first crack
+        // at scans with synthetic metadata columns before generic Comet rejects
+        // them. For non-contrib V1 scans this is equivalent to the outer check.
+        if (scanExec.expressions.exists(_.exists {
+            case a: Attribute => a.isMetadataCol
+            case _ => false
+          })) {
+          return withFallbackReason(scanExec, "Metadata column is not supported")
+        }
         if (!CometScanExec.isFileFormatSupported(r.fileFormat)) {
           return withFallbackReason(scanExec, s"Unsupported file format ${r.fileFormat}")
+        }
+        // Comet's native readers go through object_store, which only understands a fixed set
+        // of URL schemes. A custom Hadoop FileSystem (e.g. a test FakeFileSystem registered via
+        // spark.hadoop.fs.<scheme>.impl) would surface at execution time as
+        // `Generic URL error: Unable to recognise URL "..."`. Decline here so Spark's reader --
+        // which goes through the Hadoop FS API and can resolve custom schemes -- handles the
+        // scan. Whether object_store recognizes a scheme is answered by the native layer itself
+        // (`NativeBase.isObjectStoreSchemeSupported`) rather than a hardcoded list, so the
+        // planner can't drift from object_store's actual support.
+        //
+        // EXCEPT schemes the user routes through libhdfs via
+        // `spark.hadoop.fs.comet.libhdfs.schemes` (e.g. `hdfs`, or a test `fake`): those
+        // ARE natively readable through the libhdfs object_store bridge, so they must NOT
+        // be declined here (regression guarded by ParquetReadFromFakeHadoopFsSuite).
+        val libhdfsSchemes: Set[String] = CometConf.COMET_LIBHDFS_SCHEMES.get() match {
+          case Some(s) =>
+            s.split(",")
+              .map(_.trim.toLowerCase(java.util.Locale.ROOT))
+              .filter(_.nonEmpty)
+              .toSet
+          case None => Set.empty
+        }
+        val unsupportedFsSchemes = r.location.rootPaths
+          .map(p => p.toUri)
+          .filter { uri =>
+            val s = uri.getScheme
+            s != null && {
+              val sl = s.toLowerCase(java.util.Locale.ROOT)
+              !libhdfsSchemes.contains(sl) && !CometScanRule.isNativelyReadableScheme(uri)
+            }
+          }
+          .map(_.getScheme.toLowerCase(java.util.Locale.ROOT))
+          .toSet
+        if (unsupportedFsSchemes.nonEmpty) {
+          return withFallbackReason(
+            scanExec,
+            s"Unsupported filesystem schemes: ${unsupportedFsSchemes.mkString(", ")}")
         }
         val hadoopConf = r.sparkSession.sessionState.newHadoopConfWithOptions(r.options)
 
@@ -230,7 +288,7 @@ case class CometScanRule(session: SparkSession)
       .map(_.getScheme.toLowerCase(java.util.Locale.ROOT))
       .toSet
     if (unsupportedFsSchemes.nonEmpty) {
-      withInfo(
+      withFallbackReason(
         scanExec,
         s"Unsupported filesystem schemes: ${unsupportedFsSchemes.mkString(", ")}")
       return None
