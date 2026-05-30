@@ -508,6 +508,30 @@ object CometCreateArray extends CometExpressionSerde[CreateArray] {
       return exprToProtoInternal(emptyArrayLiteral, inputs, binding)
     }
 
+    // DataFusion's `make_array` asserts strict element-type equality (down to nested
+    // field nullability) via `MutableArrayData::with_capacities`. Spark's CreateArray
+    // is more permissive: children may share the same surface type (e.g. all
+    // `Struct<id,b,_change_type>`) but differ only in nested field nullability when
+    // the analyzer didn't insert coercion casts -- Delta's CDC write path builds
+    // these `array(struct(...), struct(...))` plans manually (one struct per change
+    // type) and can leave `_change_type` non-nullable in one arm and nullable in
+    // another. Native execution then panics inside `make_array_inner`. Decline here
+    // when any pair of children disagree on data type so Spark's JVM evaluator
+    // (which doesn't have this strictness) handles it.
+    //
+    // TODO: remove this decline once apache/datafusion#22366 lands. The upstream fix
+    // will widen the element type via nullability-OR-merge and cast each child before
+    // handing to MutableArrayData, eliminating the need for this caller-side workaround.
+    val childTypes = children.map(_.dataType)
+    if (childTypes.distinct.size > 1) {
+      withInfo(
+        expr,
+        "CreateArray children have mismatched data types: " +
+          childTypes.distinct.mkString(", "),
+        children: _*)
+      return None
+    }
+
     val childExprs = children.map(exprToProtoInternal(_, inputs, binding))
 
     if (childExprs.forall(_.isDefined)) {

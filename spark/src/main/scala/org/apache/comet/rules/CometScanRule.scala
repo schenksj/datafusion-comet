@@ -40,7 +40,7 @@ import org.apache.spark.sql.execution.datasources.v2.csv.CSVScan
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
-import org.apache.comet.{CometConf, DataTypeSupport}
+import org.apache.comet.{CometConf, CometNativeException, DataTypeSupport, NativeBase}
 import org.apache.comet.CometConf._
 import org.apache.comet.CometSparkSessionExtensions.{isCometLoaded, isSpark35Plus, withInfo, withInfos}
 import org.apache.comet.DataTypeSupport.isComplexType
@@ -124,12 +124,15 @@ case class CometScanRule(session: SparkSession)
       case scan if !CometConf.COMET_NATIVE_SCAN_ENABLED.get(conf) =>
         withInfo(scan, "Comet Scan is not enabled")
 
-      case scan if hasMetadataCol(scan) =>
-        withInfo(scan, "Metadata column is not supported")
-
-      // data source V1
+      // V1 scans go through `transformV1Scan` which itself first delegates to any
+      // available V1 contrib (today: Delta) and only then applies generic Comet
+      // bailouts like the metadata-column rejection. This keeps the metadata-col
+      // guard in place for V2 and non-contrib V1 paths without referencing any
+      // specific contrib class from this outer match.
       case scanExec: FileSourceScanExec =>
         transformV1Scan(fullPlan, scanExec)
+      case scan if hasMetadataCol(scan) =>
+        withInfo(scan, "Metadata column is not supported")
 
       // data source V2
       case scanExec: BatchScanExec =>
@@ -162,8 +165,63 @@ case class CometScanRule(session: SparkSession)
 
     scanExec.relation match {
       case r: HadoopFsRelation =>
+        // Try the optional Delta contrib first. When this build wasn't compiled with
+        // `-Pcontrib-delta`, the bridge returns None and we fall through to the
+        // vanilla scan path. When the Delta classes are on the classpath, the contrib
+        // either claims the scan (returning a CometScanExec marker) or declines via
+        // its own `withInfo` fallback message.
+        DeltaIntegration.transformV1IfDelta(plan, session, scanExec, r) match {
+          case Some(handled) => return handled
+          case None => // proceed with vanilla logic
+        }
+        // Metadata-col bailout moved here so V1 contribs (Delta) get first crack
+        // at scans with synthetic metadata columns before generic Comet rejects
+        // them. For non-contrib V1 scans this is equivalent to the outer check.
+        if (scanExec.expressions.exists(_.exists {
+            case a: Attribute => a.isMetadataCol
+            case _ => false
+          })) {
+          return withInfo(scanExec, "Metadata column is not supported")
+        }
         if (!CometScanExec.isFileFormatSupported(r.fileFormat)) {
           return withInfo(scanExec, s"Unsupported file format ${r.fileFormat}")
+        }
+        // Comet's native readers go through object_store, which only understands a fixed set
+        // of URL schemes. A custom Hadoop FileSystem (e.g. a test FakeFileSystem registered via
+        // spark.hadoop.fs.<scheme>.impl) would surface at execution time as
+        // `Generic URL error: Unable to recognise URL "..."`. Decline here so Spark's reader --
+        // which goes through the Hadoop FS API and can resolve custom schemes -- handles the
+        // scan. Whether object_store recognizes a scheme is answered by the native layer itself
+        // (`NativeBase.isObjectStoreSchemeSupported`) rather than a hardcoded list, so the
+        // planner can't drift from object_store's actual support.
+        //
+        // EXCEPT schemes the user routes through libhdfs via
+        // `spark.hadoop.fs.comet.libhdfs.schemes` (e.g. `hdfs`, or a test `fake`): those
+        // ARE natively readable through the libhdfs object_store bridge, so they must NOT
+        // be declined here (regression guarded by ParquetReadFromFakeHadoopFsSuite).
+        val libhdfsSchemes: Set[String] = CometConf.COMET_LIBHDFS_SCHEMES.get() match {
+          case Some(s) =>
+            s.split(",")
+              .map(_.trim.toLowerCase(java.util.Locale.ROOT))
+              .filter(_.nonEmpty)
+              .toSet
+          case None => Set.empty
+        }
+        val unsupportedFsSchemes = r.location.rootPaths
+          .map(p => p.toUri)
+          .filter { uri =>
+            val s = uri.getScheme
+            s != null && {
+              val sl = s.toLowerCase(java.util.Locale.ROOT)
+              !libhdfsSchemes.contains(sl) && !CometScanRule.isNativelyReadableScheme(uri)
+            }
+          }
+          .map(_.getScheme.toLowerCase(java.util.Locale.ROOT))
+          .toSet
+        if (unsupportedFsSchemes.nonEmpty) {
+          return withInfo(
+            scanExec,
+            s"Unsupported filesystem schemes: ${unsupportedFsSchemes.mkString(", ")}")
         }
         val hadoopConf = r.sparkSession.sessionState.newHadoopConfWithOptions(r.options)
 
@@ -725,6 +783,33 @@ case class CometScanTypeChecker() extends DataTypeSupport with CometTypeShim {
 }
 
 object CometScanRule extends Logging {
+
+  // Per-scheme memo of `NativeBase.isObjectStoreSchemeSupported`. The answer depends only on the
+  // URL scheme, so we cache by scheme and never re-cross the JNI boundary for a repeated scheme.
+  private val schemeSupportCache =
+    new java.util.concurrent.ConcurrentHashMap[String, java.lang.Boolean]()
+
+  /**
+   * True when Comet's native object_store layer recognizes this URI's scheme (so the scan is
+   * natively readable). Delegates to the native layer -- the source of truth -- instead of a
+   * hardcoded scheme list. On any failure to consult native (e.g. the library isn't loaded on
+   * this JVM, or predates this method), we assume the scheme IS supported: the scheme gate is an
+   * early-fallback optimization, and a build without a working native library can't run Comet's
+   * native scan anyway, so declining here would only over-restrict.
+   */
+  private[rules] def isNativelyReadableScheme(uri: java.net.URI): Boolean = {
+    val scheme = uri.getScheme
+    if (scheme == null) return true
+    schemeSupportCache
+      .computeIfAbsent(
+        scheme.toLowerCase(java.util.Locale.ROOT),
+        _ =>
+          try java.lang.Boolean.valueOf(NativeBase.isObjectStoreSchemeSupported(uri.toString))
+          catch {
+            case _: Throwable => java.lang.Boolean.TRUE
+          })
+      .booleanValue()
+  }
 
   /**
    * Tag set on a scan (`FileSourceScanExec` or `BatchScanExec`) that should be left as a plain
