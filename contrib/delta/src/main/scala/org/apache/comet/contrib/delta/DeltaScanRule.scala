@@ -24,7 +24,7 @@ import java.util.Locale
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Attribute, AttributeReference, Coalesce, EqualTo, Expression, InputFileBlockLength, InputFileBlockStart, InputFileName, Literal}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
-import org.apache.spark.sql.comet.CometScanExec
+import org.apache.spark.sql.comet.CometDeltaScanMarker
 import org.apache.spark.sql.execution.{FileSourceScanExec, FilterExec, ProjectExec, SparkPlan}
 import org.apache.spark.sql.execution.datasources.HadoopFsRelation
 import org.apache.spark.sql.execution.datasources.parquet.ParquetUtils
@@ -50,9 +50,9 @@ import org.apache.comet.rules.CometScanRule
  *   - [[matchesV1]] probes the relation's file format via reflection (no compile-time
  *     `io.delta.spark` dependency required).
  *   - [[transformV1]] runs `nativeDeltaScan`: schema / encryption / parquet-field-ID gates,
- *     column-mapping metadata re-attachment, row-tracking rewrite, and finally
- *     `CometScanExec(scan, session, CometDeltaNativeScan.ScanImpl)`. [[CometExecRule]] picks up
- *     the marker via [[DeltaOperatorSerdeExtension.matchOperator]] and routes it through
+ *     column-mapping metadata re-attachment, row-tracking rewrite, and finally wraps the scan in
+ *     a `CometDeltaScanMarker` (carrying a `DeltaScanMetadata` field). [[CometExecRule]] detects
+ *     the marker by type (`DeltaIntegration.isDeltaScanMarker`) and routes it through
  *     [[CometDeltaNativeScan]].
  *
  * SPI surfaces used:
@@ -265,46 +265,29 @@ object DeltaScanRule {
     // (`base_row_id`, `default_row_commit_version`, etc.) appear in many
     // scans that the existing packing handles correctly without per-task
     // partitioning.
+    // Per-file `_metadata.file_path` projection needs one file per Spark partition (1:1
+    // file/partition so per-file synthetic columns aren't dropped).
     val needsMetadataPerFile = scanExec.output.exists { a =>
       a.name.equalsIgnoreCase("file_path")
     }
-    val needsOneTaskPerPartition = needsMetadataPerFile
-    // Capture the analysis-time Delta schema (DeltaParquetFileFormat.referenceSchema) NOW,
-    // while the original Delta file format is still present. Core Comet will replace the file
-    // format with CometParquetFileFormat (which drops referenceSchema) and the FileIndex may
-    // re-resolve to the latest snapshot, so this is the only point where the schema the query
-    // was analyzed with is available. Stash it in relation.options (which survive both copies)
-    // so the native scan resolves column-mapping physical names / field-ids against it rather
-    // than the latest snapshot. See DeltaColumnMappingSuite "physical name changes" /
-    // "explicit id matching" and CometDeltaColumnMappingPhysicalNameReproSuite.
-    val withOneTaskPerPartition =
-      if (needsOneTaskPerPartition) {
-        scanExec.relation.options + (DeltaConf.OneTaskPerPartitionOption -> "true")
-      } else {
-        scanExec.relation.options
-      }
-    val taggedOptions =
-      DeltaReflection.extractFileFormatReferenceSchema(scanExec.relation) match {
-        case Some(refSchema) =>
-          withOneTaskPerPartition + (DeltaConf.AnalyzedSchemaJsonOption -> refSchema.json)
-        case None => withOneTaskPerPartition
-      }
-    val scanForDelta = if (taggedOptions != scanExec.relation.options) {
-      val taggedRelation = scanExec.relation.copy(options = taggedOptions)(
-        scanExec.relation.sparkSession)
-      val copied = scanExec.copy(relation = taggedRelation)
-      // `copy` drops TreeNode tags including the logicalLink; carry it so downstream marker
-      // creation can stash it (and createExec restore it) for AQE. See DeltaLogicalLinkTag.
-      scanExec.logicalLink.foreach(copied.setLogicalLink)
-      copied
-    } else scanExec
-    nativeDeltaScan(session, scanForDelta, scanForDelta.relation)
+    // Capture the analysis-time Delta schema (DeltaParquetFileFormat.referenceSchema) NOW, while
+    // the original Delta file format is still present (core later replaces it with
+    // CometParquetFileFormat and the FileIndex may re-resolve to the latest snapshot). Carried on
+    // the marker as a field so column-mapping physical names / field-ids resolve against the
+    // analyzed schema -- no scan copy / relation.options smuggling, so the scan's logicalLink is
+    // preserved for AQE. See DeltaColumnMappingSuite "physical name changes" / "explicit id
+    // matching".
+    val metadata = DeltaScanMetadata(
+      analyzedSchema = DeltaReflection.extractFileFormatReferenceSchema(scanExec.relation),
+      oneTaskPerPartition = needsMetadataPerFile)
+    nativeDeltaScan(session, scanExec, scanExec.relation, metadata)
   }
 
   private def nativeDeltaScan(
       session: SparkSession,
       scanExec: FileSourceScanExec,
-      r: HadoopFsRelation): Option[SparkPlan] = {
+      r: HadoopFsRelation,
+      metadata: DeltaScanMetadata): Option[SparkPlan] = {
     if (!DeltaConf.COMET_DELTA_NATIVE_ENABLED.get()) {
       withInfo(
         scanExec,
@@ -461,15 +444,11 @@ object DeltaScanRule {
     // columns are now synthesised natively via `DeltaSyntheticColumnsExec` -- see
     // CometDeltaNativeScan.convert for the schema stripping + proto emit flags, and
     // contrib/delta/native/src/synthetic_columns.rs for the exec.
-    applyRowTrackingRewrite(scanWithMappedSchema, r, session).getOrElse {
-      val marker = CometScanExec(scanWithMappedSchema, session)
-      marker.setTagValue(org.apache.comet.rules.DeltaIntegration.DeltaScanTag, ())
-      // Stash the scan's logicalLink in a custom tag that survives the marker copy between
-      // CometScanRule and CometExecRule (Spark's LOGICAL_PLAN_TAG is dropped there). createExec
-      // restores it so AQE's setLogicalLinkForNewQueryStage assertion holds for shuffle plans.
-      scanExec.logicalLink.foreach(
-        marker.setTagValue(org.apache.comet.rules.DeltaIntegration.DeltaLogicalLinkTag, _))
-      Some(marker)
+    applyRowTrackingRewrite(scanWithMappedSchema, r, session, metadata).getOrElse {
+      // scanWithMappedSchema already carries the original scan's logicalLink (preserved in
+      // withDeltaColumnMappingMetadata), so the marker's originalPlan retains it for AQE -- no
+      // tag/workaround needed (mirrors Iceberg keeping originalPlan as the link-bearing node).
+      Some(CometDeltaScanMarker(scanWithMappedSchema, metadata))
     }
   }
 
@@ -535,7 +514,8 @@ object DeltaScanRule {
   private def applyRowTrackingRewrite(
       scanExec: FileSourceScanExec,
       r: HadoopFsRelation,
-      session: SparkSession): Option[Option[SparkPlan]] = {
+      session: SparkSession,
+      metadata: DeltaScanMetadata): Option[Option[SparkPlan]] = {
     val RowIdName = DeltaReflection.RowIdColumnName
     val RowCommitVersionName = DeltaReflection.RowCommitVersionColumnName
     val hasRowIdField = scanExec.requiredSchema.fieldNames.exists { n =>
@@ -682,12 +662,10 @@ object DeltaScanRule {
       relation = newRelation,
       output = newOutput,
       requiredSchema = finalRequiredSchema)
-    val cometScan = CometScanExec(newScan, session)
-    cometScan.setTagValue(org.apache.comet.rules.DeltaIntegration.DeltaScanTag, ())
-    // Stash the scan's logicalLink in a custom tag that survives the marker copy (see site above);
-    // scanExec carries it via withDeltaColumnMappingMetadata. createExec restores it.
-    scanExec.logicalLink.foreach(
-      cometScan.setTagValue(org.apache.comet.rules.DeltaIntegration.DeltaLogicalLinkTag, _))
+    // newScan is the row-tracking-rewritten scan; preserve the input scan's logicalLink onto it so
+    // the marker's originalPlan retains it for AQE.
+    scanExec.logicalLink.foreach(newScan.setLogicalLink)
+    val cometScan = CometDeltaScanMarker(newScan, metadata)
 
     val projectExprs = origOutput.map { a =>
       renameMap.get(a.name).flatMap(phys => baseNewOutput.find(_.name == phys)) match {

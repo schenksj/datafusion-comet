@@ -20,9 +20,6 @@
 package org.apache.comet.rules
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.apache.spark.sql.catalyst.trees.TreeNodeTag
-import org.apache.spark.sql.comet.CometScanExec
 import org.apache.spark.sql.execution.{FileSourceScanExec, SparkPlan}
 import org.apache.spark.sql.execution.datasources.HadoopFsRelation
 
@@ -56,24 +53,16 @@ object DeltaIntegration extends org.apache.spark.internal.Logging {
   private val ScanRuleClass = "org.apache.comet.contrib.delta.DeltaScanRule$"
   private val SerdeClass = "org.apache.comet.contrib.delta.CometDeltaNativeScan$"
 
-  /**
-   * Tag the contrib stamps on the `CometScanExec` markers it produces, so `CometExecRule` can
-   * route them to the Delta serde handler. (Previously a `scanImpl` string discriminator, removed
-   * upstream when `CometScanExec` collapsed to a single native path.)
-   */
-  val DeltaScanTag: TreeNodeTag[Unit] = TreeNodeTag[Unit]("comet.delta.scan")
+  // Fully-qualified name of the contrib's planning-time marker (CometDeltaScanMarker), matched by
+  // class name so core carries no compile-time dependency on the contrib. CometExecRule routes any
+  // node of this type to the Delta serde handler. Type-based dispatch survives node copies / AQE
+  // re-planning (a TreeNodeTag would not), and the marker wraps the original, link-bearing scan as
+  // the produced exec's originalPlan -- so no logicalLink workaround is needed (mirrors Iceberg's
+  // CometBatchScanExec + nativeIcebergScanMetadata field).
+  private val MarkerClass = "org.apache.spark.sql.comet.CometDeltaScanMarker"
 
-  /**
-   * Carries the scan's `logicalLink` across the CometScanRule -> CometExecRule boundary. Spark's
-   * `LOGICAL_PLAN_TAG` is dropped when the marker node is copied in between (AQE re-planning),
-   * but custom `TreeNodeTag`s like this one survive. `CometDeltaNativeScan.createExec` reads it
-   * back and re-applies the link to the produced exec and its `originalPlan`, so AQE's
-   * `setLogicalLinkForNewQueryStage` assertion holds when the Delta scan is itself a query-stage
-   * root (e.g. ORDER BY / UNION / window). The built-in scans don't need this because their
-   * `originalPlan` is the untouched planned node, which retains its link.
-   */
-  val DeltaLogicalLinkTag: TreeNodeTag[LogicalPlan] =
-    TreeNodeTag[LogicalPlan]("comet.delta.logicalLink")
+  /** True when `plan` is the Delta contrib's scan marker. */
+  def isDeltaScanMarker(plan: SparkPlan): Boolean = plan.getClass.getName == MarkerClass
 
   // Lazy class lookups -- single reflection cost per JVM, cached either as the
   // class handle or as the empty option if the contrib wasn't bundled.
@@ -179,10 +168,10 @@ object DeltaIntegration extends org.apache.spark.internal.Logging {
    * `CometExecRule` calls this and passes the result through the standard `convertToComet(scan,
    * handler)` path so the Delta scan flows through the same code as `CometNativeScan` etc.
    */
-  def scanHandler: Option[CometOperatorSerde[CometScanExec]] = serdeCls.flatMap { cls =>
+  def scanHandler: Option[CometOperatorSerde[_]] = serdeCls.flatMap { cls =>
     try {
       val module = cls.getField("MODULE$").get(null)
-      Some(module.asInstanceOf[CometOperatorSerde[CometScanExec]])
+      Some(module.asInstanceOf[CometOperatorSerde[_]])
     } catch {
       // Only swallow true reflection-binding failures. A ClassCastException here
       // would mean the contrib's serde object doesn't implement the expected trait

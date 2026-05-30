@@ -264,14 +264,15 @@ case class CometExecRule(session: SparkSession)
   // spotless:on
   private def transform(plan: SparkPlan): SparkPlan = {
     def convertNode(op: SparkPlan): SparkPlan = op match {
-      // Delta scan marker stamped by the optional contrib/delta integration (a TreeNodeTag set by
-      // DeltaScanRule). The handler is resolved via reflection (no compile-time dependency on the
-      // contrib) -- present only when -Pcontrib-delta was activated. Must precede the generic
-      // CometScanExec case so Delta-tagged scans route to the Delta serde, not CometNativeScan.
-      case scan: CometScanExec if scan.getTagValue(DeltaIntegration.DeltaScanTag).isDefined =>
+      // Delta scan marker produced by the optional contrib/delta integration. Matched by type
+      // (no compile-time dependency on the contrib) -- present only when -Pcontrib-delta was
+      // activated. The marker wraps the original, link-bearing scan, so the produced exec's
+      // originalPlan keeps its logicalLink with no workaround. If conversion declines, the marker
+      // itself falls back to the vanilla Spark Delta scan, so leaving it in the plan is safe.
+      case scan if DeltaIntegration.isDeltaScanMarker(scan) =>
         DeltaIntegration.scanHandler
           .flatMap(handler => convertToComet(scan, handler))
-          .getOrElse(scan.wrapped)
+          .getOrElse(scan)
 
       // Fully native scan for V1. CometScanExec must always convert to a native scan; the JVM
       // fallback path has been removed. If conversion fails, fall back to the original Spark scan.

@@ -66,29 +66,4 @@ object DeltaConf {
       .intConf
       .checkValue(v => v > 0, "Data file concurrency limit must be positive")
       .createWithDefault(1)
-
-  /**
-   * Relation-options key signalling that the scan must emit one task per partition. Set by
-   * `DeltaScanRule` when the scan projects a per-file `_metadata.file_path` column: the native
-   * plan creates one parquet file-group per file, and Spark consumes a single DataFusion
-   * partition per Spark partition, so packing multiple files into one Spark partition would
-   * silently drop the 2nd+ files' rows. When `"true"`, the contrib emits
-   * `oneTaskPerPartition = true` on the `CometDeltaNativeScanExec` so packTasks keeps each task
-   * in its own partition.
-   */
-  val OneTaskPerPartitionOption: String = "comet.contrib.delta.oneTaskPerPartition"
-
-  /**
-   * Relation-options key carrying the JSON of the analysis-time Delta schema
-   * (`DeltaParquetFileFormat.referenceSchema`), captured by `DeltaScanRule` while the original
-   * Delta file format is still present. Core Comet later replaces the file format with
-   * `CometParquetFileFormat` (dropping `referenceSchema`) and the FileIndex may re-resolve to
-   * the latest snapshot, so without this the native scan would resolve column-mapping physical
-   * names / field-ids against the LATEST schema instead of the one the query was analyzed with
-   * -- returning new data where a column was renamed/re-physicalised should read NULL
-   * (DeltaColumnMappingSuite "physical name changes" / "explicit id matching"). The value is a
-   * `StructType.json` whose fields preserve `delta.columnMapping.physicalName` /
-   * `delta.columnMapping.id` metadata.
-   */
-  val AnalyzedSchemaJsonOption: String = "comet.contrib.delta.analyzedSchemaJson"
 }

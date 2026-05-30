@@ -28,7 +28,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{And, BoundReference, Expression, InterpretedPredicate}
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
-import org.apache.spark.sql.comet.{CometDeltaNativeScanExec, CometNativeExec, CometScanExec}
+import org.apache.spark.sql.comet.{CometDeltaNativeScanExec, CometDeltaScanMarker, CometNativeExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
@@ -66,7 +66,7 @@ import org.apache.comet.serde.operator.schema2Proto
  * `DeltaIntegration.scanHandler` (one reflective class lookup, no ServiceLoader, no
  * registry). The wire format is the typed `OpStruct::DeltaScan` variant.
  */
-object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Logging {
+object CometDeltaNativeScan extends CometOperatorSerde[CometDeltaScanMarker] with Logging {
 
   /**
    * `kind` string for the `ContribOp` envelope this serde produces. The native side's
@@ -76,13 +76,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
    */
   val DeltaScanKind: String = "delta-scan"
 
-  /**
-   * `scanImpl` tag the contrib uses on `CometScanExec` markers produced by
-   * `DeltaScanRuleExtension.transformV1`. Contrib-local constant (not in core's CometConf),
-   * declared as `nativeParquetScanImpls` in `DeltaOperatorSerdeExtension` so
-   * `CometScanExec.supportedDataFilters` applies the right exclusions, and matched in
-   * `DeltaOperatorSerdeExtension.matchOperator` to route through this serde.
-   */
+  /** Human-readable label for this scan implementation, used in diagnostic messages. */
   val ScanImpl: String = "native_delta_compat"
 
   /** Private lazy handle to the native library - one instance per JVM. */
@@ -93,8 +87,8 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
   // during planning so a simple ThreadLocal is safe.
   private val lastTaskListBytes = new ThreadLocal[Array[Byte]]()
 
-  // When a scan projects a per-file `_metadata.file_path` column, `DeltaScanRule` tags the
-  // relation's options with `DeltaConf.OneTaskPerPartitionOption`. We read it here to (a) skip
+  // When a scan projects a per-file `_metadata.file_path` column, `DeltaScanRule` sets
+  // `oneTaskPerPartition = true` in the marker's `DeltaScanMetadata`. We read it here to (a) skip
   // byte-range splitting in splitTasks and (b) emit `oneTaskPerPartition = true` on the
   // CometDeltaNativeScanExec so packTasks keeps each task in its own partition -- the native
   // plan emits one parquet file-group per file, so multiple files in one Spark partition would
@@ -156,11 +150,8 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       case other => other
     }
 
-  /** Visible to `DeltaOperatorSerdeExtension.matchOperator` for routing decisions. */
-  private[delta] def scanNeedsOneTaskPerPartition(scan: CometScanExec): Boolean =
-    scan.relation.options
-      .get(DeltaConf.OneTaskPerPartitionOption)
-      .contains("true")
+  private[delta] def scanNeedsOneTaskPerPartition(scan: CometDeltaScanMarker): Boolean =
+    scan.deltaMetadata.oneTaskPerPartition
 
   /**
    * True when the native plan will emit one parquet file-group per file (core_glue's
@@ -175,7 +166,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
    * CometDeltaDefaultRowCommitVersionReproSuite / DefaultRowCommitVersionSuite,
    * [[isMaterializedRowTrackingName]], and `project_concurrent_missing_column_drop`.
    */
-  private[delta] def needsPerFileGroups(scan: CometScanExec): Boolean = {
+  private[delta] def needsPerFileGroups(scan: CometDeltaScanMarker): Boolean = {
     val outNames = scan.output.map(_.name.toLowerCase(Locale.ROOT)).toSet
     val reqNames = scan.requiredSchema.fieldNames.map(_.toLowerCase(Locale.ROOT)).toSet
     // `_metadata.*` virtual columns + per-file row-tracking constants (these always force
@@ -343,10 +334,10 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
   override def enabledConfig: Option[ConfigEntry[Boolean]] = Some(
     DeltaConf.COMET_DELTA_NATIVE_ENABLED)
 
-  override def getSupportLevel(operator: CometScanExec): SupportLevel = Compatible()
+  override def getSupportLevel(operator: CometDeltaScanMarker): SupportLevel = Compatible()
 
   override def convert(
-      scan: CometScanExec,
+      scan: CometDeltaScanMarker,
       builder: Operator.Builder,
       childOp: OperatorOuterClass.Operator*): Option[OperatorOuterClass.Operator] = {
 
@@ -460,7 +451,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
 
     // Honor Delta's time-travel options (versionAsOf / timestampAsOf) via the Delta-
     // resolved snapshot version sitting on the FileIndex. Delta's analysis phase pins
-    // the exact snapshot before we ever see the plan, so by the time `CometScanExec` is
+    // the exact snapshot before we ever see the plan, so by the time the marker is
     // built, `relation.location` is a `PreparedDeltaFileIndex` whose toString looks like
     // `Delta[version=0, file:/...]`. We parse the version out via
     // `DeltaReflection.extractSnapshotVersion` and pass it through to kernel.
@@ -635,13 +626,8 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     // Suite "physical name changes" / "explicit id matching"). Fall back to the live snapshot
     // schema when the option is absent (e.g. the Delta-FileIndex-over-plain-ParquetFileFormat
     // shape, where referenceSchema was never available).
-    val analyzedSchemaFromOption: Option[StructType] =
-      relation.options.get(DeltaConf.AnalyzedSchemaJsonOption).flatMap { json =>
-        try Some(DataType.fromJson(json).asInstanceOf[StructType])
-        catch { case scala.util.control.NonFatal(_) => None }
-      }
     val snapshotSchemaEarly: Option[StructType] =
-      analyzedSchemaFromOption.orElse(DeltaReflection.extractSnapshotSchema(relation))
+      scan.deltaMetadata.analyzedSchema.orElse(DeltaReflection.extractSnapshotSchema(relation))
     // Only honour physicalName metadata when the table actually has column mapping
     // mode enabled. Some Delta test helpers (e.g. `DeltaSourceSuiteBase.withMetadata`)
     // call `DeltaColumnMapping.assignColumnIdAndPhysicalName` unconditionally, which
@@ -1401,7 +1387,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
    * Delta-native scan splits files the same way a vanilla `FileSourceScanExec` would. Inputs are
    * file sizes (bytes); other knobs come from session conf and the relation's spark session.
    */
-  private def maxSplitBytes(scan: CometScanExec, fileSizes: Seq[Long]): Long = {
+  private def maxSplitBytes(scan: CometDeltaScanMarker, fileSizes: Seq[Long]): Long = {
     val sparkSession = scan.relation.sparkSession
     val conf = sparkSession.sessionState.conf
     val openCostInBytes = conf.filesOpenCostInBytes
@@ -1428,7 +1414,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
    * across chunks is correct (just slightly wasteful).
    */
   private def splitTasks(
-      scan: CometScanExec,
+      scan: CometDeltaScanMarker,
       tasks: Seq[OperatorOuterClass.DeltaScanTask]): Seq[OperatorOuterClass.DeltaScanTask] = {
     if (tasks.isEmpty) return tasks
     // When the scan needs one task per partition (per-file `_metadata.file_path`), keep each
@@ -1460,7 +1446,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
 
   private def prunePartitions(
       tasks: Seq[OperatorOuterClass.DeltaScanTask],
-      scan: CometScanExec,
+      scan: CometDeltaScanMarker,
       partitionSchema: StructType): Seq[OperatorOuterClass.DeltaScanTask] = {
     if (scan.partitionFilters.isEmpty || partitionSchema.isEmpty) return tasks
 
@@ -1566,7 +1552,7 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
     tlBuilder.build()
   }
 
-  def createExec(nativeOp: Operator, op: CometScanExec): CometNativeExec = {
+  def createExec(nativeOp: Operator, op: CometDeltaScanMarker): CometNativeExec = {
     val tableRoot = DeltaReflection.extractTableRoot(op.relation).getOrElse("unknown")
     val tlBytes =
       try {
@@ -1605,36 +1591,11 @@ object CometDeltaNativeScan extends CometOperatorSerde[CometScanExec] with Loggi
       dppFilters,
       partitionSchema,
       oneTaskPerPartition = oneTaskPerPartition)
-    // Propagate logicalLink from the source scanExec to the contrib's exec, mirroring
-    // what CometNativeScanExec/CometScanExec/CometIcebergNativeScanExec do for built-in
-    // scans. AdaptiveSparkPlanExec.setLogicalLinkForNewQueryStage asserts every new
-    // query-stage node has a logicalLink set; without this, AQE plans containing a
-    // CometDeltaNativeScanExec hit the assertion when the AQE optimizer tries to wrap
-    // them (especially under spark.sql.adaptive.forceApply and on column-mapping
-    // rewritten plans).
-    // Propagate the logical link, falling back from the wrapped scan to the
-    // CometScanExec itself. The built-in CometExecRule runs a later "set up
-    // logical links" pass that re-derives THIS exec's link from
-    // `exec.originalPlan.logicalLink` (== `op.wrapped.logicalLink`) and
-    // UNSETS the tag when that's empty -- which would discard a link we set
-    // only on the exec. In column-mapping mode the wrapped FileSourceScanExec
-    // can lack a logicalLink even though the surrounding CometScanExec has one
-    // (Delta builds the CM scan without propagating it), so any plan with a
-    // shuffle above the scan (orderBy / join / aggregate) tripped
-    // AdaptiveSparkPlanExec.setLogicalLinkForNewQueryStage's assertion. Seed
-    // the wrapped scan's link from `op`'s so both passes agree, then set it on
-    // the exec too.
-    // Restore the logicalLink. Spark's LOGICAL_PLAN_TAG is dropped when the marker is copied
-    // between CometScanRule and here, so prefer the custom DeltaLogicalLinkTag stashed by
-    // DeltaScanRule (which survives the copy). Set it on `op.wrapped` (== exec.originalPlan) so
-    // CometExecRule's later "set up logical links" pass -- which keys off originalPlan.logicalLink
-    // and UNSETS the link when that's empty -- keeps it, and on the exec directly.
-    val link = op
-      .getTagValue(org.apache.comet.rules.DeltaIntegration.DeltaLogicalLinkTag)
-      .orElse(op.wrapped.logicalLink)
-      .orElse(op.logicalLink)
-    link.foreach(op.wrapped.setLogicalLink)
-    link.foreach(exec.setLogicalLink)
+    // `op.wrapped` (== exec.originalPlan) is the original, link-bearing scan (preserved through
+    // DeltaScanRule's rebuild), so CometExecRule's "set up logical links" pass -- which keys off
+    // originalPlan.logicalLink -- finds it and sets the exec's link, satisfying AQE's
+    // setLogicalLinkForNewQueryStage assertion. Set it here too for good measure.
+    op.wrapped.logicalLink.foreach(exec.setLogicalLink)
     exec
   }
 }
