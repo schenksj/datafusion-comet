@@ -554,6 +554,25 @@ fn hash_object_store_configs(configs: &HashMap<String, String>) -> u64 {
 
 /// Parses the url, registers the object store with configurations, and returns a tuple of the object store url
 /// and object store path
+/// Build an object_store [`Path`] from a Spark-supplied file URL.
+///
+/// For local files (`file://`), the URL is percent-decoded to a real filesystem path and turned
+/// into a `Path` with [`Path::from_absolute_path`], which round-trips correctly through
+/// `LocalFileSystem` even when the path contains a literal `%` (or spaces). Using
+/// [`Path::from_url_path`] on the raw URL path mis-handles such names -- a file at
+/// `/tmp/s p a r k %2a/data.parquet` is then reported as "not found". Remote object stores
+/// (s3/gcs/azure/hdfs) keep URL-path semantics, where percent-encoding is part of the key.
+pub(crate) fn object_store_path_from_url(url: &Url) -> Result<Path, ExecutionError> {
+    if url.scheme() == "file" {
+        let fs_path = url.to_file_path().map_err(|_| {
+            ExecutionError::GeneralError(format!("Could not convert file URL to a path: {url}"))
+        })?;
+        Path::from_absolute_path(&fs_path).map_err(|e| ExecutionError::GeneralError(e.to_string()))
+    } else {
+        Path::from_url_path(url.path()).map_err(|e| ExecutionError::GeneralError(e.to_string()))
+    }
+}
+
 pub(crate) fn prepare_object_store_with_configs(
     runtime_env: Arc<RuntimeEnv>,
     url: String,
@@ -590,8 +609,7 @@ pub(crate) fn prepare_object_store_with_configs(
     let (object_store, object_store_path): (Arc<dyn ObjectStore>, Path) =
         if let Some(store) = cached {
             debug!("Reusing cached object store for {url_key}");
-            let path = Path::from_url_path(url.path())
-                .map_err(|e| ExecutionError::GeneralError(e.to_string()))?;
+            let path = object_store_path_from_url(&url)?;
             (store, path)
         } else {
             debug!("Creating new object store for {url_key}");
@@ -731,5 +749,47 @@ mod tests {
         let res = res.unwrap();
         assert_eq!(res.0, expected.0);
         assert_eq!(res.1, expected.1);
+    }
+
+    // A local file whose path contains a literal `%` (and spaces) must be readable. The Spark-side
+    // `file://` URL percent-encodes those characters; `object_store_path_from_url` decodes back to
+    // the real filesystem path via `from_absolute_path` so `LocalFileSystem` finds the file. The
+    // old `Path::from_url_path` route does not round-trip such paths -- the read fails with
+    // "not found" (the `s p a r k %2a` / `test%file%prefix` Delta vacuum-cdc failures).
+    #[tokio::test]
+    async fn local_path_with_percent_and_spaces_is_readable() {
+        use super::object_store_path_from_url;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path;
+        use object_store::ObjectStore;
+        use url::Url;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("s p a r k %2a");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test%file%prefix-data.parquet");
+        std::fs::write(&file, b"hello").unwrap();
+
+        // The URL Spark hands the planner is percent-encoded (space -> %20, '%' -> %25).
+        let url = Url::from_file_path(&file).unwrap();
+        let store = LocalFileSystem::new();
+
+        // Fix: from_absolute_path resolves the real on-disk file.
+        let good = object_store_path_from_url(&url).unwrap();
+        let bytes = store
+            .get(&good)
+            .await
+            .expect("local file with '%' in path should be readable")
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"hello");
+
+        // Regression guard: the previous `Path::from_url_path` route cannot locate the file.
+        let old = Path::from_url_path(url.path()).unwrap();
+        assert!(
+            store.get(&old).await.is_err(),
+            "Path::from_url_path should fail to locate a local file whose name contains '%'"
+        );
     }
 }

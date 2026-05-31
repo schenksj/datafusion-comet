@@ -78,7 +78,9 @@ use iceberg::expr::Bind;
 use crate::execution::operators::ExecutionError::GeneralError;
 use crate::execution::shuffle::{CometPartitioning, CompressionCodec};
 use crate::execution::spark_plan::SparkPlan;
-use crate::parquet::parquet_support::prepare_object_store_with_configs;
+use crate::parquet::parquet_support::{
+    object_store_path_from_url, prepare_object_store_with_configs,
+};
 use datafusion::common::scalar::ScalarStructBuilder;
 use datafusion::common::{
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
@@ -131,7 +133,6 @@ use datafusion_comet_spark_expr::{
 use itertools::Itertools;
 use jni::objects::{Global, JObject};
 use num::{BigInt, ToPrimitive};
-use object_store::path::Path;
 use std::cmp::max;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
@@ -251,8 +252,10 @@ impl PhysicalPlanner {
             // Spark sends the path over as URL-encoded, parse that first.
             let url =
                 Url::parse(file.file_path.as_ref()).map_err(|e| GeneralError(e.to_string()))?;
-            // Convert that to a Path object to use in the PartitionedFile.
-            let path = Path::from_url_path(url.path()).map_err(|e| GeneralError(e.to_string()))?;
+            // Convert that to a Path object to use in the PartitionedFile. For local files this
+            // uses the decoded filesystem path so names containing a literal `%` (or spaces)
+            // round-trip correctly through LocalFileSystem; remote stores keep URL-path semantics.
+            let path = object_store_path_from_url(&url)?;
             partitioned_file.object_meta.location = path;
 
             // Process partition values

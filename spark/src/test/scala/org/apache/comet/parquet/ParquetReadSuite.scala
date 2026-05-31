@@ -81,6 +81,22 @@ abstract class ParquetReadSuite extends CometTestBase {
     }
   }
 
+  test("read parquet from a local path containing spaces and a literal '%' (SPARK-#4546)") {
+    // The native scan built its object_store path with `Path::from_url_path`, which does not
+    // round-trip a literal `%` in a local filesystem path: the read failed with
+    // "Object at location ... not found". Mirrors Delta's `DeletionVectorsTestUtils`, which uses
+    // the temp-dir prefix `s p a r k %2a` to stress path handling (its vacuum-cdc tests hit this).
+    withTempDir { dir =>
+      val weird = new File(dir, "s p a r k %2a")
+      assert(weird.mkdirs())
+      val path = new File(weird, "data").getCanonicalPath
+      spark.range(0, 100).toDF("id").write.parquet(path)
+      // Reads natively before this fix would throw "... is declared ... not found"; assert both
+      // correctness and that Comet's native scan actually handled it.
+      checkSparkAnswerAndOperator(spark.read.parquet(path))
+    }
+  }
+
   test("basic data types") {
     Seq(7, 1024).foreach { batchSize =>
       withSQLConf(CometConf.COMET_BATCH_SIZE.key -> batchSize.toString) {
