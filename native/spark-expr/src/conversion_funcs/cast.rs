@@ -62,6 +62,7 @@ use base64::Engine;
 use datafusion::common::{internal_err, DataFusionError, Result as DataFusionResult, ScalarValue};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ColumnarValue;
+use datafusion_comet_common::decode_utf8_spark_lossy;
 use std::{
     any::Any,
     fmt::{Debug, Display, Formatter},
@@ -830,7 +831,10 @@ fn cast_binary_to_string<O: OffsetSizeTrait>(
 /// Before Spark 4.0.0, the default is SPACE_DELIMITED_UPPERCASE_HEX
 fn spark_binary_formatter(value: &[u8], binary_output_style: BinaryOutputStyle) -> String {
     match binary_output_style {
-        BinaryOutputStyle::Utf8 => String::from_utf8(value.to_vec()).unwrap(),
+        // `new String(bytes, UTF_8)` parity: invalid bytes render as U+FFFD with the JDK's
+        // replacement granularity (not a panic, and not `from_utf8_lossy`'s differing
+        // surrogate-range granularity).
+        BinaryOutputStyle::Utf8 => decode_utf8_spark_lossy(value).into_owned(),
         BinaryOutputStyle::Basic => {
             format!(
                 "{:?}",
@@ -860,10 +864,12 @@ fn spark_binary_formatter(value: &[u8], binary_output_style: BinaryOutputStyle) 
 }
 
 fn cast_binary_formatter(value: &[u8]) -> String {
-    match String::from_utf8(value.to_vec()) {
-        Ok(value) => value,
-        Err(_) => unsafe { String::from_utf8_unchecked(value.to_vec()) },
-    }
+    // Spark's `cast(binary as string)` is `UTF8String.fromBytes(bytes).toString()` =
+    // `new String(bytes, UTF_8)`: invalid bytes become U+FFFD with the JDK's replacement
+    // granularity. Decode through the shared Spark-parity decoder rather than
+    // `from_utf8_unchecked` (UB on non-UTF-8 input, and it would also keep the raw bytes
+    // instead of rendering U+FFFD the way Spark does).
+    decode_utf8_spark_lossy(value).into_owned()
 }
 
 #[cfg(test)]
@@ -873,6 +879,35 @@ mod tests {
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::TimestampMicrosecondType;
     use arrow::datatypes::{Field, Fields};
+
+    #[test]
+    fn cast_binary_formatter_renders_invalid_bytes_like_spark() {
+        // cast(binary as string) == `new String(bytes, UTF_8)`: invalid bytes render as U+FFFD
+        // with the JDK's replacement granularity -- no panic and no UB from from_utf8_unchecked.
+        assert_eq!(cast_binary_formatter(b"hello"), "hello");
+        // lone invalid byte -> single U+FFFD
+        assert_eq!(cast_binary_formatter(&[b'a', 0xFF, b'b']), "a\u{FFFD}b");
+        // surrogate-range 3-byte sequence: the JDK collapses it to ONE U+FFFD, whereas
+        // from_utf8_lossy would emit three. This is the parity case raised on #4524.
+        assert_eq!(cast_binary_formatter(&[0xED, 0xA0, 0x80]), "\u{FFFD}");
+        // valid multibyte is preserved
+        assert_eq!(cast_binary_formatter("é".as_bytes()), "é");
+    }
+
+    #[test]
+    fn spark_binary_formatter_utf8_does_not_panic_on_invalid_bytes() {
+        // BinaryOutputStyle::Utf8 (ToPrettyString) previously did `from_utf8(..).unwrap()` and
+        // panicked on invalid bytes; now it renders U+FFFD like Spark's `new String(bytes, UTF_8)`.
+        assert_eq!(
+            spark_binary_formatter(&[0xED, 0xA0, 0x80], BinaryOutputStyle::Utf8),
+            "\u{FFFD}"
+        );
+        assert_eq!(
+            spark_binary_formatter(&[b'a', 0xFF], BinaryOutputStyle::Utf8),
+            "a\u{FFFD}"
+        );
+    }
+
     #[test]
     fn test_cast_unsupported_timestamp_to_date() {
         // Since datafusion uses chrono::Datetime internally not all dates representable by TimestampMicrosecondType are supported

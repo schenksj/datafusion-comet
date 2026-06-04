@@ -17,9 +17,11 @@
 
 mod error;
 mod query_context;
+mod spark_utf8;
 pub mod tracing;
 mod utils;
 
 pub use error::{decimal_overflow_error, SparkError, SparkErrorWithContext, SparkResult};
 pub use query_context::{create_query_context_map, QueryContext, QueryContextMap};
+pub use spark_utf8::decode_utf8_spark_lossy;
 pub use utils::bytes_to_i128;
