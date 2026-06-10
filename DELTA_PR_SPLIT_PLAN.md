@@ -544,6 +544,18 @@ Append-only. Newest entry at the top. Entry template:
 - Next action:
 ```
 
+### 2026-06-10 (session 2b — Opus 4.8) — upstream sync to clear #4366 conflict
+- #4366 showed a `.gitignore` conflict (apache/main advanced +8 to `523ffb6c9`; feat 107 ahead / 8 behind).
+  Merged `upstream/main` into `feat/delta-kernel-read` (merge `937b97760`, NOT rebase — per §3). Only
+  `.gitignore` conflicted; all else auto-merged (Cargo.lock/toml, pom.xml, CometScanRule.scala, pr_build_*.yml,
+  CometExpressionSuite.scala).
+- Resolved `.gitignore` by **dropping leaked local-only junk** (`pr-4366-body*.md`, `# Claude Code local
+  runtime state`, `.claude/scheduled_tasks.lock`, `.claude/*.lock`) and keeping upstream's `docs/superpowers/`.
+  → carve A.2's `.gitignore` (gate entries) from THIS cleaned version, not the old one.
+- Pushed FF to `origin/feat/delta-kernel-read` and to `contrib-delta-direct`. #4366 now `MERGEABLE`
+  (state BLOCKED only because it's a draft). **Not** build-verified post-merge — a full integration
+  re-verify (build + targeted suites) per §3 is the proper follow-up before trusting end-state green.
+
 ### 2026-06-10 (session 2 — Opus 4.8) — %-path fix investigation
 - Asked to open the `%`-path fix as the 8th extraction PR. Rebased `fix/local-path-special-chars`
   onto `main` (clean, patch-id identical). Corrected its native unit test (the regression guard was
