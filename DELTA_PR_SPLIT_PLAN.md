@@ -341,9 +341,19 @@ Once **all** units pass §5 + §6:
 - Conflict policy with extraction PRs: whichever of {A.1 vs #4535}, {A.2 vs #4525} lands second
   takes the (small) conflict. If an extraction merges mid-sequence, fold its hunks back into the
   affected unit branches at the next rebase.
-- Also **open the `%`-path fix now** (`fix/local-path-special-chars` + move
-  `CometParquetPercentPathSuite` + its `pr_build_*.yml` registration into that PR) — it is the
-  eighth extraction, currently sitting unopened.
+- **`%`-path fix — DEFERRED, do not open as a standalone PR** (decision 2026-06-10). Verified
+  red/green on current `main`: the core `ParquetReadV1Suite` test passes **identically with and
+  without** the production change (`object_store` 0.13.2's `Path::from_url_path` already round-trips
+  `%`/spaces in local paths). It is a **no-op at the core read level** on current main — no failing
+  test justifies a core bugfix PR. Its real necessity (if any) is in the Delta path, so the
+  production change folds into **A.6a**, alongside the tests that would actually exercise it
+  (`CometDeltaPercentFileNameReproSuite`, `CometDeltaSpecialCharFilenameSuite`). During A.6a carve:
+  run those Delta suites WITHOUT the planner/parquet_support change; **only** keep the change if a
+  suite goes red without it (real red-green), otherwise **drop it entirely**. Branch preserved:
+  `fix/local-path-special-chars` (local, rebased onto main) and `origin/backup/fix-local-path-special-chars`
+  (pre-rebase original). NB: that branch's native unit-test regression guard is a flawed micro-repro
+  (`Url::from_file_path` round-trips cleanly, so it can't reproduce the bug) — fix or drop it if the
+  change is kept.
 
 Merge-order summary: A.1 → A.2 → {A.3a → A.3b ∥ A.4a} → A.4b → A.5 → A.7, with A.6a/A.6b last
 (gated on all eight extractions), A.8 whenever #4536 merges.
@@ -411,7 +421,7 @@ whole-file copy from `ref/delta-complete`.
 | `NativeUtil.scala`, `ArrowWriters.scala`, `comet/util/Utils.scala`, `UtilsSuite` | #4532 |
 | `CometScanRule` scheme-gate hunks, `NativeBase.java` (+11), `native/core/src/lib.rs` (+25), `FakeHdfsSchemeFileSystem.java`, `CometScanSchemeFallbackSuite` | #4525 |
 | `native/shuffle/src/spark_unsafe/{row.rs,unsafe_object.rs}`, `CometColumnarShuffleSuite` additions | #4524 |
-| `CometParquetPercentPathSuite.scala`, `pr_build_{linux,macos}.yml` suite registrations | %-path fix (`fix/local-path-special-chars` — **open it**) |
+| ~~`CometParquetPercentPathSuite.scala`, `pr_build_*.yml`~~ → **the `%`-path production change is DEFERRED into A.6a** (no-op on current main; see §8). Branch `fix/local-path-special-chars` kept for reference only. | %-path fix (deferred) |
 
 ### A.1 — Core SPI
 - `spark/.../sql/comet/operators.scala` [carve]: `CometScanWithPlanData` trait (no
@@ -533,6 +543,25 @@ Append-only. Newest entry at the top. Entry template:
 - Pending decisions or upstream events (PR merges, review feedback):
 - Next action:
 ```
+
+### 2026-06-10 (session 2 — Opus 4.8) — %-path fix investigation
+- Asked to open the `%`-path fix as the 8th extraction PR. Rebased `fix/local-path-special-chars`
+  onto `main` (clean, patch-id identical). Corrected its native unit test (the regression guard was
+  a flawed micro-repro — `Url::from_file_path` round-trips `%`/spaces cleanly on object_store 0.13.2,
+  so it never reproduced the bug). Built debug `libcomet`, staged into `spark/target/classes/.../darwin/aarch64`.
+- Ran `ParquetReadV1Suite` **green** (53/53, my test passes, native operator handled it). Then proved
+  **red** by reverting only the two production call sites (planner.rs + parquet_support cached branch)
+  and rebuilding: test **still passed 53/53** → the fix is a **no-op on current main**. object_store
+  0.13.2's `from_url_path` already handles `%`/spaces; the original branch base had the same 0.13.2.
+- **Decision (user): DEFER** the `%`-path change to the phase that ships the tests needing it = **A.6a**
+  (`CometDeltaPercentFileNameReproSuite` / `CometDeltaSpecialCharFilenameSuite`). Did NOT open a PR.
+  Restored the branch to committed state. Updated §8 + §12 accordingly.
+- Gotchas hit this session: **disk filled to 0** mid-build (release build of datafusion OOM'd the disk);
+  user freed space by `rm -rf native/target/release`. JVM test needs `-Djava.version=17
+  -Dmaven.compiler.source/target=17` (else `java.lang.Record not found` on the spark-4.x shim). Debug
+  lib is fine for JVM correctness tests; copy it to `spark/target/classes/org/apache/comet/darwin/aarch64/libcomet.dylib`.
+- Repo state left: on `feat/delta-kernel-read`; staged classpath lib is currently the throwaway RED
+  (pre-fix) debug build — harmless (gitignored), rebuild before any real test run.
 
 ### 2026-06-10 (session 1 — Opus 4.8)
 - Phase/unit in progress: **Phase 0 complete** (preserve work product + establish #4366 as the tracking PR). Phase 1 carving NOT started.
