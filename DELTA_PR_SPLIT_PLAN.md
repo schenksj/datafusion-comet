@@ -544,6 +544,42 @@ Append-only. Newest entry at the top. Entry template:
 - Next action:
 ```
 
+### 2026-06-13 (session 4 — Opus 4.8) — Phase 1 Unit A.1 carved + fork draft PR + review loop
+- **Phase/unit:** A.1 (Core SPI) carved, verified, fork draft PR open. First split unit done locally.
+- **Branches:** `feat/delta-split` (from `upstream/main` 0031c60d6) == `pr/delta-A1-spi` @ **`aa0fd12c5`**.
+  Fork `main` fast-forwarded to upstream `0031c60d6` (clean PR base). Local `main` also synced.
+- **Fork draft PR: schenksj/datafusion-comet#3** (base `main`), title `feat: core SPI for contrib
+  leaf scans (CometScanWithPlanData)`. 6 files, +192/-16.
+- **A.1 carve (4 prod/test + 2 CI files):**
+  - `operators.scala`: reflective `DeltaPlanDataInjector$` slot against main's O(N) loop (import
+    `Logging`, `extends Logging`); `foreachUntilCometInput` → `case _: CometLeafExec`;
+    `findAllPlanData` → `case s: CometScanWithPlanData`; new `trait CometScanWithPlanData` WITHOUT
+    `perPartitionFilePaths`.
+  - `CometNativeScanExec.scala`: `with CometScanWithPlanData` ONLY (the perPartitionFilePaths/triple
+    hunks are A.8, excluded).
+  - `CometPlanAdaptiveDynamicPruningFilters.scala`: trait DPP in-place arm.
+  - NEW `CometScanWithPlanDataSuite` (trait defaults + reflective-slot absence; disjoint from
+    #4535's `PlanDataInjectorSuite`).
+  - `pr_build_{linux,macos}.yml`: register the new suite (preflight requires it — A.1's own hunk).
+- **Excluded hunks confirmed absent in A.1:** `perPartitionFilePaths`, `opStructCase`,
+  `injectorsByKind` (those are A.8 / #4535).
+- **§5 verification (all green):** new suite 2/2; `CometJoinSuite` smoke 28/28 (native scan fusion);
+  spotless + scalastyle BUILD SUCCESS; `check-suites.py` exit 0; A.1 has zero native changes.
+  Had to **build a clean default-features `libcomet`** first — the staged June-10 contrib lib caused
+  spurious `NoClassDefFound CometBatchIterator` join failures (stale-dylib gotcha). Disk freed to ~25G.
+- **Review loop:** `/review-comet-pr` (adapted — structural PR, not expressions) + `/code-review`
+  high (3 finders). No correctness bugs. Fixes folded: inline-FQN `Logging`→import; PR title→`feat:`.
+  3 forward-notes documented as won't-fix in A.1 (all match the monolith): `hasScanInput` not
+  generalized (metrics-only, A.4b/A.8); DPP case-4 guard asymmetry (no contrib scan in A.1); single-
+  slot reflective lookup (altitude). See `.delta-split/review-log-A1.md`.
+- **CI:** PR MERGEABLE. Fork Preflight/Analyze still queued (shared runners) at session end — local
+  equivalents all pass, so expected green. Verify when it lands.
+- **Carve-attribution learning for §12:** `CometNativeScanExec.scala`'s trait-extension hunk is A.1
+  (only its perPartitionFilePaths hunks are #4536/A.8); `pr_build_*.yml` get a 1-line A.1 hunk
+  (suite registration) regardless of the file's other-unit ownership.
+- **Next action:** confirm #3 CI green; then either open A.1 **upstream** (apache) or proceed to carve
+  **A.2** (build gate) onto `feat/delta-split`. A.2 proto must use `delta_scan = 118` (see session 3).
+
 ### 2026-06-13 (session 3 — Opus 4.8) — upstream sync #2 (real code conflicts) to clear #4366
 - apache/main advanced +30 to `0031c60d6`; #4366 went CONFLICTING. Merged `upstream/main` into
   `feat/delta-kernel-read` (merge `f442361c3`, not rebase). 6 conflicts resolved + verified:
