@@ -544,6 +544,33 @@ Append-only. Newest entry at the top. Entry template:
 - Next action:
 ```
 
+### 2026-06-13 (session 3 — Opus 4.8) — upstream sync #2 (real code conflicts) to clear #4366
+- apache/main advanced +30 to `0031c60d6`; #4366 went CONFLICTING. Merged `upstream/main` into
+  `feat/delta-kernel-read` (merge `f442361c3`, not rebase). 6 conflicts resolved + verified:
+  - **`operator.proto`: upstream took field 117 for `BroadcastNestedLoopJoin`** (collided with
+    Delta's `delta_scan`). Kept BNLJ=117, **moved `DeltaScan` to field 118**. ⇒ **A.2's proto carve
+    must use `delta_scan = 118`.** Updated docs 01-overview/02-planning to 118.
+  - `operator_registry.rs` + `jni_api.rs`: kept both new match arms (BNLJ + DeltaScan).
+  - **`operators.scala`: upstream refactored the CometExecRDD construction** into
+    `buildNativeContext(): NativeExecContext` + `executeColumnarWithContext(ctx)`. Re-threaded Delta's
+    `perPartitionFilePaths` through it: added a field to the `NativeExecContext` case class (default
+    `Array.empty`), compute it in `buildNativeContext`, pass `ctx.perPartitionFilePaths` to the RDD
+    ctor. ⇒ **A.8 (perPartitionFilePaths threading) must target this new ctx structure, not the old
+    inline body.** A.1's `CometScanWithPlanData` trait + `executeColumnarWithContext`/`buildNativeContext`
+    matching are unaffected in shape.
+  - `CometArrayExpressionSuite.scala`: kept both tests (the nullability-divergent CreateArray-decline
+    test is #4533's; the ansi GetArrayItem-on-null-split is upstream's).
+  - `Cargo.lock`: took upstream's lock; `cargo check` re-added Delta deps; consistent under `--locked`.
+  - Non-conflict scare: rust-analyzer flashed E0107 on `planner.rs` `init_datasource_exec` mid-merge —
+    a transient cascade from the conflicted proto enum; def=call=16 args, false alarm.
+- Verified: native `cargo check` (default) green; spark `test-compile` (JDK-17 flags) BUILD SUCCESS.
+  NOT verified: gated `--features contrib-delta` native build (merge didn't touch gated code; renumber
+  is variant-name-safe) and full regression — proper §3 re-verify still pending.
+- Pushed FF to `origin/feat` + `contrib-delta-direct`; #4366 back to MERGEABLE.
+- **Process note:** `git add -A` accidentally staged `DELTA_PR_SPLIT_PLAN.md` into the merge commit;
+  caught and removed via `git rm --cached` + `--amend`. Never `git add -A` with this file untracked —
+  use explicit paths or it leaks into #4366.
+
 ### 2026-06-10 (session 2b — Opus 4.8) — upstream sync to clear #4366 conflict
 - #4366 showed a `.gitignore` conflict (apache/main advanced +8 to `523ffb6c9`; feat 107 ahead / 8 behind).
   Merged `upstream/main` into `feat/delta-kernel-read` (merge `937b97760`, NOT rebase — per §3). Only
