@@ -548,6 +548,32 @@ Append-only. Newest entry at the top. Entry template:
 - Next action:
 ```
 
+### 2026-06-21 (session 5g — Opus 4.8) — A.5 (CDF) carved + reviewed clean; Delta READ path COMPLETE
+- **A.5 carved** onto `pr/delta-A4b-scala-exec` → branch `pr/delta-A5-cdf` @ **`b94530bb2`**, fork
+  review draft **#9**. 6 files +595/-5. Survey-mapped re-add of the CDF pieces deferred across earlier
+  units. NEW CometDeltaCdfScanExec (carries my Nx-dup CometScanWithPlanData fix); serde convertCdf
+  re-added; DeltaIntegration CDF members re-added BEFORE the cached scanHandler; CometExecRule CDF arm
+  re-added after the marker hook. Touches 2 CORE files (CometExecRule, DeltaIntegration).
+- **Preserved the divergent fixes** (verified): DeltaIntegration cached scanHandler + ClassLoaders.
+  loadClass (2.12 fix) UNTOUCHED; serde did NOT re-gain ScanImpl/UTF8String/DateTimeUtils (survey
+  confirmed convertCdf doesn't use them — my A.4b removal was correct).
+- **§5 (all green):** gated JVM test-compile; **Scala-2.12 core compile** (spark-3.4, since the CDF
+  hunks are core); **6 CDF tests** (CometDeltaCdcSuite 3 incl. the orderBy red-green, CdfReflection 3);
+  spotless/scalastyle; check-suites; gate-verify (default 0 Delta symbols).
+- **Review (manual + /code-review high, 15 agents, 4 refuted / 1 reported):** made CometDeltaCdfScanExec
+  commonData/perPartitionData `@transient lazy val` (were defs from my Nx-dup fix; CDF subRanges fixed,
+  no DPP, so memoising is safe + matches sibling scans). Refuted: reflective-binding-cache "dup" (the
+  established pattern) + the dedicated CDF arm (correct).
+- **Delta READ path now COMPLETE** (V1 scans + CDF, end-to-end native, both Spark profiles).
+- **CI flaky-job re-runs still BLOCKED:** PR #4 (Spark4.1 [shuffle], proven flaky — passed on #5) and
+  PR #5 (rust-test) runs have been stuck queued on shared fork runners the whole session; gh won't
+  re-run a failed job mid-run. Re-run when they clear.
+- **Next action:** A.6a (test battery — remaining ~25 contrib suites + delta_contrib_test.yml full +
+  check-suites.py), A.6b (regression harness — dev/diffs + run-regression.sh [has my version-skew
+  fix] + delta_regression_test.yml), A.7 (docs), A.8 (perPartitionFilePaths/FAILED_READ_FILE follow-up
+  — includes re-adding the perPartitionFilePaths override I stripped from CometDeltaNativeScanExec in
+  A.4b). A.6a/A.6b are gated on all extraction PRs + the %-path fix per §8.
+
 ### 2026-06-21 (session 5f — Opus 4.8) — stack 2.12 fix; PR#2 fully fixed (gate + 2 DV/CDF bugs); A.4b carved + reviewed clean (END-TO-END NATIVE READS)
 - **Stack 2.12 fix:** the A.2-review `scanHandler` cache (`val handler = serdeCls.flatMap{...}`)
   didn't compile on Scala 2.12 (Spark 3.4) — existential `CometOperatorSerde[_]` needs an explicit
