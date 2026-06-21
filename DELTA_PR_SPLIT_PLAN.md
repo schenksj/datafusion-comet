@@ -548,6 +548,34 @@ Append-only. Newest entry at the top. Entry template:
 - Next action:
 ```
 
+### 2026-06-21 (session 5d — Opus 4.8) — A.3b carved + reviewed clean; Rust side complete
+- **A.3b carved** onto `pr/delta-A3a-rust-driver` → branch `pr/delta-A3b-rust-executor` @ **`38e2312c6`**,
+  fork review draft **#6**. 7 files +2530/-62. Completes the contrib native crate: verbatim executor
+  modules (planner.rs stub→real 561, kernel_scan.rs 1553, dv_reader.rs 388), lib.rs re-adds the
+  dv_reader/kernel_scan decls + DeltaScan/DeltaScanCommon proto re-exports (trimmed in 3a), Cargo.toml
+  re-adds executor deps. Kept A.3a improvements (crate version 0.18.0 not the monolith's stale 0.17.0;
+  clarified planner doc-link). Both lockfiles regenerated.
+- **§5 (all green):** gated native build, **89 in-crate unit tests** (54 driver + 35 executor), default
+  native build unchanged, clippy ×2 feature states, gate-verify script (contrib libcomet +13 MB),
+  cargo fmt. (Disk filled mid-run from the delta_kernel tree ×2 — cleaned the contrib standalone target
+  after the 89 tests passed; the gated build alone proves the later dep cleanup.)
+- **Carve invariants:** stub planner FULLY replaced (no NotImplemented left); A.3b touches ONLY
+  contrib/native + native lockfile (no core, no gate script, no JVM); unchanged shim links the real
+  4-arg planner.
+- **Review (manual + /code-review high, 29 agents, 1 refuted / 5 reported — all Cargo.toml, no
+  correctness bugs):** removed FOUR dead deps the monolith carried (verified unused by grep AND by the
+  gated rebuild compiling without them): `roaring` (also killed a duplicate 0.10.12 vs 0.11.4),
+  `datafusion-datasource`, direct `parquet` dep, datafusion `parquet` feature — all parquet I/O goes
+  through delta_kernel; the exec is DeltaKernelScanExec. Fixed a stale `dv_filter`→`dv_reader` comment.
+  These dead deps also exist in the monolith (byte-identical modules) → cleanup should flow back on
+  reconciliation.
+- **Rust side of the contrib is now COMPLETE** (A.3a driver + A.3b executor == the monolith's
+  contrib/native modulo the version + doc-link + dep cleanup).
+- **Next action:** carve **A.4a** (Scala claim/decline + reflection: DeltaReflection, DeltaScanMetadata,
+  CometDeltaScanMarker, RowTrackingAugmentedFileIndex, DeltaScanRule) onto `pr/delta-A3b-rust-executor`.
+  Needs only A.2 (parallel with A.3x), so it could also branch from A.2 — but stacking on A.3b keeps
+  one linear chain. Required edit: move `ScanImpl` constant into DeltaScanMetadata (§4 A.4a).
+
 ### 2026-06-20 (session 5c — Opus 4.8) — PR#2 smoke fixed (version skew); A.3a carved + reviewed clean
 - **PR #2 (monolith) smoke failures diagnosed + fixed:** the `Delta Lake Regression Tests /
   smoke/delta-*` jobs failed on the fresh head — NOT a code regression, a VERSION SKEW. The
