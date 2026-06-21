@@ -548,6 +548,33 @@ Append-only. Newest entry at the top. Entry template:
 - Next action:
 ```
 
+### 2026-06-21 (session 5e — Opus 4.8) — A.4a carved + reviewed clean; JVM claim/decline layer
+- **A.4a carved** onto `pr/delta-A3b-rust-executor` → branch `pr/delta-A4a-scala-claim` @ **`ae3ec8d24`**,
+  fork review draft **#7**. 8 files +2514. Survey agent mapped it. Verbatim main files (DeltaReflection,
+  DeltaScanRule, RowTrackingAugmentedFileIndex, CometDeltaScanMarker, DeltaScanMetadata) + the ONE
+  required edit (ScanImpl moved off CometDeltaNativeScan (4b) into `object DeltaScanMetadata`;
+  DeltaScanRule:306 re-pointed). Tests: trimmed CometDeltaTestBase (3 serde/exec helpers → 4b) + NEW
+  CometDeltaMarkerSuite. check-suites.py: exempt contrib suites.
+- **Inert by design:** DeltaScanRule plants CometDeltaScanMarker; no serde → CometExecRule.scanHandler
+  None → marker stays + executes vanilla. Delta reads run on vanilla Spark. No core/A.2 edits (A.2's
+  reflective wiring already reaches DeltaScanRule$ + the marker).
+- **§5 (all green):** gated JVM test-compile, **CometDeltaMarkerSuite 3/3** (marker planted = red on
+  A.2 / green here; fallback result-correct; input_file_name declines, no marker), check-suites,
+  spotless+scalastyle, gate-verify (default still 0 Delta symbols). Ran under spark-4.0/delta-4.0.0
+  (avoids the local 4.1.1 pin quirk); copied contrib libcomet into the test classpath.
+- **Carve invariants:** no deferred-class compile refs; A.4a touches ONLY contrib/delta/src +
+  check-suites.py.
+- **Review (manual + /code-review high, 25 agents, 6 refuted / 3 reported — ALL in the hand-authored
+  TEST code; verbatim modules clean):** fixed a CONFIRMED coverage gap (test 2 only compared rows,
+  never asserted the marker was planted → a claim regression would ship green; now asserts marker +
+  correctness), aligned the marker matcher to the production FQN (getName, not getSimpleName), removed
+  a dead+buggy non-AQE assertNativePlanContains helper.
+- **Next action:** carve **A.4b** (serde + exec — the red-to-green native-read unit): CometDeltaNativeScan
+  serde, Native.scala JNI decls, CometDeltaNativeScanExec, DeltaPlanDataInjector. Re-adds the native-read
+  test helpers (assertDeltaNativeMatches etc.) to CometDeltaTestBase; re-points its serde at
+  DeltaScanMetadata.ScanImpl (drop its own ScanImpl def). Needs A.3b + A.4a. Interim error semantics
+  (until A.8): exec/iterator must NOT reference #4536's taskFilePaths overloads.
+
 ### 2026-06-21 (session 5d — Opus 4.8) — A.3b carved + reviewed clean; Rust side complete
 - **A.3b carved** onto `pr/delta-A3a-rust-driver` → branch `pr/delta-A3b-rust-executor` @ **`38e2312c6`**,
   fork review draft **#6**. 7 files +2530/-62. Completes the contrib native crate: verbatim executor
