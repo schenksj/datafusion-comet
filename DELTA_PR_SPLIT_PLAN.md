@@ -548,6 +548,37 @@ Append-only. Newest entry at the top. Entry template:
 - Next action:
 ```
 
+### 2026-06-21 (session 5f — Opus 4.8) — stack 2.12 fix; PR#2 fully fixed (gate + 2 DV/CDF bugs); A.4b carved + reviewed clean (END-TO-END NATIVE READS)
+- **Stack 2.12 fix:** the A.2-review `scanHandler` cache (`val handler = serdeCls.flatMap{...}`)
+  didn't compile on Scala 2.12 (Spark 3.4) — existential `CometOperatorSerde[_]` needs an explicit
+  type annotation 2.13 infers. This is core (DeltaIntegration), so it broke EVERY stacked fork PR's
+  3.4 builds. Fixed (`val handler: Option[CometOperatorSerde[_]] = ...`), amended into A.2, cascade-
+  rebased A.3a/A.3b/A.4a, force-pushed all. New heads after rebase. (Memory: build -Pspark-3.4 too.)
+- **PR #2 (monolith) fully fixed:** (a) build-gate = the pipefail/SIGPIPE gate-script bug I fixed in
+  A.2, never backported -> backported (`69dfb05ff`); (b) DELETE-on-DV crash = empty Delta scan gave 0
+  partitions while outputPartitioning floors to 1 -> `taskGroups = Seq(Seq.empty)` (`b803010e0`,
+  CometDeltaNativeScanExec = A.4b file); (c) CDF orderBy Nx row dup = CometDeltaCdfScanExec wasn't
+  `CometScanWithPlanData` so the parent block's findAllPlanData skipped its sub-ranges -> implements
+  the trait (`47ac11144`, CometDeltaCdfScanExec = A.5 file). Both Delta fixes flow forward into A.4b/A.5.
+  (Spark-4.0-exec 403 was transient infra.) See [[project_delta_empty_scan_and_cdf_dup]].
+- **A.4b carved** onto `pr/delta-A4a-scala-claim` → branch `pr/delta-A4b-scala-exec` @ **`8d14cdb5e`**,
+  fork review draft **#8**. 11 files +3879/-59. Serde + native exec — END-TO-END native Delta reads.
+  Carved: serde dropped ScanImpl + convertCdf (A.5); exec stripped perPartitionFilePaths (A.8 interim
+  error semantics), kept the taskGroups fix + CometScanWithPlanData. Test base re-gained native helpers;
+  CometDeltaMarkerSuite rewritten (serde present -> claim engages native, not a leftover marker).
+- **§5 (all green):** gated JVM test-compile; **60 contrib tests** across 6 suites; spotless/scalastyle;
+  check-suites; gate-verify (default 0 Delta symbols). A.4b touches ONLY contrib/delta/src.
+- **Review (manual + /code-review high, 15 agents, 3 refuted / 2 reported):** fixed orphaned imports
+  (UTF8String/DateTimeUtils left after convertCdf removal -> breaks -Pstrict-warnings) + dead planData*
+  aliases (0 callers, pre-existing monolith dead code).
+- **PR #5 rust-test re-run:** BLOCKED — its CI run is stuck queued on shared fork runners; gh refuses
+  to re-run a failed job while the run is in progress. Re-run the moment it completes. (Default-build
+  job, unaffected by A.3a's excluded contrib crate -> transient.)
+- **Next action:** carve **A.5** (CDF): re-add convertCdf to the serde, CometDeltaCdfScanExec (already
+  carries the Nx-dup fix from PR#2 work), the CometExecRule CDF hook hunk (deferred from A.2), and
+  DeltaIntegration's CDF methods (deferred from A.4a). Tests: CometDeltaCdcSuite (has the orderBy
+  red-green), CometDeltaCdfReflectionReproSuite.
+
 ### 2026-06-21 (session 5e — Opus 4.8) — A.4a carved + reviewed clean; JVM claim/decline layer
 - **A.4a carved** onto `pr/delta-A3b-rust-executor` → branch `pr/delta-A4a-scala-claim` @ **`ae3ec8d24`**,
   fork review draft **#7**. 8 files +2514. Survey agent mapped it. Verbatim main files (DeltaReflection,
