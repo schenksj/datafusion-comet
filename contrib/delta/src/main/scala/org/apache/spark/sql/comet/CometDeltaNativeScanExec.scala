@@ -298,8 +298,15 @@ case class CometDeltaNativeScanExec(
   // tasks WITHIN groups, never changing the group count). `numPartitions` reads
   // this directly so counting partitions never triggers DPP broadcast
   // resolution.
+  //
+  // An empty scan (zero tasks -- e.g. a DELETE that matches nothing, or a DV-maintenance
+  // read pruned to zero files) still gets ONE empty group: `outputPartitioning` floors the
+  // partition count to `max(1, numPartitions)`, so the per-partition data MUST also have one
+  // (empty) entry or `NativeExecContext`'s "all per-partition arrays must have length
+  // numPartitions" check trips when this scan is fused into a parent native block.
+  // (Repro: CometDeltaDeleteWithDVReproSuite.)
   @transient private lazy val taskGroups: Seq[Seq[OperatorOuterClass.DeltaScanTask]] =
-    if (allTasks.isEmpty) Seq.empty else packTasks(allTasks)
+    if (allTasks.isEmpty) Seq(Seq.empty) else packTasks(allTasks)
 
   private def applyDppFilters(
       tasks: Seq[OperatorOuterClass.DeltaScanTask]): Seq[OperatorOuterClass.DeltaScanTask] = {
