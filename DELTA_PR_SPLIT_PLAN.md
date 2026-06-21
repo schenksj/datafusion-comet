@@ -544,6 +544,43 @@ Append-only. Newest entry at the top. Entry template:
 - Next action:
 ```
 
+### 2026-06-20 (session 5 — Opus 4.8) — maintainers OK'd the plan; #4366 re-synced; A.1 refreshed onto current main + review round 2 clean
+- **Phase/unit:** A.1 (Core SPI) refreshed onto post-#4535 main, re-reviewed clean. Maintainers
+  comfortable with the split plan — execution greenlit. A.1 still fork-local (PR #3); upstream open
+  pending the user's go.
+- **Upstream events:** dependent PRs **#4524, #4533, #4535, #4536 all merged** to `apache/main`
+  (now `9c69f30b0`). #4366 went CONFLICTING; resolved (see below).
+- **#4366 main-sync** (branch `contrib-delta-direct` / `feat/delta-kernel-read`, merge `9f29732a8`):
+  3 textual + 1 semantic conflict resolved. unsafe_object.rs → main's corrected comment;
+  CometNativeScanExec → keep `override def perPartitionFilePaths` (trait declares it in the
+  monolith); CometArrayExpressionSuite → main's #4533 tests. **Semantic:** auto-merge DUPLICATED
+  `injectorsByKind` (delta's reflective `injectors` val + #4535's O(1) lookup) — removed the dup.
+  Contrib-enabled `test-compile` BUILD SUCCESS. Pushed FF; #4366 → MERGEABLE. (Confirmed
+  merged `arrays.scala` carries ONLY #4533's refined CreateArray decline — the old
+  "contrib over-declines, backport #4533" note is now RESOLVED.)
+- **A.1 refresh:** clean `git rebase upstream/main` of `aa0fd12c5`. The reflective-`injectors`-val
+  hunk replayed on top of #4535's untouched `injectorsByKind` with **no duplication** — result ==
+  the monolith's reconciled state. Diff shape unchanged (6 files). Fork `main` FF'd to `9c69f30b0`
+  (clean PR base).
+- **§5 (all green):** default `test-compile` SUCCESS; `CometScanWithPlanDataSuite` 2/2;
+  `CometJoinSuite` 28/28 (fresh default debug libcomet copied to `spark/target/classes/.../darwin/
+  aarch64`); spotless+scalastyle 0 errors; `check-suites.py` (py3.13!) exit 0. `CometLeafExec`
+  verified to have EXACTLY the 3 removed subclasses ⇒ `case _: CometLeafExec` is a provable strict
+  superset.
+- **Review round 2:** `/review-comet-pr` (manual) + `/code-review high` (31-agent workflow: 8
+  refuted, 6 survived). 2 fixes folded into A.1 commit: (a) reflective catch ladder now warns on
+  `NoSuchField`/`IllegalAccess` (misbuild diagnosable; only `ClassNotFound` stays silent); (b)
+  dropped the test's passthrough assertion that duplicated `PlanDataInjectorSuite` (+ removed unused
+  `Operator` import). 4 PLAUSIBLE correctness findings are **inert on default builds AND on the real
+  Delta scan** (verified vs monolith: `DeltaPlanDataInjector.opStructCase=DELTA_SCAN` distinct;
+  `CometDeltaNativeScanExec extends CometLeafExec`) → documented as A.4b forward-notes in
+  `.delta-split/review-log-A1.md`.
+- **Commits:** A.1 == `feat/delta-split` == `pr/delta-A1-spi` @ **`fc48c0cfe`** (force-pushed).
+  #4366 head `9f29732a8`. Local+fork `main` @ `9c69f30b0`.
+- **Next action:** carve **A.2** (build gate + inert wiring) onto `feat/delta-split` — proto
+  `delta_scan = 118`, NO 4.1.1 pin in default pom (§10.1), stub contrib crate. Open A.1 upstream
+  whenever the user calls it.
+
 ### 2026-06-13 (session 4 — Opus 4.8) — Phase 1 Unit A.1 carved + fork draft PR + review loop
 - **Phase/unit:** A.1 (Core SPI) carved, verified, fork draft PR open. First split unit done locally.
 - **Branches:** `feat/delta-split` (from `upstream/main` 0031c60d6) == `pr/delta-A1-spi` @ **`aa0fd12c5`**.
