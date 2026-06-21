@@ -345,6 +345,12 @@ Once **all** units pass §5 + §6:
 - Conflict policy with extraction PRs: whichever of {A.1 vs #4535}, {A.2 vs #4525} lands second
   takes the (small) conflict. If an extraction merges mid-sequence, fold its hunks back into the
   affected unit branches at the next rebase.
+- **`%`-path fix — RESOLVED 2026-06-21 (session 5h): DROPPED.** During the A.6a carve, ran
+  `CometDeltaPercentFileNameReproSuite` + `CometDeltaSpecialCharFilenameSuite` WITHOUT the
+  `object_store_path_from_url` production change (it was never in the monolith — only in
+  `fix/local-path-special-chars`): 7 succeeded / 0 failed. Confirmed no-op → change dropped entirely,
+  A.6a carries no production change, `fix/local-path-special-chars` retired. (Original deferral note kept
+  below for history.)
 - **`%`-path fix — DEFERRED, do not open as a standalone PR** (decision 2026-06-10). Verified
   red/green on current `main`: the core `ParquetReadV1Suite` test passes **identically with and
   without** the production change (`object_store` 0.13.2's `Path::from_url_path` already round-trips
@@ -573,6 +579,40 @@ Append-only. Newest entry at the top. Entry template:
   fix] + delta_regression_test.yml), A.7 (docs), A.8 (perPartitionFilePaths/FAILED_READ_FILE follow-up
   — includes re-adding the perPartitionFilePaths override I stripped from CometDeltaNativeScanExec in
   A.4b). A.6a/A.6b are gated on all extraction PRs + the %-path fix per §8.
+
+### 2026-06-21 (session 5h — Opus 4.8) — A.6a (test battery + CI workflow) carved + reviewed clean; %-path DROPPED
+- **A.6a carved** onto `pr/delta-A5-cdf` → branch `pr/delta-A6a-test-battery` @ **`9a1ef06fc`**, fork
+  review draft **#10**. 26 files +3677/-98. Test-only — NO production or native code.
+  - 23 contrib suites copied **byte-identical** from `feat/delta-kernel-read` (22 under
+    `org.apache.comet.contrib.delta` + `CometDeltaCheckpointFilterReproSuite` under
+    `org.apache.spark.sql.delta`); `delta_contrib_test.yml` added; `check-suites.py` refined
+    (byte-identical to monolith); standalone `delta_build_gate.yml` DELETED (subsumed by the full
+    workflow's byte-identical gate job → converges to monolith end-state).
+  - My superset `CometDeltaTestBase` (A.4b) already covers all 23 incoming suites; no A.8 dep (the
+    `FAILED_READ_FILE` refs are comments; EdgeCase suite asserts version-stable wording).
+- **%-path (§8) DECISION: DROPPED.** Ran `CometDeltaPercentFileNameReproSuite` +
+  `CometDeltaSpecialCharFilenameSuite` WITHOUT the `object_store_path_from_url` change (which lives only
+  in `fix/local-path-special-chars`, NOT the monolith): 7 succeeded / 0 failed → confirmed no-op on
+  current main → change dropped entirely. A.6a carries no production change. `fix/local-path-special-chars`
+  retired. (Updated §8 below.)
+- **§5 (all green):** gated test-compile (all 31 suites); **full battery 157 succeeded / 0 failed / 1
+  version-gated cancel across 33 suites** (Spark 4.1 + Delta 4.1.0, `-Dspark.version=4.1.1`);
+  spotless/scalastyle; check-suites exit 0; gate-verify all pass (default 0 Delta symbols). No 2.12 core
+  compile needed (zero core Scala changes).
+- **Review (/code-review high, 35 agents, 20 findings → ~9 root causes, ALL on the new workflow — nothing
+  in the carved suites or check-suites).** Fixed 5 in `delta_contrib_test.yml`: (1) wired
+  `-Dspark.version=${{ matrix.spark-version.full }}` (4.1 cell was CI-red — `-Pspark-4.1` pulls 4.1.2 which
+  dropped IgnoreCachedData; pom stays 4.1.2, CI-only pin per §10.1); (2) corrected Spark-3.5 label
+  `2.13`→`2.12` (its real binary version + the only 2.12 coverage cell; did NOT force `-Pscala-2.13` —
+  would downgrade 4.1's Scala .17→.16); (3) made `full` load-bearing, 4.0 full 4.0.1→4.0.2 (proven
+  default); (4) cached `contrib/delta/native/target`; (5) silent-green guard (≥25 surefire reports).
+  Plus "both cells"→"all three" comments.
+  **A.6a's workflow now INTENTIONALLY diverges from the monolith — these 5 fixes are real monolith bugs;
+  BACKPORT to #4366 (like the gate-script fix).**
+- **Next action:** A.6b (regression harness — `dev/diffs/*.diff`, `run-regression.sh` [has version-skew
+  fix], `run-test.sh`, `delta_regression_test.yml`; §10.1 CI-only 4.1.1 pin lives here too), then A.7
+  (docs), A.8 (perPartitionFilePaths / FAILED_READ_FILE follow-up). Also: backport the 5 A.6a workflow
+  fixes to #4366.
 
 ### 2026-06-21 (session 5f — Opus 4.8) — stack 2.12 fix; PR#2 fully fixed (gate + 2 DV/CDF bugs); A.4b carved + reviewed clean (END-TO-END NATIVE READS)
 - **Stack 2.12 fix:** the A.2-review `scanHandler` cache (`val handler = serdeCls.flatMap{...}`)
