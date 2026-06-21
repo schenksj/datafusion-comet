@@ -220,6 +220,10 @@ Two file classes:
 **A.5 — CDF**
 - `CometDeltaCdfScanExec.scala`, the `CometExecRule` CDF hook hunk (deferred from A.2),
   CDF wiring in the contrib (the Rust `TableChanges` path already landed in A.3x).
+- **Also deferred from A.2 (review round 2):** `DeltaIntegration`'s CDF members
+  (`isCdfRelation`, `transformCdf`, `convertCdfBinding` + its cache, and the
+  `RowDataSourceScanExec` import) — A.2 stripped them as dead code (no caller until the CDF
+  hook lands). Re-add them here alongside the CometExecRule CDF arm.
 - Tests: `CometDeltaCdcSuite`, `CometDeltaCdfReflectionReproSuite`.
 
 **A.6a — Test battery** *(gated on all extraction PRs + %-path fix being merged)*
@@ -543,6 +547,31 @@ Append-only. Newest entry at the top. Entry template:
 - Pending decisions or upstream events (PR merges, review feedback):
 - Next action:
 ```
+
+### 2026-06-20 (session 5b — Opus 4.8) — A.1 opened upstream (#4700); A.2 carved + reviewed clean
+- **A.1:** opened upstream as **#4700** (with AI-disclosure footer; new standing rule: every PR body
+  ends with it). Apache CI is `action_required` (awaiting a maintainer to approve workflow runs for a
+  non-committer PR — NOT a failure). Fork review-draft #3 closed as superseded.
+- **Loose end fixed:** fork PR #2 (monolith, `feat/delta-kernel-read`) was stranded on the pre-main-sync
+  commit `f442361c3` (I'd pushed the merge to `contrib-delta-direct`/#4366 but not `feat/delta-kernel-read`).
+  Pushed `9f29732a8` (FF) → #2 MERGEABLE again. Its stale `delta-contrib/*` CI failures were from the old
+  commit; A.1/#4700 is unaffected (zero Delta surface).
+- **A.2 carved** onto `pr/delta-A1-spi` → branch `pr/delta-A2-buildgate` @ **`f2ad00c29`**, fork review
+  draft **#4** (base = A.1 branch, A.2-only diff). 20 files +4020/-14. An Explore agent produced the
+  precise carve map (whole-checkout vs partial-carve vs stub vs copy); see `.delta-split/review-log-A2.md`.
+  Proto `delta_scan = 118`. Stub contrib crate authored (real impl deferred). pom.xml carries
+  `delta.version` only (NO 4.1.1 pin, §10.1). CometExecRule = marker hook only (CDF → A.5).
+- **§5 (all green):** default + gated native build, clippy ×2 feature states, gate-verify script (all
+  layers), gated + default JVM compile, spotless/scalastyle (both profiles), cargo fmt.
+- **Review round (manual + /code-review high, 28 agents, 9 refuted / 6 survived) — 5 fixed, 2 accepted:**
+  fixed a VACUOUS cargo-tree gate check (no anti-vacuous guard → false pass on cargo failure), a
+  pipefail+`grep -q` SIGPIPE misfire in the gate script (→ here-strings), dead CDF block in
+  DeltaIntegration (→ stripped to A.5, see A.5 note), scanHandler per-call MODULE$ re-resolve
+  (→ @volatile cache), raw Class.forName (→ ClassLoaders.loadClass). Accepted+documented: a Spark-3.4
+  diagnostic-only fallback-reason string change (rare metadata-col + AQE overlap, matches monolith) and
+  DeltaConf's unread-in-A.2 config entries (the contrib's config leaf).
+- **Next action:** carve **A.3a** (Rust driver side: error/engine/predicate/scan/jni) onto
+  `pr/delta-A2-buildgate`, OR wait for #4700 review. Open A.2 upstream once A.1 is approved/merged (§8).
 
 ### 2026-06-20 (session 5 — Opus 4.8) — maintainers OK'd the plan; #4366 re-synced; A.1 refreshed onto current main + review round 2 clean
 - **Phase/unit:** A.1 (Core SPI) refreshed onto post-#4535 main, re-reviewed clean. Maintainers
