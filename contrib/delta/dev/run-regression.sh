@@ -190,6 +190,25 @@ echo
 echo "[3/4] Applying diff $DIFF_FILE..."
 git apply "$DIFF_FILE"
 
+# Keep the diff's injected `val cometVersion = "..."` in lockstep with THIS checkout's
+# actual project version. The diffs carry a hardcoded fallback, but a repo version bump
+# (0.17 -> 0.18 -> ...) would otherwise leave it stale and the smoke jobs would fail at
+# dependency resolution ("not found: comet-spark-...-<old>-SNAPSHOT.pom"). Derive the
+# version from the comet pom -- the project version is the only `-SNAPSHOT` there (the
+# apache parent is a plain number) -- and overwrite the line the diff just injected.
+# grep -oE prints just the version token (no tags); `sed -n '1p'` takes the first and reads to
+# EOF (NOT `head -1`, which would close the pipe early -> grep SIGPIPE -> `set -o pipefail` aborts).
+COMET_VERSION="$(grep -oE '[0-9][0-9.]*-SNAPSHOT' "$COMET_ROOT/pom.xml" | sed -n '1p')"
+if [[ -n "$COMET_VERSION" ]]; then
+  echo "  Pinning cometVersion -> $COMET_VERSION (derived from comet pom)"
+  # sed -i.bak for GNU/BSD portability; build.sbt is at the Delta repo root (cwd here).
+  sed -i.bak -E "s/(val cometVersion = )\"[^\"]*\"/\1\"$COMET_VERSION\"/" build.sbt
+  rm -f build.sbt.bak
+else
+  echo "  WARNING: could not derive comet version from $COMET_ROOT/pom.xml;" \
+    "using the diff's hardcoded cometVersion"
+fi
+
 # Step 4: run tests.
 echo
 echo "[4/4] Running tests..."
