@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Runs the contrib-delta Scala test suite on both supported (Spark, Delta)
+# Runs the contrib-delta Scala test suite on all three supported (Spark, Delta)
 # version pairs PLUS the build-gate verification script that proves default
 # builds carry zero Delta surface. Modeled on iceberg_spark_test.yml.
 #
@@ -25,8 +25,9 @@
 #   2. delta-contrib-scala    -- matrix over (Spark 3.5 + Delta 3.3.2),
 #                                (Spark 4.0 + Delta 4.0.0) and
 #                                (Spark 4.1 + Delta 4.1.0), downloads the
-#                                native lib, runs all 25 contrib Scala
-#                                suites per matrix cell.
+#                                native lib, runs every contrib Scala
+#                                suite (matched by package prefix) per
+#                                matrix cell.
 #   3. delta-build-gate       -- cheap independent job; runs
 #                                dev/verify-contrib-delta-gate.sh which
 #                                proves default cargo / mvn / dylib carry
@@ -76,7 +77,7 @@ env:
   RUSTFLAGS: "-Clink-arg=-fuse-ld=bfd"
 
 jobs:
-  # Build libcomet ONCE with the contrib-delta feature and share with both
+  # Build libcomet ONCE with the contrib-delta feature and share with all
   # matrix cells via an artifact upload/download. Mirrors iceberg_spark_test.yml.
   build-native:
     name: Build Native Library (contrib-delta)
@@ -99,6 +100,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             native/target
+            contrib/delta/native/target
           key: ${{ runner.os }}-cargo-ci-contrib-delta-${{ hashFiles('native/**/Cargo.lock', 'native/**/Cargo.toml', 'contrib/delta/native/**/Cargo.toml') }}-${{ hashFiles('native/**/*.rs', 'contrib/delta/native/**/*.rs') }}
           restore-keys: |
             ${{ runner.os }}-cargo-ci-contrib-delta-${{ hashFiles('native/**/Cargo.lock', 'native/**/Cargo.toml', 'contrib/delta/native/**/Cargo.toml') }}-
@@ -127,6 +129,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             native/target
+            contrib/delta/native/target
           key: ${{ runner.os }}-cargo-ci-contrib-delta-${{ hashFiles('native/**/Cargo.lock', 'native/**/Cargo.toml', 'contrib/delta/native/**/Cargo.toml') }}-${{ hashFiles('native/**/*.rs', 'contrib/delta/native/**/*.rs') }}
 
       - name: Upload native library
@@ -136,19 +139,30 @@ jobs:
           path: native/target/ci/libcomet.so
           retention-days: 1
 
-  # Run all 25 contrib Scala suites across every (Spark, Delta) version
-  # pair. The matrix asserts feature parity: the same suites must pass on
+  # Run every contrib Scala suite (matched by package prefix) across every
+  # (Spark, Delta) version pair. The matrix asserts feature parity: the same
+  # suites must pass on
   # Spark 3.5 + Delta 3.3.2, Spark 4.0 + Delta 4.0.0 AND Spark 4.1 + Delta 4.1.0.
   delta-contrib-scala:
     needs: build-native
     strategy:
+      # `spark-version.full` is load-bearing: it is passed as -Dspark.version below to
+      # pin the EXACT patch release per cell (the -Pspark-X profile alone would pull its
+      # own default -- e.g. spark-4.1 pins 4.1.2, which dropped IgnoreCachedData and breaks
+      # delta-spark 4.1.0; the contrib needs 4.1.1). `scala-version` is documentation: the
+      # -Pspark-X profile fixes the Scala binary version (spark-3.5 => 2.12, spark-4.x =>
+      # 2.13), so the 3.5 cell is intentionally the project's only Scala 2.12 coverage --
+      # it guards 2.12-specific breakage (e.g. existential-type inference in the core
+      # DeltaIntegration bridge that 2.13 accepts but 2.12 rejects). `delta-version` is a
+      # display label; the actual delta-spark version is pinned by the contrib-delta profile
+      # keyed off the Spark profile (verified by dev/verify-contrib-delta-gate.sh).
       matrix:
         include:
           - spark-version: { short: '3.5', full: '3.5.8' }
             delta-version: '3.3.2'
-            scala-version: '2.13'
+            scala-version: '2.12'
             java-version: 17
-          - spark-version: { short: '4.0', full: '4.0.1' }
+          - spark-version: { short: '4.0', full: '4.0.2' }
             delta-version: '4.0.0'
             scala-version: '2.13'
             java-version: 17
@@ -190,10 +204,26 @@ jobs:
           ./mvnw -Pspark-${{ matrix.spark-version.short }},contrib-delta \
             -pl spark -am test \
             -DwildcardSuites='org.apache.comet.contrib.delta,org.apache.spark.sql.delta.CometDeltaCheckpointFilterReproSuite' \
+            -Dspark.version=${{ matrix.spark-version.full }} \
             -Djava.version=${{ matrix.java-version }} \
             -Dmaven.compiler.source=${{ matrix.java-version }} \
             -Dmaven.compiler.target=${{ matrix.java-version }} \
             -Dmaven.gitcommitid.skip
+
+      - name: Assert contrib suites actually ran
+        # scalatest-maven-plugin treats a zero-match wildcardSuites as success (runs
+        # nothing, reports green). If the contrib test sources ever fail to register
+        # (profile slip, package rename, classpath gap) the matrix would pass having
+        # executed ZERO Delta tests. Guard against that silent-green hole by asserting a
+        # floor on the per-suite surefire reports actually produced.
+        run: |
+          count=$(find spark/target/surefire-reports -name 'TEST-*CometDelta*.xml' 2>/dev/null | wc -l | tr -d ' ')
+          echo "Contrib delta suites executed: $count"
+          if [ "$count" -lt 25 ]; then
+            echo "ERROR: expected at least 25 contrib-delta suites to run, but only $count produced surefire reports."
+            echo "wildcardSuites likely matched too few suites (silent-green hole). Failing the job."
+            exit 1
+          fi
 
       - name: Upload surefire reports on failure
         if: failure()

@@ -47,13 +47,12 @@ TEST_FILTER="${2:-smoke}"
 
 # Map Delta version -> Spark short version -> SBT module
 case "$DELTA_VERSION" in
-  2.4.0) SPARK_SHORT="3.4"; SBT_MODULE="core" ;;
   3.3.2) SPARK_SHORT="3.5"; SBT_MODULE="spark" ;;
   4.0.0) SPARK_SHORT="4.0"; SBT_MODULE="spark" ;;
   4.1.0) SPARK_SHORT="4.1"; SBT_MODULE="spark" ;;
   *)
     echo "Error: unsupported Delta version '$DELTA_VERSION'"
-    echo "Supported: 2.4.0 (Spark 3.4), 3.3.2 (Spark 3.5), 4.0.0 (Spark 4.0), 4.1.0 (Spark 4.1)"
+    echo "Supported: 3.3.2 (Spark 3.5), 4.0.0 (Spark 4.0), 4.1.0 (Spark 4.1)"
     exit 1
     ;;
 esac
@@ -140,6 +139,12 @@ fi
 # the diff applies into the Delta checkout. macOS's $TMPDIR is per-user under
 # /var/folders/..., so substituting it here would diverge from the diff's
 # literal path.
+#
+# NOTE: the default is COUPLED to the diff's hardcoded `local-comet` repository path.
+# Overriding COMET_PUBLISH_DIR will publish Comet there but leave SBT resolving the
+# default /tmp/comet-published-${SPARK_SHORT} from the diff, so dependency resolution
+# fails ("not found: comet-spark-..."). Override only if you also patch the diff's
+# repositories file to match.
 COMET_PUBLISH_DIR="${COMET_PUBLISH_DIR:-/tmp/comet-published-${SPARK_SHORT}}"
 echo
 echo "[1.5/4] Syncing Comet artifacts to $COMET_PUBLISH_DIR..."
@@ -173,7 +178,17 @@ if [[ -d "$DELTA_WORKDIR" ]] \
   echo "  Reusing existing checkout at $DELTA_WORKDIR"
   cd "$DELTA_WORKDIR"
   git fetch --depth 1 origin "refs/tags/v$DELTA_VERSION:refs/tags/v$DELTA_VERSION" 2>/dev/null || true
-  git checkout -f "v$DELTA_VERSION"
+  # The fetch above is best-effort (`|| true`): a reused workdir may have been left by a
+  # run for a DIFFERENT Delta version, and the fetch can also fail offline. If the tag
+  # isn't present, `git checkout` would hard-abort under `set -e`; fall back to a clean
+  # re-clone instead so switching versions (or a half-fetched workdir) self-heals.
+  if ! git checkout -f "v$DELTA_VERSION" 2>/dev/null; then
+    echo "  Tag v$DELTA_VERSION not in reused checkout; removing and re-cloning."
+    cd "$COMET_ROOT"
+    rm -rf "$DELTA_WORKDIR"
+    git clone --depth 1 --branch "v$DELTA_VERSION" https://github.com/delta-io/delta.git "$DELTA_WORKDIR"
+    cd "$DELTA_WORKDIR"
+  fi
   git clean -fd
   rm -rf spark/spark-warehouse
 else
@@ -198,7 +213,11 @@ git apply "$DIFF_FILE"
 # apache parent is a plain number) -- and overwrite the line the diff just injected.
 # grep -oE prints just the version token (no tags); `sed -n '1p'` takes the first and reads to
 # EOF (NOT `head -1`, which would close the pipe early -> grep SIGPIPE -> `set -o pipefail` aborts).
-COMET_VERSION="$(grep -oE '[0-9][0-9.]*-SNAPSHOT' "$COMET_ROOT/pom.xml" | sed -n '1p')"
+# Trailing `|| true`: if the regex ever stops matching (release build without `-SNAPSHOT`, pom
+# restructure), grep exits 1 and `pipefail` would abort the whole run at the assignment under
+# `set -e` -- making the WARNING+fallback else-branch below unreachable. `|| true` lets the
+# substitution yield empty so the documented fallback actually runs.
+COMET_VERSION="$(grep -oE '[0-9][0-9.]*-SNAPSHOT' "$COMET_ROOT/pom.xml" | sed -n '1p' || true)"
 if [[ -n "$COMET_VERSION" ]]; then
   echo "  Pinning cometVersion -> $COMET_VERSION (derived from comet pom)"
   # sed -i.bak for GNU/BSD portability; build.sbt is at the Delta repo root (cwd here).

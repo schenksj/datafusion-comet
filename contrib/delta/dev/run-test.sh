@@ -29,7 +29,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 DELTA_VERSION="${DELTA_VERSION:-4.1.0}"
 DELTA_DIR="${DELTA_DIR:-${DELTA_WORKDIR:-${TMPDIR:-/tmp}/delta-regression-${DELTA_VERSION}}}"
-export JAVA_HOME="${JAVA_HOME:-$HOME/jdks/jdk-17.0.18+8/Contents/Home}"
+# Honour an existing JAVA_HOME; otherwise try the macOS java_home helper for a JDK >=17
+# (Delta 4.x needs Java 17 for java.lang.Record). Do NOT hardcode a developer-specific
+# path -- if nothing is found, leave JAVA_HOME unset and let sbt use `java` on PATH.
+if [[ -z "${JAVA_HOME:-}" ]]; then
+  JAVA_HOME="$(/usr/libexec/java_home -v 17 2>/dev/null || true)"
+  [[ -n "$JAVA_HOME" ]] && export JAVA_HOME || unset JAVA_HOME
+fi
 export SPARK_LOCAL_IP=127.0.0.1
 export RUST_BACKTRACE=1
 

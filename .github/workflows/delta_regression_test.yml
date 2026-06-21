@@ -46,15 +46,22 @@ on:
       - "native/spark-expr/benches/**"
       - "spark/src/test/scala/org/apache/spark/sql/benchmark/**"
   pull_request:
-    paths-ignore:
-      - "benchmarks/**"
-      - "doc/**"
-      - "docs/**"
-      - "**.md"
-      - "dev/changelog/*.md"
-      - "native/core/benches/**"
-      - "native/spark-expr/benches/**"
-      - "spark/src/test/scala/org/apache/spark/sql/benchmark/**"
+    # This workflow is expensive (full contrib native build + a Delta clone + smoke run per
+    # cell), so on PRs scope it to paths that can actually affect Comet-on-Delta behaviour:
+    # the contrib itself, the native engine, the core SPI / rule wiring the contrib hooks
+    # into, the serde, and the build poms / harness. PRs that touch only an unrelated
+    # expression, shuffle, docs, etc. skip it. (push-to-main keeps the broader paths-ignore
+    # above so the post-merge full sweep is not under-triggered. Final CI cadence is a
+    # maintainer decision -- see the split plan's CI-cost section.)
+    paths:
+      - "contrib/delta/**"
+      - "native/**"
+      - "spark/src/main/scala/org/apache/comet/rules/**"
+      - "spark/src/main/scala/org/apache/comet/serde/**"
+      - "spark/src/main/scala/org/apache/spark/sql/comet/operators.scala"
+      - ".github/workflows/delta_regression_test.yml"
+      - "pom.xml"
+      - "spark/pom.xml"
   workflow_dispatch:
 
 permissions:
@@ -166,7 +173,12 @@ jobs:
           path: target/delta-regression-logs/
           retention-days: 5
 
-  # Full Delta suite under Comet. Gated on the matching smoke cell.
+  # Full Delta suite under Comet. `needs: delta-smoke` gates on the WHOLE smoke job (all
+  # cells must pass) -- GitHub Actions `needs` is job-level, not per matrix cell. Only runs
+  # on push-to-main and manual dispatch, never on pull_request: the full/lite sweeps take
+  # hours (3.3.2 `full` would be ~29h), so PRs get the fast smoke job as the blocking signal
+  # and the full sweep runs post-merge. (CI cadence -- per-PR vs schedule vs merge -- is a
+  # maintainer decision flagged in the split plan's CI-cost section.)
   delta-full:
     needs: delta-smoke
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
