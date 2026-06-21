@@ -379,6 +379,16 @@ Merge-order summary: A.1 → A.2 → {A.3a → A.3b ∥ A.4a} → A.4b → A.5 �
    fold the refinement into A.6a's rebase.
 4. Run the full Delta own-suite regression on `main` (gated build) for 3.5/4.0/4.1; record
    results on #4366; close #4366.
+   - **#4366 branch sync (DEFERRED here from session 5i):** #4366's head is branch
+     `contrib-delta-direct` (`9f29732a8`), which is **6 commits behind** the working monolith
+     `feat/delta-kernel-read` (= fork PR #2, now `503c4194c`). The gap = the 5 session-5f fixes
+     (CDF N-fold dup `47ac11144`, empty-scan partition `b803010e0`, gate pipefail `69dfb05ff`,
+     cometVersion auto-derive `940fea62f`, cometVersion bump `48a84f08d`) + the session-5i CI/harness
+     backport (`503c4194c`). Deferred because #4366 is the tracking umbrella being REPLACED by the
+     split sub-PRs (all these fixes already live in A.4b/A.5/A.6a/A.6b) — no need to churn an
+     outward-facing apache PR that's slated for closure. At reconciliation: either fast-forward
+     `contrib-delta-direct` to `feat/delta-kernel-read` then close, or just close #4366 in favour of
+     the split PRs. Decide with the user.
 5. Delete `feat/delta-split` and the `pr/delta-*` branches; keep `ref/delta-complete` + tag
    permanently (or until a release contains the full feature).
 
@@ -608,10 +618,18 @@ Append-only. Newest entry at the top. Entry template:
   tradeoff — 29h can't run per-PR; §10.4 maintainer call).
   **The 3 edited files now INTENTIONALLY diverge from the monolith (real monolith bugs) → BACKPORT to #4366,
   alongside the 5 A.6a workflow fixes.**
+- **Backport (session 5i, post-A.6b):** landed the 12 CI/harness fixes (A.6a 5 + A.6b 7) onto the working
+  monolith `feat/delta-kernel-read` as `503c4194c` ("test(contrib-delta): harden Delta CI workflows +
+  regression harness"); pushed to the FORK (updates fork PR #2, NOT apache). Diff = exactly the 12 fixes
+  (4 files: delta_contrib_test.yml, delta_regression_test.yml, run-regression.sh, run-test.sh); validated
+  bash -n + YAML. **Discovered #4366's branch ≠ the working monolith:** #4366 head = `contrib-delta-direct`
+  (`9f29732a8`), 6 commits behind `feat/delta-kernel-read`. **DEFERRED the #4366 sync to end-of-cycle §9.4**
+  (it's the tracking umbrella being replaced; all fixes already in A.4b/A.5/A.6a/A.6b — no point churning an
+  outward-facing apache PR slated for closure). #4366 left untouched.
 - **Next action:** A.7 (docs — `contrib/delta/docs/*.md` 12-13 files + `docs/source/user-guide/latest/
   {delta.md,datasources.md,index.rst}`; audit refs against what actually landed, paths/configs may have
   drifted), then A.8 (perPartitionFilePaths / FAILED_READ_FILE follow-up, gated on #4536). Also pending:
-  backport the A.6a (5) + A.6b (7) CI/harness fixes to #4366; the flaky CI re-runs on #4/#5.
+  #4366 reconciliation/close at end-of-cycle (§9.4); the flaky CI re-runs on #4/#5.
 
 ### 2026-06-21 (session 5h — Opus 4.8) — A.6a (test battery + CI workflow) carved + reviewed clean; %-path DROPPED
 - **A.6a carved** onto `pr/delta-A5-cdf` → branch `pr/delta-A6a-test-battery` @ **`9a1ef06fc`**, fork
