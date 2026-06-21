@@ -57,7 +57,8 @@ case class CometDeltaCdfScanExec(
     @transient originalPlan: SparkPlan,
     tableRoot: String,
     subRanges: Seq[(Long, Option[Long])])
-    extends CometLeafExec {
+    extends CometLeafExec
+    with CometScanWithPlanData {
 
   override def outputPartitioning: Partitioning = UnknownPartitioning(subRanges.length)
 
@@ -70,25 +71,35 @@ case class CometDeltaCdfScanExec(
     Map("output_rows" -> outputRowsMetric, "numOutputRows" -> outputRowsMetric)
   }
 
-  private def sourceKey: String = CometDeltaNativeScanExec.computeSourceKey(nativeOp)
+  override def sourceKey: String = CometDeltaNativeScanExec.computeSourceKey(nativeOp)
+
+  // The shared `DeltaScanCommon` (cdf_read + full version range + required schema). Exposed via the
+  // `CometScanWithPlanData` trait so that when this scan is fused under a PARENT native block (e.g. a
+  // CDC read with an `orderBy`, which makes the plan AQE-wrapped), the parent's `findAllPlanData`
+  // collects it and `DeltaPlanDataInjector` splices each partition's sub-range over it -- the same
+  // injection `doExecuteColumnar` drives standalone. Without the trait the parent skipped this scan,
+  // every partition read the FULL feed, and CDC rows were duplicated N-fold (one copy per partition).
+  override def commonData: Array[Byte] = nativeOp.getDeltaScan.getCommon.toByteArray
+
+  // One minimal `DeltaScan` per partition carrying only that partition's inclusive cdf sub-range
+  // (cdf_read marks it). No per-file tasks -- the native side reconstructs `TableChanges` from the
+  // spliced range.
+  override def perPartitionData: Array[Array[Byte]] = subRanges.map { case (start, end) =>
+    val pc = OperatorOuterClass.DeltaScanCommon.newBuilder()
+    pc.setCdfRead(true)
+    pc.setCdfStartVersion(start)
+    end.foreach(pc.setCdfEndVersion)
+    val b = OperatorOuterClass.DeltaScan.newBuilder().setCommon(pc.build())
+    if (tableRoot != null && tableRoot.nonEmpty) b.setTableRoot(tableRoot)
+    b.build().toByteArray
+  }.toArray
 
   override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val nativeMetrics = CometMetricNode.fromCometPlan(this)
     val serializedPlan = CometExec.serializeNativePlan(nativeOp)
-    // The DeltaScanCommon (carrying cdf_read + full version range + required schema) is shared; each
-    // per-partition DeltaScan carries only this partition's inclusive cdf sub-range in a minimal
-    // common (cdf_read marks it), which DeltaPlanDataInjector splices over the shared range. No
-    // per-file tasks -- the native side reconstructs TableChanges from the (overridden) range.
-    val commonData = nativeOp.getDeltaScan.getCommon.toByteArray
-    val perPartition: Array[Array[Byte]] = subRanges.map { case (start, end) =>
-      val pc = OperatorOuterClass.DeltaScanCommon.newBuilder()
-      pc.setCdfRead(true)
-      pc.setCdfStartVersion(start)
-      end.foreach(pc.setCdfEndVersion)
-      val b = OperatorOuterClass.DeltaScan.newBuilder().setCommon(pc.build())
-      if (tableRoot != null && tableRoot.nonEmpty) b.setTableRoot(tableRoot)
-      b.build().toByteArray
-    }.toArray
+    // Standalone execution: same shared common + per-partition sub-ranges the trait exposes for the
+    // fused-under-a-parent path above.
+    val perPartition = perPartitionData
     CometExecRDD(
       sparkContext,
       inputRDDs = Seq.empty,
