@@ -58,14 +58,27 @@ hdr()   { printf '\n\033[36m==> %s\033[0m\n' "$*"; }
 hdr "Cargo: default build does not depend on comet-contrib-delta / delta_kernel"
 cd "$NATIVE_DIR"
 TREE_DEFAULT="$(cargo tree -p datafusion-comet --no-default-features 2>/dev/null)"
-if echo "$TREE_DEFAULT" | grep -qE 'comet-contrib-delta|delta_kernel|delta-kernel'; then
+# Anti-vacuous (mirrors the Maven gate below): a failing `cargo tree` yields empty output, and the
+# command-substitution failure doesn't trip `set -e` in an assignment -- so assert the root crate we
+# KNOW is always present before concluding "no Delta deps", otherwise a broken cargo-tree run would
+# pass the leak check vacuously. (`datafusion-comet ` with a trailing space matches only the root
+# crate line, not `datafusion-comet-proto`/`-common`.)
+if ! grep -q 'datafusion-comet ' <<<"$TREE_DEFAULT"; then
+  red "FAIL: default cargo tree produced no datafusion-comet entry (cargo tree likely failed;"
+  red "      refusing to conclude 'no Delta deps' vacuously)"
+  exit 1
+fi
+if grep -qE 'comet-contrib-delta|delta_kernel|delta-kernel' <<<"$TREE_DEFAULT"; then
   red "FAIL: default cargo tree contains Delta-related deps:"
-  echo "$TREE_DEFAULT" | grep -E 'comet-contrib-delta|delta_kernel|delta-kernel'
+  grep -E 'comet-contrib-delta|delta_kernel|delta-kernel' <<<"$TREE_DEFAULT"
   exit 1
 fi
 green "OK: cargo tree default is clean of contrib + kernel"
 
 TREE_CONTRIB="$(cargo tree -p datafusion-comet --features contrib-delta 2>/dev/null)"
+# The gated tree must pull in both the contrib crate AND the heavy `delta_kernel` it
+# depends on (driver-side log replay). Require >=2 hits; the symbol check below guards
+# against grep-pattern drift either way.
 CONTRIB_HITS="$(printf '%s\n' "$TREE_CONTRIB" | grep -cE 'comet-contrib-delta|delta_kernel|delta-kernel' || true)"
 if [[ "$CONTRIB_HITS" -lt 2 ]]; then
   red "FAIL: --features contrib-delta tree missing expected Delta-related entries (hits=$CONTRIB_HITS)"
@@ -98,13 +111,13 @@ delta_active_deps() { # args: -P / -D flags
 delta_spark_version() { # args: -P flags
   delta_active_deps "$@" |
     grep -A2 'artifactId>delta-spark' |
-    grep -oE '<version>[^<]+' | head -1 | sed 's/<version>//'
+    grep -oE '<version>[^<]+' | sed -n '1s/<version>//p'
 }
 
 DEPS_DEFAULT="$(delta_active_deps -Pspark-4.1)"
 # Anti-vacuous: a broken mvn run yields empty output; assert a dep we KNOW is always present so a
 # broken run fails loudly instead of "passing" the io.delta check by finding nothing.
-if ! echo "$DEPS_DEFAULT" | grep -q '<groupId>org.apache.spark</groupId>'; then
+if ! grep -q '<groupId>org.apache.spark</groupId>' <<<"$DEPS_DEFAULT"; then
   red "FAIL: default effective-pom produced no org.apache.spark deps (mvn likely failed;"
   red "      refusing to conclude 'zero io.delta' vacuously)"
   red "      --- mvnw: $MVNW (java=${JAVA_HOME:-unset}) ---"
@@ -112,7 +125,7 @@ if ! echo "$DEPS_DEFAULT" | grep -q '<groupId>org.apache.spark</groupId>'; then
   tail -60 "$EPOM_LOG" >&2 || true
   exit 1
 fi
-if echo "$DEPS_DEFAULT" | grep -q '<groupId>io.delta</groupId>'; then
+if grep -q '<groupId>io.delta</groupId>' <<<"$DEPS_DEFAULT"; then
   red "FAIL: default Maven build pulls io.delta dependencies:"
   echo "$DEPS_DEFAULT" | grep -A2 '<groupId>io.delta</groupId>'
   exit 1
