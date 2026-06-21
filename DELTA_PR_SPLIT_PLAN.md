@@ -580,6 +580,39 @@ Append-only. Newest entry at the top. Entry template:
   — includes re-adding the perPartitionFilePaths override I stripped from CometDeltaNativeScanExec in
   A.4b). A.6a/A.6b are gated on all extraction PRs + the %-path fix per §8.
 
+### 2026-06-21 (session 5i — Opus 4.8) — A.6b (Delta own-suite regression harness) carved + reviewed clean
+- **A.6b carved** onto `pr/delta-A6a-test-battery` → branch `pr/delta-A6b-regression` @ **`f0dcb242a`**,
+  fork review draft **#11**. 6 files +2021. Test/CI tooling only — NO production/native/main code.
+  - `dev/diffs/{3.3.2,4.0.0,4.1.0}.diff` (byte-identical to monolith), `dev/run-regression.sh`,
+    `dev/run-test.sh`, `delta_regression_test.yml`. All carved from the monolith; the 3 edited files
+    (both scripts + workflow) then review-hardened.
+- **§10.1 pin RESOLVED — no pin needed in A.6b:** the regression runs Delta's OWN suite, where Delta's
+  build picks its own Spark via CrossSparkVersions (Delta 4.1.0 → Spark 4.1.0), so delta-spark 4.1.0 never
+  runs on the pom's 4.1.2 and the IgnoreCachedData skew can't occur. The diff inherits `sparkVersion.value`
+  (no pin); proven monolith harness has none. (A.6a needed `-Dspark.version=4.1.1` because its test JVM ran
+  delta-spark on the pom 4.1.2 — different situation.)
+- **§5 (green):** all 3 diffs **`git apply --check` clean against the real upstream Delta tags**
+  (v3.3.2/v4.0.0/v4.1.0, shallow-cloned + verified + cleaned); bash -n both scripts; workflow YAML valid;
+  version-skew auto-derive present; gate/check-suites unaffected. **E2E full/smoke regression run DEFERRED**
+  — disk 94% (release build duplicates the ~5-11G delta_kernel tree) + runtime (3.3.2 full ~29h); it's the
+  plan's gated heavyweight (§5), not a per-carve gate; harness byte-identical to monolith where sweeps ran.
+- **Review (/code-review high, 44 agents, 10 findings — ALL on scripts/workflow, none on the diffs).**
+  Fixed 7: (1) `|| true` on cometVersion derive (no-match aborted under pipefail BEFORE the documented
+  fallback — my earlier fix only handled the head-1 SIGPIPE); (2) graceful re-clone when a reused
+  DELTA_WORKDIR lacks the tag (was a hard checkout abort); (3) removed dead 2.4.0 case; (4) documented
+  COMET_PUBLISH_DIR/diff-path coupling; (5) run-test.sh hardcoded personal JAVA_HOME → java_home helper +
+  PATH fallback; (6) scoped the PR trigger to Delta-affecting paths (was every code PR); (7) corrected the
+  "matching smoke cell" comment (needs is job-level) + made the smoke-on-PR/full-on-merge tradeoff explicit.
+  Not fixed (documented): wrong-token derive (#1 makes it graceful; comment states project version is the
+  only -SNAPSHOT), git-apply integrity (atomic + #2 ensures right tag), delta-full PR-skip (deliberate cost
+  tradeoff — 29h can't run per-PR; §10.4 maintainer call).
+  **The 3 edited files now INTENTIONALLY diverge from the monolith (real monolith bugs) → BACKPORT to #4366,
+  alongside the 5 A.6a workflow fixes.**
+- **Next action:** A.7 (docs — `contrib/delta/docs/*.md` 12-13 files + `docs/source/user-guide/latest/
+  {delta.md,datasources.md,index.rst}`; audit refs against what actually landed, paths/configs may have
+  drifted), then A.8 (perPartitionFilePaths / FAILED_READ_FILE follow-up, gated on #4536). Also pending:
+  backport the A.6a (5) + A.6b (7) CI/harness fixes to #4366; the flaky CI re-runs on #4/#5.
+
 ### 2026-06-21 (session 5h — Opus 4.8) — A.6a (test battery + CI workflow) carved + reviewed clean; %-path DROPPED
 - **A.6a carved** onto `pr/delta-A5-cdf` → branch `pr/delta-A6a-test-battery` @ **`9a1ef06fc`**, fork
   review draft **#10**. 26 files +3677/-98. Test-only — NO production or native code.
