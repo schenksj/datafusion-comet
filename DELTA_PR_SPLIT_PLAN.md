@@ -548,6 +548,33 @@ Append-only. Newest entry at the top. Entry template:
 - Next action:
 ```
 
+### 2026-06-20 (session 5c — Opus 4.8) — PR#2 smoke fixed (version skew); A.3a carved + reviewed clean
+- **PR #2 (monolith) smoke failures diagnosed + fixed:** the `Delta Lake Regression Tests /
+  smoke/delta-*` jobs failed on the fresh head — NOT a code regression, a VERSION SKEW. The
+  regression diffs hardcoded `val cometVersion = "0.17.0-SNAPSHOT"`; the main-sync bumped the repo to
+  0.18.0-SNAPSHOT, so the smoke harness couldn't resolve `comet-spark-...-0.17.0-SNAPSHOT.pom`. Fixed
+  on `feat/delta-kernel-read`: (1) bumped the 3 diffs to 0.18.0-SNAPSHOT (`48a84f08d`), then (2) made
+  `run-regression.sh` auto-derive cometVersion from the pom + overwrite the injected line post-apply
+  (`940fea62f`) so future bumps never re-break it (pipefail-safe extraction). This `run-regression.sh`
+  improvement flows into A.6b when carved.
+- **A.3a carved** onto `pr/delta-A2-buildgate` → branch `pr/delta-A3a-rust-driver` @ **`1a774d02d`**,
+  fork review draft **#5**. 10 files +4374/-50. Survey agent mapped the carve. Verbatim driver
+  modules (error/engine/predicate/scan/jni = 2622 lines), carved lib.rs (keeps planner stub, drops
+  dv_reader/kernel_scan), TRIMMED real Cargo.toml (only driver deps; executor deps → A.3b). Gate
+  cargo-tree assertion re-tightened to require delta_kernel (now real; contrib libcomet +11 MB).
+- **§5 (all green):** gated native build, **54 in-crate unit tests**, default native build unchanged,
+  clippy ×2 feature states, gate-verify script, cargo fmt.
+- **Review (manual + /code-review high, 22 agents, 6 refuted / 6 survived) — 3 fixed, 2 documented:**
+  fixed dead `crate::proto` re-export (DeltaScan/DeltaScanCommon → A.3b), unused datafusion `parquet`
+  feature (→ A.3b), misleading `[plan_delta_scan]` doc-link. Documented (NOT fixed, verbatim monolith
+  code, latent behind DV invariants): scan.rs:691/693 unguarded DV offset/sizeInBytes Arrow reads —
+  candidate for a separate monolith-level hardening pass, not an A.3a divergence.
+- **Carve invariants verified:** driver set has zero deferred-module refs; A.3a touches ONLY
+  contrib/native + native lockfile + gate script; stub planner.rs byte-unchanged.
+- **Next action:** carve **A.3b** (executor side: dv_reader, kernel_scan, real planner — replaces the
+  stub) onto `pr/delta-A3a-rust-driver`. It re-adds the deferred Cargo deps (parquet, roaring,
+  datafusion-datasource, futures, chrono*, comet-common, tokio) + the proto re-exports trimmed in 3a.
+
 ### 2026-06-20 (session 5b — Opus 4.8) — A.1 opened upstream (#4700); A.2 carved + reviewed clean
 - **A.1:** opened upstream as **#4700** (with AI-disclosure footer; new standing rule: every PR body
   ends with it). Apache CI is `action_required` (awaiting a maintainer to approve workflow runs for a
