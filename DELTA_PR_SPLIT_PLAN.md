@@ -577,9 +577,14 @@ Append-only. Newest entry at the top. Entry template:
   `.delta-split/review-log-A1.md`.
 - **Commits:** A.1 == `feat/delta-split` == `pr/delta-A1-spi` @ **`fc48c0cfe`** (force-pushed).
   #4366 head `9f29732a8`. Local+fork `main` @ `9c69f30b0`.
+- **A.1 OPENED UPSTREAM:** apache/datafusion-comet **#4700** (ready-for-review, not draft; head
+  `schenksj:pr/delta-A1-spi` @ `fc48c0cfe` → apache `main`; 6 files +185/-16; MERGEABLE). Title:
+  `feat: core SPI for contrib leaf scans (CometScanWithPlanData) [Delta contrib split, part 1]`.
+  Body leads with the breakup framing + roadmap, links #4366/#4535/#4536/#3510. Umbrella #4366
+  commented (issuecomment-4760525806) linking #4700. Fork review-draft #3 CLOSED as superseded.
 - **Next action:** carve **A.2** (build gate + inert wiring) onto `feat/delta-split` — proto
-  `delta_scan = 118`, NO 4.1.1 pin in default pom (§10.1), stub contrib crate. Open A.1 upstream
-  whenever the user calls it.
+  `delta_scan = 118`, NO 4.1.1 pin in default pom (§10.1), stub contrib crate, gate-verify script
+  + CI job. Watch #4700 review.
 
 ### 2026-06-13 (session 4 — Opus 4.8) — Phase 1 Unit A.1 carved + fork draft PR + review loop
 - **Phase/unit:** A.1 (Core SPI) carved, verified, fork draft PR open. First split unit done locally.
