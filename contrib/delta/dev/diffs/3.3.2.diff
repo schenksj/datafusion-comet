@@ -7,7 +7,7 @@ index 280efcc..a7e39c9 100644
  val LATEST_RELEASED_SPARK_VERSION = "3.5.3"
  val SPARK_MASTER_VERSION = "4.0.0-SNAPSHOT"
 +// Comet regression testing (added by contrib/delta/dev/diffs/3.3.2.diff in Apache DataFusion Comet)
-+val cometVersion = "0.17.0-SNAPSHOT"
++val cometVersion = "0.18.0-SNAPSHOT"
 +ThisBuild / resolvers += Resolver.mavenLocal
  val sparkVersion = settingKey[String]("Spark version")
  spark / sparkVersion := getSparkVersion()

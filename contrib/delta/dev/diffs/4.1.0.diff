@@ -7,7 +7,7 @@ index 6f16864..e623a08 100644
  // Spark version to delta-spark and its dependent modules
  // For more information see CrossSparkVersions.scala
 +// Comet regression testing (added by dev/diffs/delta/4.1.0.diff in Apache DataFusion Comet)
-+val cometVersion = "0.17.0-SNAPSHOT"
++val cometVersion = "0.18.0-SNAPSHOT"
 +ThisBuild / resolvers += Resolver.mavenLocal
  val sparkVersion = settingKey[String]("Spark version")
  
