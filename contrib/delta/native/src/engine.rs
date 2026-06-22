@@ -45,7 +45,7 @@ pub type DeltaEngine = DefaultEngine<TokioBackgroundExecutor>;
 /// through `object_store::parse_url`, which sources credentials from the ambient environment
 /// (`AZURE_*` / `GOOGLE_*` / ADC / instance metadata) -- matching core's non-S3 path -- so they
 /// need no fields here.
-#[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Default, Hash, PartialEq, Eq)]
 pub struct DeltaStorageConfig {
     pub aws_access_key: Option<String>,
     pub aws_secret_key: Option<String>,
@@ -53,6 +53,30 @@ pub struct DeltaStorageConfig {
     pub aws_region: Option<String>,
     pub aws_endpoint: Option<String>,
     pub aws_force_path_style: bool,
+}
+
+// Hand-written `Debug` (NOT derived) so a stray `{:?}` -- a future debug log, an error wrapper --
+// can never leak credential material (`aws_access_key` / `aws_secret_key` / `aws_session_token`).
+// Each credential field renders as `<set>` / `None`; non-secret fields stay visible for
+// diagnosability. Defense-in-depth: nothing on the read path Debug-prints this today.
+impl std::fmt::Debug for DeltaStorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(o: &Option<String>) -> &'static str {
+            if o.is_some() {
+                "<set>"
+            } else {
+                "None"
+            }
+        }
+        f.debug_struct("DeltaStorageConfig")
+            .field("aws_access_key", &redact(&self.aws_access_key))
+            .field("aws_secret_key", &redact(&self.aws_secret_key))
+            .field("aws_session_token", &redact(&self.aws_session_token))
+            .field("aws_region", &self.aws_region)
+            .field("aws_endpoint", &self.aws_endpoint)
+            .field("aws_force_path_style", &self.aws_force_path_style)
+            .finish()
+    }
 }
 
 /// Build an `ObjectStore` for the given URL and credentials.
@@ -239,6 +263,28 @@ mod tests {
 
     fn empty_config() -> DeltaStorageConfig {
         DeltaStorageConfig::default()
+    }
+
+    #[test]
+    fn debug_redacts_credential_material() {
+        // A stray `{:?}` on the storage config (e.g. a future debug log) must NOT leak the
+        // secret key / session token / access key into logs. Non-secret fields stay visible
+        // for diagnosability.
+        let c = DeltaStorageConfig {
+            aws_access_key: Some("AKIDEXAMPLE".to_string()),
+            aws_secret_key: Some("SUPERSECRETKEYVALUE".to_string()),
+            aws_session_token: Some("SESSIONTOKENVALUE".to_string()),
+            aws_region: Some("us-west-2".to_string()),
+            aws_endpoint: Some("https://s3.example".to_string()),
+            aws_force_path_style: true,
+        };
+        let s = format!("{c:?}");
+        assert!(!s.contains("SUPERSECRETKEYVALUE"), "secret key leaked: {s}");
+        assert!(!s.contains("SESSIONTOKENVALUE"), "session token leaked: {s}");
+        assert!(!s.contains("AKIDEXAMPLE"), "access key leaked: {s}");
+        // Non-secret fields remain visible.
+        assert!(s.contains("us-west-2"), "region should be visible: {s}");
+        assert!(s.contains("s3.example"), "endpoint should be visible: {s}");
     }
 
     #[test]
