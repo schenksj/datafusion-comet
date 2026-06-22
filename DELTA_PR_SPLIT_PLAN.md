@@ -605,6 +605,17 @@ Append-only. Newest entry at the top. Entry template:
 - **#4366 updated:** filled the split-table PR column — A.1 → [apache#4700], A.2–A.8 → [schenksj#4–#13] — set
   all statuses 🔎, and added a "Where each carveout lives" note (A.1 upstream; A.2–A.8 stacked fork review
   drafts opened upstream as the chain merges).
+- **#4366 de-staled (user-requested):** (a) extraction table — flipped #4524/#4525/#4533/#4535/#4536 to
+  ✅merged (only #4532 still open); removed the #4588 row (followup from other work, not part of this) and the
+  %-path row (dropped, confusing); reworded intro + diagram. (b) **Replaced the entire ~411-line `<details>`
+  "technical reference" — it described the PRE-kernel-read-refactor design (ParquetSource +
+  DeltaSyntheticColumnsExec + DeltaDvFilterExec + core_glue.rs + column-mapping physicalisation + arrow
+  bridge), all DELETED — with a 19-line accurate kernel-read summary that points to the maintained
+  `contrib/delta/docs/` (shipped by A.7/#12) + validation commands + the upstream issue.** Description 477→85
+  lines; final stale-scan clean. Also updated the user's tracking comment (issuecomment-4760525806) with
+  per-carveout links + @andygrove. (Caught via an Explore audit agent vs the docs/code; LESSON: the #4366
+  body's long technical reference predated the refactor — the docs are now the single source of truth.)
+- **CI re-runs** (#2/#4/#5 flaky infra + #12 prettier-fixed) left in flight on shared fork runners.
 
 ### 2026-06-21 (session 5l — Opus 4.8) — docs 10/11/12 archived (post-split refinement to A.7)
 - **User decision: archive.** Moved `10-iceberg-style-kernel-read.md`, `11-kernel-read-coherence-audit.md`,
