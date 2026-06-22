@@ -46,11 +46,13 @@ matrix/native module list/proto messages all verified. Fixes:
   (plural) is a real file that also discusses cannotReadFilesError; line numbers already approximate
   in a historical audit doc — risk of a wrong "correction" outweighs benefit.
 
-## Open question surfaced to user (not actioned)
-Docs 10/11/12 (migration plan / coherence audit / elimination evaluation) are point-in-time
-development-history artifacts. Both review passes flagged whether they belong in shipped in-repo docs
-vs an archive. Kept (faithful to monolith; explicitly framed as historical), flagged in the PR body
-for maintainer decision.
+## Docs 10/11/12 archived (user decision, post-review)
+Both review passes flagged docs 10/11/12 (migration plan / coherence audit / elimination evaluation) as
+point-in-time development-history artifacts. **User chose: archive.** Moved them to
+`contrib/delta/docs/archive/` via `git mv` (rename, history preserved); repointed the 4 incoming links
+(01/03/04/README → `archive/`); added an "Archived design history" note to the README. 01–08 + README
+remain the living doc set. All links verified resolving. Amended into A.7 (`51e71587b`); A.8 cascade-
+rebased onto the new A.7 (`b0644a6ad`); both force-pushed (#12/#13).
 
 ## §5 verification
 Inter-doc links resolve; user-guide links + index.rst toctree correct (delta.md wired in); the one

@@ -590,6 +590,16 @@ Append-only. Newest entry at the top. Entry template:
   — includes re-adding the perPartitionFilePaths override I stripped from CometDeltaNativeScanExec in
   A.4b). A.6a/A.6b are gated on all extraction PRs + the %-path fix per §8.
 
+### 2026-06-21 (session 5l — Opus 4.8) — docs 10/11/12 archived (post-split refinement to A.7)
+- **User decision: archive.** Moved `10-iceberg-style-kernel-read.md`, `11-kernel-read-coherence-audit.md`,
+  `12-elimination-evaluation.md` → `contrib/delta/docs/archive/` (git mv, history preserved). Repointed the
+  4 incoming links (01/03/04/README → `archive/`); added an "Archived design history" note to README. 01–08
+  + README remain the living doc set. All inter-doc links verified resolving.
+- **Folded into A.7** (the docs unit): amended `pr/delta-A7-docs` → **`51e71587b`** (#12). Cascade-rebased
+  A.8 onto the new A.7 → **`b0644a6ad`** (#13, code intact, disjoint from docs so clean). Both force-pushed
+  (--force-with-lease). PR #12 body updated (the "flagged, not actioned" note → "archived"). Updated stack
+  heads: A.7 `51e71587b`, A.8 `b0644a6ad`.
+
 ### 2026-06-21 (session 5k — Opus 4.8) — A.8 (FAILED_READ_FILE provenance) carved + red-green + reviewed clean — SPLIT COMPLETE
 - **A.8 carved** onto `pr/delta-A7-docs` → branch `pr/delta-A8-failed-read-file` @ **`e703c0f98`**, fork
   review draft **#13**. 4 files. CODE unit (core + contrib) + red-green test. **FINAL split unit.**
