@@ -58,5 +58,15 @@ clarified in the comment, flagged as a §10.4 maintainer decision).
 from the monolith (the review found real bugs in the monolith's harness). The diffs stay byte-identical.
 These 7 fixes are real monolith bugs → BACKPORT to #4366.
 
-**State:** A.6b review clean, pushed (#11), §5 green (sans the gated e2e run). Remaining: A.7 (docs),
+## Post-review fix (found running the 4.1 full regression locally — session 5n)
+Running `run-regression.sh 4.1.0 full` on macOS surfaced a real harness bug CI (Linux bash 5) never
+hit: `SBT_REPO_OVERRIDE=()` is empty on the 4.x cells, and **macOS bash 3.2 treats `"${empty[@]}"` as
+an unbound variable under `set -u`** → the script aborted at `[4/4]` before running any tests
+(`SBT_REPO_OVERRIDE[@]: unbound variable`). Fixed the 4 call sites to the portable
+`${SBT_REPO_OVERRIDE[@]+"${SBT_REPO_OVERRIDE[@]}"}` alternation (verified under bash 3.2 + set -u).
+Amended into A.6b (`c65b636e2`); A.7 (`59ff67caa`) + A.8 (`8e31afad6`) cascade-rebased; all force-pushed
+(#11/#12/#13). Re-launched the regression — now past `[4/4]` into Delta's sbt test build. NOTE: the same
+bug is in the fork-monolith backport (`run-regression.sh` @ 503c4194c) — fix there too.
+
+**State:** A.6b review clean + harness bash-3.2 fix, pushed (#11). Remaining: A.7 (docs),
 A.8 (perPartitionFilePaths / FAILED_READ_FILE follow-up).

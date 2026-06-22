@@ -590,6 +590,21 @@ Append-only. Newest entry at the top. Entry template:
   — includes re-adding the perPartitionFilePaths override I stripped from CometDeltaNativeScanExec in
   A.4b). A.6a/A.6b are gated on all extraction PRs + the %-path fix per §8.
 
+### 2026-06-21 (session 5n — Opus 4.8) — 4.1 full regression run → found+fixed a harness bash-3.2 bug
+- **Ran the Spark 4.1 / Delta 4.1.0 full regression locally** (the gated e2e proof deferred in A.6b).
+  Freed 11.8G via `cargo clean native/target` first (disk was 94%/12G → 88%/23G). First run FAILED at
+  `[4/4]` with `SBT_REPO_OVERRIDE[@]: unbound variable` — **real A.6b harness bug**: empty array +
+  `set -u` errors on macOS **bash 3.2** (Linux CI bash 5 tolerates it, so CI never caught it).
+- **Fixed** the 4 call sites to `${SBT_REPO_OVERRIDE[@]+"${SBT_REPO_OVERRIDE[@]}"}` (verified under bash
+  3.2+set -u). Amended A.6b → `c65b636e2`; cascade-rebased A.7 → `59ff67caa`, A.8 → `8e31afad6`;
+  force-pushed #11/#12/#13. **(Gotcha: first cascade used the wrong rebase base — collapsed all 3 branches
+  to one commit; recovered from the intact old SHAs via `git branch -f` + `rebase --onto <old-parent>`.
+  Verify each unit's stat after any cascade.)** Re-launched the regression — now past `[4/4]` into Delta's
+  sbt test build (multi-hour). The force-push also re-triggered fresh CI on #12/#13 (a #13 flake the user
+  flagged).
+- **TODO:** same bash-3.2 bug is in the fork-monolith backport (`run-regression.sh` @ 503c4194c) — fix
+  there too. Watching #12/#13 CI to green (bg watcher) + the regression to completion.
+
 ### 2026-06-21 (session 5m — Opus 4.8) — CI triage (#2/#4/#5/#12) + #4366 carveout links
 - **CI failures diagnosed (root cause, not assumed flaky):**
   - **#12 Preflight = REAL** (`prettier --check "**/*.md"` failed on README.md + archive/12 — my A.7 hand-edits
