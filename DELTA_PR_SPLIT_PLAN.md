@@ -590,6 +590,36 @@ Append-only. Newest entry at the top. Entry template:
   — includes re-adding the perPartitionFilePaths override I stripped from CometDeltaNativeScanExec in
   A.4b). A.6a/A.6b are gated on all extraction PRs + the %-path fix per §8.
 
+### 2026-06-21 (session 5k — Opus 4.8) — A.8 (FAILED_READ_FILE provenance) carved + red-green + reviewed clean — SPLIT COMPLETE
+- **A.8 carved** onto `pr/delta-A7-docs` → branch `pr/delta-A8-failed-read-file` @ **`e703c0f98`**, fork
+  review draft **#13**. 4 files. CODE unit (core + contrib) + red-green test. **FINAL split unit.**
+- **#4536 merged to main** → A.8 unblocked. Scope = the REMAINING delta (trait member + CometNativeExec
+  threading + contrib override + test); applied ONLY the perPartitionFilePaths hunks of operators.scala
+  (left the unrelated PlanDataInjector reflection-refinement drift out of scope).
+- **Carve:** operators.scala perPartitionFilePaths trait member + NativeExecContext field + CometNativeExec
+  per-leaf collection + CometExecRDD threading; CometNativeScanExec `override` keyword (REQUIRED coupling —
+  found via compile error, matches monolith:242); CometDeltaNativeScanExec override + standalone pass-through
+  (did NOT re-add the dead planData* aliases removed in A.4b); NEW CometDeltaFailedReadFileSuite.
+- **Key finding:** native always calls `map_file_read_error(e, &file.path)` so CannotReadFile is
+  path-bearing → F6 (corrupted-file, on HEAD via A.6a) already surfaces FAILED_READ_FILE WITH path (passed
+  A.6a battery). So an e2e path-in-error test would be VACUOUS. perPartitionFilePaths is parity/fallback
+  provenance → the honest red-green is STRUCTURAL (perPartitionFilePaths exposes the files; empty default
+  = RED, override = GREEN). **PROVEN red→green.**
+- **§5 (all green):** red-green proven; targeted regression (native+CDF+new) 23/0; **Scala 2.12 compile of
+  CORE (spark-3.4) AND contrib (spark-3.5/2.12)**; spotless/scalastyle; gate-verify (default 0 Delta symbols).
+- **Review (/code-review high, 35 agents, 5 findings):** fixed 2 (redundant double proto-parse in standalone
+  doExecuteColumnar → reuse the single parse; vacuous-subsetOf test hole → added nonEmpty assert). Documented
+  3 as inherent/monolith-design (join multi-scan path union = NO_HINT imprecision, same as CometNativeScanExec;
+  DPP-required perPartitionData recompute; per-query collection bounded by early-empty return).
+- **THE DELTA CONTRIB SPLIT IS COMPLETE END-TO-END (A.1–A.8), all reviewed clean, all fork PRs open:**
+  A.1 #4700(upstream) ← A.2 #4 ← A.3a #5 ← A.3b #6 ← A.4a #7 ← A.4b #8 ← A.5 #9 ← A.6a #10 ← A.6b #11 ←
+  A.7 #12 ← A.8 #13.
+- **Next action (post-split, no more units):** (1) docs 10/11/12 archive decision (user); (2) #4366
+  reconcile/close at end-of-cycle (§9.4 — contrib-delta-direct is 6 commits behind the fork monolith);
+  (3) flaky CI re-runs on #4/#5; (4) when the extraction chain merges upstream, open the units upstream in
+  order (per §8 merge-order). The fork monolith (feat/delta-kernel-read @ 503c4194c) already carries the
+  CI/harness backport.
+
 ### 2026-06-21 (session 5j — Opus 4.8) — A.7 (docs) carved + audited + reviewed clean
 - **A.7 carved** onto `pr/delta-A6b-regression` → branch `pr/delta-A7-docs` @ **`01cd61f81`**, fork
   review draft **#12**. 15 files +2650. DOCS ONLY. 12 internal design docs (contrib/delta/docs/) +
