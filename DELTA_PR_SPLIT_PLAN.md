@@ -590,6 +590,31 @@ Append-only. Newest entry at the top. Entry template:
   — includes re-adding the perPartitionFilePaths override I stripped from CometDeltaNativeScanExec in
   A.4b). A.6a/A.6b are gated on all extraction PRs + the %-path fix per §8.
 
+### 2026-06-21 (session 5j — Opus 4.8) — A.7 (docs) carved + audited + reviewed clean
+- **A.7 carved** onto `pr/delta-A6b-regression` → branch `pr/delta-A7-docs` @ **`01cd61f81`**, fork
+  review draft **#12**. 15 files +2650. DOCS ONLY. 12 internal design docs (contrib/delta/docs/) +
+  user-facing delta.md (new) + datasources.md/index.rst (additive links/toctree).
+- **Audit (the unit's real work): TWO passes** — (1) Explore agent cross-checking every
+  config/class/module/proto/path reference + inter-doc links vs HEAD; (2) /code-review high on
+  user-facing semantic accuracy. Docs were ~accurate (faithful monolith reconstruction). Fixes:
+  storage line +Azure/GCS (understated; both ship via engine.rs parse_url); S3-cred residual corrected
+  to credential-provider CLASSES not "per-bucket chains" (per-bucket FIXED); INT96 far-future (~2262)
+  overflow caveat added (08 A6 — only silent-wrong-data risk); Java 17 = all Spark 4.x not just 4.1;
+  jar-must-be-from-source clarification; proto kernel_read row "kept"→"removed" (reserved 25);
+  `cargo -p comet`→`-p datafusion-comet`.
+- **Refuted/skipped:** Tuning-table "duplicates configs.md" REFUTED (GenerateDocs has no Delta ref;
+  contrib configs NOT auto-published → table needed). Skipped spark.comet.enabled/extraClassPath in the
+  example (iceberg.md convention, defaults true) + the ambiguous errors.rs→error.rs cosmetic
+  (jni-bridge/errors.rs plural is a real file too).
+- **Surfaced to user (not actioned):** docs 10/11/12 are dev-history artifacts (migration/audit/
+  elimination) — both passes flagged whether they belong in shipped docs vs archive. Kept + flagged in
+  PR body. **DECISION PENDING from user.**
+- **Next action:** A.8 (perPartitionFilePaths / FAILED_READ_FILE follow-up). **#4536 has MERGED to main**
+  (CannotReadFile is on HEAD), so A.8 is now UNBLOCKED — it re-adds the perPartitionFilePaths override
+  stripped from CometDeltaNativeScanExec in A.4b + threads Delta file paths so native read failures
+  become FAILED_READ_FILE; red-green corrupt-file test. Also pending: docs 10/11/12 archive decision;
+  #4366 reconcile/close (§9.4); flaky CI re-runs on #4/#5.
+
 ### 2026-06-21 (session 5i — Opus 4.8) — A.6b (Delta own-suite regression harness) carved + reviewed clean
 - **A.6b carved** onto `pr/delta-A6a-test-battery` → branch `pr/delta-A6b-regression` @ **`f0dcb242a`**,
   fork review draft **#11**. 6 files +2021. Test/CI tooling only — NO production/native/main code.
