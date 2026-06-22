@@ -590,6 +590,22 @@ Append-only. Newest entry at the top. Entry template:
   — includes re-adding the perPartitionFilePaths override I stripped from CometDeltaNativeScanExec in
   A.4b). A.6a/A.6b are gated on all extraction PRs + the %-path fix per §8.
 
+### 2026-06-21 (session 5m — Opus 4.8) — CI triage (#2/#4/#5/#12) + #4366 carveout links
+- **CI failures diagnosed (root cause, not assumed flaky):**
+  - **#12 Preflight = REAL** (`prettier --check "**/*.md"` failed on README.md + archive/12 — my A.7 hand-edits
+    weren't prettier-clean). FIXED: `npx prettier --write` on the 2 files (formatting-only), amended into A.7
+    (`77f9032e5`), A.8 cascade-rebased (`3930a453b`), both force-pushed. **LESSON: docs PRs must run prettier
+    (`prettier --check "**/*.md"`) — repo has no .prettierrc, uses defaults; CI `npm i -g prettier`.**
+  - **#4 [shuffle] = flaky infra** (HTTP 403 from Maven Central downloading the mvnw distribution zip).
+  - **#5 rust-test = flaky infra** (crates.io `clap_derive` download curl-failed).
+  - **#2 sql_core-3/spark-4.1.2 = flaky infra** (exit 137 / SIGKILL — runner OOM-or-preemption mid-test,
+    tests were passing right up to the kill; NOT a test failure).
+  - Re-triggered the 3 flaky jobs (`gh run rerun --failed`); all in_progress. Swept the rest of the stack
+    (#6–#11, #13) — all green, no action.
+- **#4366 updated:** filled the split-table PR column — A.1 → [apache#4700], A.2–A.8 → [schenksj#4–#13] — set
+  all statuses 🔎, and added a "Where each carveout lives" note (A.1 upstream; A.2–A.8 stacked fork review
+  drafts opened upstream as the chain merges).
+
 ### 2026-06-21 (session 5l — Opus 4.8) — docs 10/11/12 archived (post-split refinement to A.7)
 - **User decision: archive.** Moved `10-iceberg-style-kernel-read.md`, `11-kernel-read-coherence-audit.md`,
   `12-elimination-evaluation.md` → `contrib/delta/docs/archive/` (git mv, history preserved). Repointed the
