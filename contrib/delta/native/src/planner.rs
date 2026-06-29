@@ -458,6 +458,16 @@ pub fn plan_delta_scan(
                 .zip(logical.fields().iter())
                 .any(|(p, l)| p.name() != l.name());
             (physical, logical, needs_transform)
+        } else if common.synthesize_in_worker {
+            // kernel_physical_schema is empty but there ARE non-partition required columns, and the
+            // executor synthesises in-worker: every such column is a worker-produced synthetic or
+            // `_metadata.*` virtual column (e.g. `_metadata.file_name`) that the driver deliberately
+            // excluded from the kernel read schema -- NOT a parquet/kernel read. So there is nothing
+            // to read from kernel; the executor produces all output columns itself. (A genuine
+            // dropped-schema bug still errors below when synthesis is OFF.) Guards the
+            // `_metadata`-alias-on-a-table-with-a-colliding-real-column case.
+            let empty: SchemaRef = Arc::new(Schema::empty());
+            (Arc::clone(&empty), empty, false)
         } else {
             return Err(DataFusionError::Execution(format!(
                 "Delta kernel-read scan is missing kernel data-column schemas for {} data \
