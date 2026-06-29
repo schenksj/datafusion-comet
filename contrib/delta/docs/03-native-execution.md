@@ -175,8 +175,15 @@ and calls `TableChanges::execute()`, then reconciles each batch to
 (default 8) contiguous sub-ranges, each read by an independent native
 `TableChanges` call as one Spark partition — staying a single `CometNativeExec`
 (not a `CometUnionExec`, which would make a downstream native shuffle
-ineligible). CDF is read kernel-natively; it is NOT declined and was never
-handled via a synthetic-columns exec.
+ineligible). CDF was never handled via a synthetic-columns exec. It is read
+kernel-natively for the common case, but it **does** decline to Spark's CDF
+reader for tables kernel's `TableChanges` cannot serve correctly — deletion-vector
+tables (kernel can't resolve the persistent `deletion_vector_*.bin`) and
+catalog-managed / coordinated-commits tables (kernel requires a
+`max_catalog_version` we don't supply). Both are gated up front in `convertCdf`
+via `DeltaReflection.cdfHasUnsupportedTableFeatures`, so the decline happens at
+planning rather than crashing mid-execution. See
+[08-known-limitations.md](08-known-limitations.md) A5 / A8.
 
 ## The output stream
 
