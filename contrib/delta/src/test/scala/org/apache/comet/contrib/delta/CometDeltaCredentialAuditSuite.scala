@@ -205,4 +205,38 @@ class CometDeltaCredentialAuditSuite extends AnyFunSuite with Matchers {
       "per-bucket key was unexpectedly bridged; if intentional, " +
         "remove this gap test and add a positive assertion")
   }
+
+  // === Layer 1+2 composition: the exact method the V1 scan AND the CDF path use
+  // to populate the scan proto's `object_store_options` (P2 driver->proto core) ===
+  //
+  // `resolveStorageOptionsFromConf` is what `convert()` (V1 regular scan) and
+  // `convertCdf` both call to build `object_store_options`. The CDF credential suite
+  // (`CometDeltaCdfCredentialSuite`) proves it reaches the proto end-to-end on the CDF
+  // path; a V1-path e2e is infeasible locally because V1's driver-side kernel
+  // enumeration needs reachable storage (a fake-S3 FS fails the native read, so no
+  // native exec/proto is produced). These guard the shared resolution composing
+  // Layer 1 (extract) + Layer 2 (AWS provider chain) -- which neither isolation test
+  // above exercises together -- and that it stays scheme-gated.
+
+  test("resolveStorageOptionsFromConf bridges S3 creds for an s3a root (V1/CDF proto core)") {
+    val conf = new Configuration()
+    conf.set("fs.s3a.access.key", "AK")
+    conf.set("fs.s3a.secret.key", "SK")
+    conf.set("fs.s3a.session.token", "TOK")
+    conf.set("fs.s3a.endpoint.region", "us-west-2")
+    val opts = CometDeltaNativeScan.resolveStorageOptionsFromConf(conf, "s3a://bucket/tbl")
+    assert(opts.get("fs.s3a.access.key") === "AK")
+    assert(opts.get("fs.s3a.secret.key") === "SK")
+    assert(opts.get("fs.s3a.session.token") === "TOK")
+    assert(opts.get("fs.s3a.endpoint.region") === "us-west-2")
+  }
+
+  test("resolveStorageOptionsFromConf bridges nothing for a file:// root (scheme-gated)") {
+    val conf = new Configuration()
+    conf.set("fs.s3a.access.key", "SHOULD_NOT_LEAK")
+    val opts = CometDeltaNativeScan.resolveStorageOptionsFromConf(conf, "file:///tmp/tbl")
+    assert(
+      !opts.containsKey("fs.s3a.access.key"),
+      s"file:// scan must not bridge s3a creds; got $opts")
+  }
 }
