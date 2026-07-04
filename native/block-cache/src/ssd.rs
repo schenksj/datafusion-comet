@@ -465,7 +465,12 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::FileExt;
 
-    fn open(dir: &std::path::Path, limit: u64, region: u64, shards: usize) -> (SsdCache, Arc<Metrics>) {
+    fn open(
+        dir: &std::path::Path,
+        limit: u64,
+        region: u64,
+        shards: usize,
+    ) -> (SsdCache, Arc<Metrics>) {
         let metrics = Arc::new(Metrics::default());
         let ssd = SsdCache::open(
             SsdConfig {
@@ -545,7 +550,11 @@ mod tests {
         assert!(ssd.get((0, 1)).await.is_some());
         assert!(ssd.get((0, 4)).await.is_some());
         assert!(ssd.get((0, 5)).await.is_some());
-        assert_eq!(ssd.get((0, 2)).await, None, "coldest region should be evicted");
+        assert_eq!(
+            ssd.get((0, 2)).await,
+            None,
+            "coldest region should be evicted"
+        );
         assert_eq!(ssd.get((0, 3)).await, None);
     }
 

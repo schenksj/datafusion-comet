@@ -978,10 +978,7 @@ pub extern "system" fn Java_org_apache_comet_Native_getDataCacheStats(
 #[no_mangle]
 /// Drop all cached blocks from the process-global data cache. No-op when disabled. Used to
 /// force a cold cache between benchmark scenarios.
-pub extern "system" fn Java_org_apache_comet_Native_clearDataCache(
-    e: EnvUnowned,
-    _class: JClass,
-) {
+pub extern "system" fn Java_org_apache_comet_Native_clearDataCache(e: EnvUnowned, _class: JClass) {
     try_unwrap_or_throw(&e, |_env| {
         crate::execution::data_cache::clear();
         Ok(())

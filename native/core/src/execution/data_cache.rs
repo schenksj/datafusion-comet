@@ -96,7 +96,11 @@ fn build(spark_config: &HashMap<String, String>, local_dirs: &[String]) -> Optio
         spark_config
             .get(COMET_DATA_CACHE_SSD_PATH)
             .map(PathBuf::from)
-            .or_else(|| local_dirs.first().map(|d| PathBuf::from(d).join("comet-data-cache")))
+            .or_else(|| {
+                local_dirs
+                    .first()
+                    .map(|d| PathBuf::from(d).join("comet-data-cache"))
+            })
     } else {
         None
     };

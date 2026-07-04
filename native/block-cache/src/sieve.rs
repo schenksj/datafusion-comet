@@ -119,7 +119,12 @@ impl Shard {
     /// Insert a freshly fetched block, evicting in SIEVE order until back under budget.
     /// A block already present (a concurrent fill won the race) is left as-is. Returns the
     /// blocks evicted to make room (for SSD admission).
-    pub(crate) fn insert(&mut self, key: BlockKey, block: Arc<Block>, metrics: &Metrics) -> Vec<Evicted> {
+    pub(crate) fn insert(
+        &mut self,
+        key: BlockKey,
+        block: Arc<Block>,
+        metrics: &Metrics,
+    ) -> Vec<Evicted> {
         if self.map.contains_key(&key) {
             return Vec::new();
         }
