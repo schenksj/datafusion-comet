@@ -105,10 +105,16 @@ object CometDataCacheBenchmark extends CometBenchmarkBase {
   // Rows in the fact table (configurable). Combined with `valueCols` random-double columns this
   // targets a ~0.5 GB on-disk dataset (4M rows * 16 cols * 8 bytes ~= 512 MB).
   private def factRows: Long = env("COMET_DATA_CACHE_BENCH_ROWS").map(_.toLong).getOrElse(rows)
-  // Number of value columns. Uniform random doubles: incompressible (so on-disk size reflects the
-  // logical size, unlike id-derived columns which Parquet dictionary/RLE crush to near zero), and
-  // wide enough that a single-column projection fetches a small fraction of the file.
+  // Number of value columns, wide enough that a single-column projection fetches a small fraction
+  // of the file.
   private final val valueCols: Int = 16
+  // Data shape toggle. Default (false) = uniform random doubles: incompressible, so the on-disk
+  // size reflects the logical size and projections fetch a real fraction -- the primary case.
+  // true = low-cardinality id-derived columns that Parquet dictionary/RLE crush to a tiny file:
+  // shows the cache still wins (cold cost over WAN is S3-round-trip-latency-bound, not throughput),
+  // but too small to surface the projection selective-read benefit.
+  private def compressible: Boolean =
+    env("COMET_DATA_CACHE_BENCH_COMPRESSIBLE").exists(_.toBoolean)
   // Distinct join keys (also the dimension table's row count).
   private final val dimKeys: Long = 4000
   // Warm iterations timed per scenario (median reported).
@@ -158,10 +164,16 @@ object CometDataCacheBenchmark extends CometBenchmarkBase {
   private def prepareData(base: String): Unit = {
     val factPath = s"$base/fact"
     val dimPath = s"$base/dim"
-    // `id` and `k` (the join key) are derived and compress well, but the value columns are
-    // uniform random doubles (seeded per column) so they do not compress -- the file lands near
-    // its logical size and column chunks are large enough that projections fetch a real fraction.
-    val valueExprs = (1 to valueCols).map(i => s"rand($i) AS v$i")
+    // `id` and `k` (the join key) are derived and compress well. The value columns are either
+    // seeded uniform random doubles (incompressible; the file lands near its logical size) or
+    // low-cardinality id-derived doubles (compressible; Parquet crushes the file), per the toggle.
+    val valueExprs =
+      if (compressible) {
+        // A handful of distinct values per column -> dictionary/RLE -> tiny file.
+        (1 to valueCols).map(i => s"cast(id % ${100 + i} as double) AS v$i")
+      } else {
+        (1 to valueCols).map(i => s"rand($i) AS v$i")
+      }
     spark
       .range(factRows)
       .selectExpr(Seq("id", s"cast(id % $dimKeys as long) AS k") ++ valueExprs: _*)
@@ -213,8 +225,11 @@ object CometDataCacheBenchmark extends CometBenchmarkBase {
       f"${"Category"}%-8s ${"Scenario"}%-24s ${"Cold(ms)"}%9s ${"Warm(ms)"}%9s " +
         f"${"Speedup"}%8s ${"ColdFetch"}%10s ${"WarmFetch"}%10s"
     val rule = "-" * header.length
+    val shape = if (compressible) "compressible (id-derived)" else "incompressible (random)"
     println("")
-    println(s"Object-store data cache: cold vs warm by operation  ($base, fact=$factRows rows)")
+    println(
+      s"Object-store data cache: cold vs warm by operation  " +
+        s"($base, fact=$factRows rows x $valueCols cols, $shape)")
     println(rule)
     println(header)
     println(rule)
