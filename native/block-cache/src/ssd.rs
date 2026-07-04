@@ -21,8 +21,8 @@
 //! the tier cold-starts empty on restart (stale files are unlinked at construction).
 //!
 //! - **Admission**: only blocks that were hit at least once in the memory tier (accessed
-//!   >= 2 times) are admitted, filtering single-pass scan traffic that would only wear the
-//!   device.
+//!   twice or more) are admitted, filtering single-pass scan traffic that would only wear
+//!   the device.
 //! - **Writes**: batched and performed off the read path — admission only enqueues; a
 //!   background flush drains the queue and does the disk I/O without holding the shard lock.
 //! - **Eviction**: wholesale per region, by a decayed bytes-read score. Evicting whole
@@ -294,8 +294,9 @@ impl SsdCache {
         if spawn {
             let shard = Arc::clone(&shard);
             let metrics = Arc::clone(&self.metrics);
-            // Off the read path: the disk write runs on a blocking thread.
-            let _ = tokio::task::spawn_blocking(move || flush_shard(&shard, &metrics));
+            // Off the read path: the disk write runs on a blocking thread. Detach the handle
+            // (fire-and-forget); a named binding avoids clippy's `let_underscore_future`.
+            let _flush = tokio::task::spawn_blocking(move || flush_shard(&shard, &metrics));
         }
     }
 
