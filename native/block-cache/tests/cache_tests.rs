@@ -101,6 +101,7 @@ fn small_cache() -> Arc<BlockCache> {
         memory_budget: 64 << 20,
         num_shards: 4,
         max_coalesce_bytes: DEFAULT_MAX_COALESCE_BYTES,
+        ..Default::default()
     })
 }
 
@@ -271,10 +272,10 @@ async fn sieve_keeps_reused_block_evicts_one_hit_wonder() {
         memory_budget: bs * 2 + 4096, // room for 2 blocks + overhead
         num_shards: 1,
         max_coalesce_bytes: bs, // force one fetch per block for determinism
+        ..Default::default()
     });
     let data = seq(bs as usize * 10);
     let fetcher = MockFetcher::new(data.clone(), "v1");
-    let file = FileKey::new(0, "f");
 
     let read_block = |c: Arc<BlockCache>, f: Arc<MockFetcher>, idx: u64| async move {
         let start = idx * bs;
@@ -309,6 +310,7 @@ async fn set_memory_budget_shrink_evicts_then_growth_readmits() {
         memory_budget: bs * 8,
         num_shards: 1,
         max_coalesce_bytes: bs,
+        ..Default::default()
     });
     let data = seq(bs as usize * 8);
     let fetcher = MockFetcher::new(data.clone(), "v1");
@@ -351,6 +353,49 @@ async fn invalidate_file_drops_blocks() {
     cache.invalidate_file(&file);
     cache.get_ranges(&file, &[0..10], &*fetcher).await.unwrap();
     assert_eq!(fetcher.calls(), before + 1, "invalidated file must be re-fetched");
+}
+
+#[tokio::test]
+async fn ssd_tier_serves_evicted_blocks_without_network() {
+    let bs = MIN_BLOCK_SIZE;
+    let tmp = tempfile::tempdir().unwrap();
+    // Start with room for all three blocks, then shrink the budget to force a spill to SSD.
+    let cache = BlockCache::new(BlockCacheConfig {
+        block_size: bs,
+        memory_budget: bs * 3 + 8192,
+        num_shards: 1,
+        max_coalesce_bytes: bs,
+        ssd_dir: Some(tmp.path().to_path_buf()),
+        ssd_limit: bs * 8,
+        ssd_region_size: bs * 2,
+    });
+    let data = seq(bs as usize * 3);
+    let fetcher = MockFetcher::new(data.clone(), "v1");
+    let file = FileKey::new(0, "f");
+
+    // Fill and warm three blocks (read each twice so it passes the SSD admission gate).
+    for b in 0..3u64 {
+        let start = b * bs;
+        cache.get_ranges(&file, &[start..start + 8], &*fetcher).await.unwrap();
+        cache.get_ranges(&file, &[start..start + 8], &*fetcher).await.unwrap();
+    }
+    assert_eq!(fetcher.calls(), 3, "each block fetched exactly once");
+
+    // Shrink to ~1 block: the two evicted (hot) blocks are admitted to the SSD tier.
+    cache.set_memory_budget(bs + 8192);
+    cache.flush_ssd();
+    assert!(cache.stats().ssd_writes >= 2, "evicted hot blocks should spill to SSD");
+
+    // Read every block again. Flushing before each read guarantees any block evicted by the
+    // previous read's promotion is durable on SSD, so nothing goes back to the network.
+    for b in 0..3u64 {
+        cache.flush_ssd();
+        let start = b * bs;
+        let out = cache.get_ranges(&file, &[start..start + 8], &*fetcher).await.unwrap();
+        assert_eq!(&out[0][..], &data[start as usize..start as usize + 8]);
+    }
+    assert_eq!(fetcher.calls(), 3, "all re-reads served from memory or SSD, not the network");
+    assert!(cache.stats().ssd_hits >= 1, "at least one read came from the SSD tier");
 }
 
 #[tokio::test]

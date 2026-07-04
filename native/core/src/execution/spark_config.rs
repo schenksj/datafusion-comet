@@ -32,8 +32,6 @@ pub(crate) const COMET_DATA_CACHE_ENABLED: &str = "spark.comet.scan.dataCache.en
 pub(crate) const COMET_DATA_CACHE_MEMORY_LIMIT: &str = "spark.comet.scan.dataCache.memoryLimit";
 pub(crate) const COMET_DATA_CACHE_BLOCK_SIZE: &str = "spark.comet.scan.dataCache.blockSize";
 pub(crate) const COMET_DATA_CACHE_SSD_LIMIT: &str = "spark.comet.scan.dataCache.ssd.limit";
-// Read by the phase-2 SSD tier; declared now so the key set is stable.
-#[allow(dead_code)]
 pub(crate) const COMET_DATA_CACHE_SSD_PATH: &str = "spark.comet.scan.dataCache.ssd.path";
 
 pub(crate) trait SparkConfig {

@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -26,7 +27,8 @@ use futures::future::FutureExt;
 
 use crate::error::{CacheError, Result};
 use crate::metrics::{Metrics, MetricsSnapshot};
-use crate::sieve::{Block, BlockKey, FetchResult, InFlightFut, Shard};
+use crate::sieve::{Block, BlockKey, Evicted, FetchResult, InFlightFut, Shard};
+use crate::ssd::{SsdCache, SsdConfig, DEFAULT_REGION_SIZE};
 use crate::version::{FileKey, FileVersion};
 
 /// Minimum / maximum / default block size (the read quantum). Powers of two only.
@@ -49,6 +51,13 @@ pub struct BlockCacheConfig {
     pub num_shards: usize,
     /// Cap on bytes fetched in a single coalesced upstream request.
     pub max_coalesce_bytes: u64,
+    /// Directory for the SSD tier's region files. `None` (or `ssd_limit == 0`) disables the
+    /// tier — the cache runs memory-only.
+    pub ssd_dir: Option<PathBuf>,
+    /// SSD-tier budget in bytes; `0` disables the tier.
+    pub ssd_limit: u64,
+    /// SSD region size in bytes (blocks never span a region).
+    pub ssd_region_size: u64,
 }
 
 impl Default for BlockCacheConfig {
@@ -58,6 +67,9 @@ impl Default for BlockCacheConfig {
             memory_budget: 512 << 20,
             num_shards: DEFAULT_NUM_SHARDS,
             max_coalesce_bytes: DEFAULT_MAX_COALESCE_BYTES,
+            ssd_dir: None,
+            ssd_limit: 0,
+            ssd_region_size: DEFAULT_REGION_SIZE,
         }
     }
 }
@@ -117,6 +129,8 @@ pub struct BlockCache {
     files: Mutex<FileTable>,
     memory_budget: AtomicU64,
     metrics: Arc<Metrics>,
+    /// SSD tier (phase 2), or `None` for memory-only.
+    ssd: Option<SsdCache>,
 }
 
 impl BlockCache {
@@ -128,6 +142,19 @@ impl BlockCache {
             .map(|_| Mutex::new(Shard::new(per_shard_budget)))
             .collect();
         let max_coalesce_blocks = (config.max_coalesce_bytes / config.block_size).max(1) as u32;
+        let metrics = Arc::new(Metrics::default());
+        let ssd = match (&config.ssd_dir, config.ssd_limit) {
+            (Some(dir), limit) if limit > 0 => SsdCache::open(
+                SsdConfig {
+                    dir: dir.clone(),
+                    total_limit: limit,
+                    num_shards: config.num_shards,
+                    region_size: config.ssd_region_size.max(config.block_size),
+                },
+                Arc::clone(&metrics),
+            ),
+            _ => None,
+        };
         Arc::new(BlockCache {
             block_size: config.block_size,
             num_shards: config.num_shards,
@@ -139,7 +166,8 @@ impl BlockCache {
                 next_id: 0,
             }),
             memory_budget: AtomicU64::new(config.memory_budget),
-            metrics: Arc::new(Metrics::default()),
+            metrics,
+            ssd,
         })
     }
 
@@ -151,6 +179,15 @@ impl BlockCache {
     /// A snapshot of the cache counters.
     pub fn stats(&self) -> MetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// Flush any pending SSD-tier writes to disk synchronously. No-op when the SSD tier is
+    /// disabled. Background flushes handle this automatically in production; this is a
+    /// clean-shutdown / test hook.
+    pub fn flush_ssd(&self) {
+        if let Some(ssd) = &self.ssd {
+            ssd.flush();
+        }
     }
 
     /// Serve `ranges` of `file`. Reads are quantized to blocks internally; misses go
@@ -195,6 +232,24 @@ impl BlockCache {
                     self.metrics.record_miss();
                     missing.push(b);
                 }
+            }
+        }
+
+        // Second tier: serve memory misses from SSD before hitting the network. An SSD hit
+        // is promoted back into the memory tier.
+        if !missing.is_empty() {
+            if let Some(ssd) = &self.ssd {
+                let mut still_missing = Vec::with_capacity(missing.len());
+                for b in std::mem::take(&mut missing) {
+                    match ssd.get((file_id, b)).await {
+                        Some(bytes) => {
+                            self.promote_from_ssd((file_id, b), bytes.clone());
+                            have.insert(b, bytes);
+                        }
+                        None => still_missing.push(b),
+                    }
+                }
+                missing = still_missing;
             }
         }
 
@@ -337,15 +392,43 @@ impl BlockCache {
         senders: &mut HashMap<u32, tokio::sync::oneshot::Sender<FetchResult>>,
     ) {
         let key = (file_id, block_index);
-        {
+        let evicted = {
             let mut shard = self.shard(key).lock().unwrap();
-            shard.insert(key, Arc::clone(&block), &self.metrics);
+            let evicted = shard.insert(key, Arc::clone(&block), &self.metrics);
             shard.in_flight_remove(&key);
-        }
+            evicted
+        };
+        self.admit_evicted(evicted);
         have.insert(block_index, block.data.clone());
         if let Some(tx) = senders.remove(&block_index) {
             // A closed receiver just means no other task waited; ignore.
             let _ = tx.send(Ok(block));
+        }
+    }
+
+    /// Promote a block read from the SSD tier back into the memory tier, marking it accessed
+    /// so SIEVE keeps it.
+    fn promote_from_ssd(&self, key: BlockKey, bytes: Bytes) {
+        let block = Block::new(bytes);
+        block.visited.store(true, Ordering::Relaxed);
+        block.ever_visited.store(true, Ordering::Relaxed);
+        let evicted = self
+            .shard(key)
+            .lock()
+            .unwrap()
+            .insert(key, block, &self.metrics);
+        self.admit_evicted(evicted);
+    }
+
+    /// Admit memory-tier evictions to the SSD tier — only blocks hit at least once, filtering
+    /// single-pass scan traffic. No-op when the SSD tier is disabled.
+    fn admit_evicted(&self, evicted: Vec<Evicted>) {
+        if let Some(ssd) = &self.ssd {
+            for ev in evicted {
+                if ev.ever_visited {
+                    ssd.admit(ev.key, ev.data);
+                }
+            }
         }
     }
 
@@ -439,7 +522,8 @@ impl BlockCache {
         self.memory_budget.store(bytes, Ordering::Relaxed);
         let per_shard = bytes / self.num_shards as u64;
         for shard in &self.shards {
-            shard.lock().unwrap().set_budget(per_shard, &self.metrics);
+            let evicted = shard.lock().unwrap().set_budget(per_shard, &self.metrics);
+            self.admit_evicted(evicted);
         }
     }
 

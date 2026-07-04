@@ -24,6 +24,7 @@
 //! object-store instance cache).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use datafusion_comet_block_cache::{
@@ -34,7 +35,7 @@ use log::info;
 
 use crate::execution::spark_config::{
     SparkConfig, COMET_DATA_CACHE_BLOCK_SIZE, COMET_DATA_CACHE_ENABLED,
-    COMET_DATA_CACHE_MEMORY_LIMIT, COMET_DATA_CACHE_SSD_LIMIT,
+    COMET_DATA_CACHE_MEMORY_LIMIT, COMET_DATA_CACHE_SSD_LIMIT, COMET_DATA_CACHE_SSD_PATH,
 };
 
 /// Default memory-tier budget when the config is absent (512 MiB, matches `CometConf`).
@@ -53,18 +54,28 @@ pub(crate) fn global() -> Option<Arc<BlockCache>> {
     DATA_CACHE.get().and_then(|opt| opt.clone())
 }
 
-fn build(spark_config: &HashMap<String, String>, _local_dirs: &[String]) -> Option<Arc<BlockCache>> {
+fn build(spark_config: &HashMap<String, String>, local_dirs: &[String]) -> Option<Arc<BlockCache>> {
     if !spark_config.get_bool(COMET_DATA_CACHE_ENABLED) {
         return None;
     }
     let memory_budget = spark_config.get_u64(COMET_DATA_CACHE_MEMORY_LIMIT, DEFAULT_MEMORY_LIMIT);
     let block_size = spark_config.get_u64(COMET_DATA_CACHE_BLOCK_SIZE, DEFAULT_BLOCK_SIZE);
     let ssd_limit = spark_config.get_u64(COMET_DATA_CACHE_SSD_LIMIT, 0);
-    if ssd_limit > 0 {
-        // The SSD tier is phase 2; honor memory-tier config now and note the deferral.
+
+    // SSD tier: enabled when ssd.limit > 0. Directory is ssd.path if set, else the first
+    // Spark block-manager local dir (Yarn/K8s clean these up with the executor).
+    let ssd_dir: Option<PathBuf> = if ssd_limit > 0 {
+        spark_config
+            .get(COMET_DATA_CACHE_SSD_PATH)
+            .map(PathBuf::from)
+            .or_else(|| local_dirs.first().map(|d| PathBuf::from(d).join("comet-data-cache")))
+    } else {
+        None
+    };
+    if ssd_limit > 0 && ssd_dir.is_none() {
         info!(
-            "Comet data cache: SSD tier requested ({} MiB) but not yet implemented (phase 2); \
-             using memory tier only",
+            "Comet data cache: SSD tier requested ({} MiB) but no ssd.path and no Spark local \
+             dirs available; using memory tier only",
             ssd_limit >> 20
         );
     }
@@ -74,12 +85,20 @@ fn build(spark_config: &HashMap<String, String>, _local_dirs: &[String]) -> Opti
         memory_budget,
         num_shards: DEFAULT_NUM_SHARDS,
         max_coalesce_bytes: DEFAULT_MAX_COALESCE_BYTES,
+        ssd_dir: ssd_dir.clone(),
+        ssd_limit,
+        ..Default::default()
     });
     info!(
-        "Comet object-store data cache enabled: memory budget {} MiB, block size {} MiB, {} shards",
+        "Comet object-store data cache enabled: memory budget {} MiB, block size {} MiB, \
+         {} shards, SSD {}",
         memory_budget >> 20,
         cache.block_size() >> 20,
         DEFAULT_NUM_SHARDS,
+        match &ssd_dir {
+            Some(d) => format!("{} MiB at {}", ssd_limit >> 20, d.display()),
+            None => "disabled".to_string(),
+        },
     );
     Some(cache)
 }

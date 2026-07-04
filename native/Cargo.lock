@@ -2043,8 +2043,10 @@ version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "crc32c",
  "futures",
  "log",
+ "tempfile",
  "tokio",
 ]
 

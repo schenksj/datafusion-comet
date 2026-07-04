@@ -30,11 +30,14 @@ use crate::error::CacheError;
 use crate::metrics::Metrics;
 
 /// A cached block. `data` is the block's bytes (short for the final block of a file);
-/// `visited` is SIEVE's per-entry reference bit, set on every hit.
+/// `visited` is SIEVE's per-entry reference bit (set on hit, cleared by the eviction hand);
+/// `ever_visited` is a monotonic "was hit at least once" flag used as the SSD admission
+/// gate (accessed >= 2 times) — it is set on hit and never cleared, unlike `visited`.
 #[derive(Debug)]
 pub(crate) struct Block {
     pub data: Bytes,
     pub visited: AtomicBool,
+    pub ever_visited: AtomicBool,
 }
 
 impl Block {
@@ -42,8 +45,17 @@ impl Block {
         Arc::new(Block {
             data,
             visited: AtomicBool::new(false),
+            ever_visited: AtomicBool::new(false),
         })
     }
+}
+
+/// A block removed from the memory tier by eviction, handed to the caller so a visited
+/// block can be admitted to the SSD tier.
+pub(crate) struct Evicted {
+    pub key: BlockKey,
+    pub data: Bytes,
+    pub ever_visited: bool,
 }
 
 /// `(file_id, block_index)` — 12 bytes, cheap to hash and shard.
@@ -96,18 +108,20 @@ impl Shard {
         }
     }
 
-    /// Hit path: return a clone of the block if present, setting its `visited` bit.
+    /// Hit path: return a clone of the block if present, setting its reference bits.
     pub(crate) fn get(&self, key: &BlockKey) -> Option<Arc<Block>> {
         let block = self.map.get(key)?;
         block.visited.store(true, Ordering::Relaxed);
+        block.ever_visited.store(true, Ordering::Relaxed);
         Some(Arc::clone(block))
     }
 
     /// Insert a freshly fetched block, evicting in SIEVE order until back under budget.
-    /// A block already present (a concurrent fill won the race) is left as-is.
-    pub(crate) fn insert(&mut self, key: BlockKey, block: Arc<Block>, metrics: &Metrics) {
+    /// A block already present (a concurrent fill won the race) is left as-is. Returns the
+    /// blocks evicted to make room (for SSD admission).
+    pub(crate) fn insert(&mut self, key: BlockKey, block: Arc<Block>, metrics: &Metrics) -> Vec<Evicted> {
         if self.map.contains_key(&key) {
-            return;
+            return Vec::new();
         }
         let cost = block_cost(block.data.len());
         self.map.insert(key, block);
@@ -118,31 +132,34 @@ impl Shard {
             self.hand += 1;
         }
         self.current_bytes += cost;
-        self.evict_to(self.budget, metrics);
+        self.evict_to(self.budget, metrics)
     }
 
-    /// Change this shard's budget and evict down to it immediately.
-    pub(crate) fn set_budget(&mut self, budget: u64, metrics: &Metrics) {
+    /// Change this shard's budget and evict down to it immediately. Returns evicted blocks.
+    pub(crate) fn set_budget(&mut self, budget: u64, metrics: &Metrics) -> Vec<Evicted> {
         self.budget = budget;
-        self.evict_to(budget, metrics);
+        self.evict_to(budget, metrics)
     }
 
     /// Evict in SIEVE order until `current_bytes <= target` (or the shard is empty).
-    fn evict_to(&mut self, target: u64, metrics: &Metrics) {
+    fn evict_to(&mut self, target: u64, metrics: &Metrics) -> Vec<Evicted> {
+        let mut evicted = Vec::new();
         while self.current_bytes > target && !self.map.is_empty() {
-            if let Some(cost) = self.evict_one() {
+            if let Some((cost, ev)) = self.evict_one() {
                 self.current_bytes -= cost;
                 metrics.record_eviction();
+                evicted.push(ev);
             } else {
                 break;
             }
         }
+        evicted
     }
 
     /// Evict exactly one block per SIEVE: walk from the hand giving visited entries a
     /// second chance (clearing their bit) until an unvisited entry is found and removed.
-    /// Returns the evicted block's accounted cost.
-    fn evict_one(&mut self) -> Option<u64> {
+    /// Returns the evicted block's accounted cost and a descriptor for SSD admission.
+    fn evict_one(&mut self) -> Option<(u64, Evicted)> {
         if self.queue.is_empty() {
             return None;
         }
@@ -171,18 +188,23 @@ impl Shard {
                 };
             } else {
                 // Evict this entry.
-                let cost = self
-                    .map
-                    .remove(&key)
-                    .map(|b| block_cost(b.data.len()))
-                    .unwrap_or(0);
+                let evicted = self.map.remove(&key).map(|b| {
+                    (
+                        block_cost(b.data.len()),
+                        Evicted {
+                            key,
+                            data: b.data.clone(),
+                            ever_visited: b.ever_visited.load(Ordering::Relaxed),
+                        },
+                    )
+                });
                 self.queue.remove(self.hand);
                 // The hand now refers to the element that followed the victim toward the
                 // tail; leave it there (clamped on next entry). Nothing to adjust.
                 if self.hand >= self.queue.len() && !self.queue.is_empty() {
                     self.hand = self.queue.len() - 1;
                 }
-                return Some(cost);
+                return evicted;
             }
         }
         None

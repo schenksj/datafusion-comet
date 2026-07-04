@@ -35,6 +35,14 @@ pub struct Metrics {
     pub evictions: AtomicU64,
     /// Files invalidated because their version changed under us.
     pub invalidations: AtomicU64,
+    /// Block reads served from the SSD tier (avoided a network fetch).
+    pub ssd_hits: AtomicU64,
+    /// Blocks written to the SSD tier.
+    pub ssd_writes: AtomicU64,
+    /// SSD reads that failed crc32c verification and fell through to the network.
+    pub ssd_corruptions: AtomicU64,
+    /// SSD regions reclaimed wholesale by the eviction policy.
+    pub ssd_region_evictions: AtomicU64,
 }
 
 /// A point-in-time copy of [`Metrics`], safe to format/log.
@@ -46,6 +54,10 @@ pub struct MetricsSnapshot {
     pub bytes_fetched: u64,
     pub evictions: u64,
     pub invalidations: u64,
+    pub ssd_hits: u64,
+    pub ssd_writes: u64,
+    pub ssd_corruptions: u64,
+    pub ssd_region_evictions: u64,
 }
 
 impl MetricsSnapshot {
@@ -87,6 +99,26 @@ impl Metrics {
         self.invalidations.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[inline]
+    pub(crate) fn record_ssd_hit(&self) {
+        self.ssd_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_ssd_write(&self) {
+        self.ssd_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_ssd_corruption(&self) {
+        self.ssd_corruptions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_ssd_region_eviction(&self) {
+        self.ssd_region_evictions.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             hits: self.hits.load(Ordering::Relaxed),
@@ -95,6 +127,10 @@ impl Metrics {
             bytes_fetched: self.bytes_fetched.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             invalidations: self.invalidations.load(Ordering::Relaxed),
+            ssd_hits: self.ssd_hits.load(Ordering::Relaxed),
+            ssd_writes: self.ssd_writes.load(Ordering::Relaxed),
+            ssd_corruptions: self.ssd_corruptions.load(Ordering::Relaxed),
+            ssd_region_evictions: self.ssd_region_evictions.load(Ordering::Relaxed),
         }
     }
 }

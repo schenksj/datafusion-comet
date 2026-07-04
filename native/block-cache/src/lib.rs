@@ -56,6 +56,7 @@ mod cache;
 mod error;
 mod metrics;
 mod sieve;
+mod ssd;
 mod version;
 
 pub use cache::{
