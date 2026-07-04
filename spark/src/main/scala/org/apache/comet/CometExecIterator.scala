@@ -129,6 +129,11 @@ class CometExecIterator(
       TaskContext.get())
   }
 
+  // In unified-memory mode, account the data cache's memory tier as off-heap storage memory
+  // now that createPlan has built the native cache. Idempotent no-op when the cache or
+  // unified-memory accounting is disabled.
+  CometCacheMemoryManager.maybeInitialize()
+
   private var nextBatch: Option[ColumnarBatch] = None
   private var prevBatch: ColumnarBatch = null
   private var currentBatch: ColumnarBatch = null

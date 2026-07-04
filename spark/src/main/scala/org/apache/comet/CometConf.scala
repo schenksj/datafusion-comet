@@ -203,6 +203,19 @@ object CometConf extends ShimCometConf {
       .booleanConf
       .createWithDefault(true)
 
+  val COMET_DATA_CACHE_UNIFIED_MEMORY_ENABLED: ConfigEntry[Boolean] =
+    conf("spark.comet.scan.dataCache.unifiedMemory.enabled")
+      .category(CATEGORY_SCAN)
+      .doc(
+        "Whether to account the data cache's memory tier as off-heap storage memory in " +
+          "Spark's unified memory manager (in fixed 64 MiB quanta) instead of consuming " +
+          "spark.executor.memoryOverhead headroom. Requires spark.memory.offHeap.enabled. " +
+          "The cache grows only up to what Spark grants and gives way to query execution " +
+          "under memory pressure. Consumed only on the executor (JVM side). Experimental; " +
+          "no effect when spark.comet.scan.dataCache.enabled is false.")
+      .booleanConf
+      .createWithDefault(false)
+
   val COMET_CSV_V2_NATIVE_ENABLED: ConfigEntry[Boolean] =
     conf("spark.comet.scan.csv.v2.enabled")
       .category(CATEGORY_TESTING)

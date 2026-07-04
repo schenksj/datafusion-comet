@@ -105,6 +105,14 @@ class Native extends NativeBase {
   @native def releasePlan(plan: Long): Unit
 
   /**
+   * Set the process-global object-store data cache memory-tier budget (bytes). Called by
+   * `CometCacheMemoryManager` (unified-memory mode) to push the storage-memory grant down to the
+   * native cache, which evicts to the new budget before returning. No-op if the data cache is
+   * disabled.
+   */
+  @native def setDataCacheMemoryBudget(bytes: Long): Unit
+
+  /**
    * Used by Comet shuffle external sorter to write sorted records to disk.
    *
    * @param addresses

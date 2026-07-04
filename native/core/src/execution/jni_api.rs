@@ -942,6 +942,23 @@ pub extern "system" fn Java_org_apache_comet_Native_releasePlan(
     })
 }
 
+#[no_mangle]
+/// Set the process-global data cache memory-tier budget (bytes). Used by the JVM
+/// `CometCacheMemoryManager` in unified-memory mode to push the current storage-memory grant
+/// down to the native cache. No-op when the data cache is disabled.
+pub extern "system" fn Java_org_apache_comet_Native_setDataCacheMemoryBudget(
+    e: EnvUnowned,
+    _class: JClass,
+    bytes: jlong,
+) {
+    try_unwrap_or_throw(&e, |_env| {
+        if let Some(cache) = crate::execution::data_cache::global() {
+            cache.set_memory_budget(bytes.max(0) as u64);
+        }
+        Ok(())
+    })
+}
+
 fn update_metrics(env: &mut Env, exec_context: &mut ExecutionContext) -> CometResult<()> {
     if let Some(native_query) = &exec_context.root_op {
         let metrics = exec_context.metrics.as_obj();

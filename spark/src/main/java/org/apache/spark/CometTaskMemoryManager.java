@@ -61,6 +61,20 @@ public class CometTaskMemoryManager {
     }
     long acquired = internal.acquireExecutionMemory(size, nativeMemoryConsumer);
     long newUsed = used.addAndGet(acquired);
+
+    // Execution-shortfall hook (OBJECT_STORE_CACHE_DESIGN.md section 2.9): under unified-memory
+    // mode, if execution could not get all it asked for, shrink the data cache to free
+    // off-heap storage memory and retry the acquire once. `isActive()` is false (and this whole
+    // block a no-op) unless the cache's unified-memory accounting is enabled.
+    if (acquired < size && CometCacheMemoryManager.isActive()) {
+      long released = CometCacheMemoryManager.releaseQuanta(size - acquired);
+      if (released > 0) {
+        long extra = internal.acquireExecutionMemory(size - acquired, nativeMemoryConsumer);
+        acquired += extra;
+        newUsed = used.addAndGet(extra);
+      }
+    }
+
     if (acquired < size) {
       logger.warn(
           "Task {} requested {} bytes but only received {} bytes. Current allocation is {} and "
