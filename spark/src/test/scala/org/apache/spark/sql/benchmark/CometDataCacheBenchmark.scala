@@ -102,9 +102,13 @@ object CometDataCacheBenchmark extends CometBenchmarkBase {
       .getOrCreate()
   }
 
-  // Rows in the fact table (configurable; keep the S3 dataset a few hundred MB so byte-fetch time
-  // dominates and the cache effect is visible).
+  // Rows in the fact table (configurable). Combined with `valueCols` random-double columns this
+  // targets a ~0.5 GB on-disk dataset (4M rows * 16 cols * 8 bytes ~= 512 MB).
   private def factRows: Long = env("COMET_DATA_CACHE_BENCH_ROWS").map(_.toLong).getOrElse(rows)
+  // Number of value columns. Uniform random doubles: incompressible (so on-disk size reflects the
+  // logical size, unlike id-derived columns which Parquet dictionary/RLE crush to near zero), and
+  // wide enough that a single-column projection fetches a small fraction of the file.
+  private final val valueCols: Int = 16
   // Distinct join keys (also the dimension table's row count).
   private final val dimKeys: Long = 4000
   // Warm iterations timed per scenario (median reported).
@@ -115,13 +119,17 @@ object CometDataCacheBenchmark extends CometBenchmarkBase {
   /** One benchmark scenario: a category, a label, and the SQL to run. */
   private case class Scenario(category: String, name: String, sql: String)
 
+  private def sumOf(cols: Seq[Int]): String = cols.map(i => s"sum(v$i)").mkString(" + ")
+
   private val scenarios: Seq[Scenario] = Seq(
     Scenario(
       "scan",
-      "full scan (5 cols)",
-      "SELECT sum(v1)+sum(v2)+sum(v3)+sum(v4)+sum(v5) FROM fact"),
+      s"full scan ($valueCols cols)",
+      s"SELECT ${sumOf(1 to valueCols)} FROM fact"),
     Scenario("scan", "projection (1 col)", "SELECT sum(v1) FROM fact"),
-    Scenario("scan", "filter (v2 < 250)", "SELECT sum(v1) FROM fact WHERE v2 < 250"),
+    Scenario("scan", "projection (4 cols)", s"SELECT ${sumOf(1 to 4)} FROM fact"),
+    // v2 is uniform in [0, 1), so this reads ~all of v1 + v2 and keeps ~25% of rows.
+    Scenario("scan", "filter (v2 < 0.25)", "SELECT sum(v1) FROM fact WHERE v2 < 0.25"),
     Scenario(
       "agg",
       "group-by aggregation",
@@ -150,16 +158,13 @@ object CometDataCacheBenchmark extends CometBenchmarkBase {
   private def prepareData(base: String): Unit = {
     val factPath = s"$base/fact"
     val dimPath = s"$base/dim"
+    // `id` and `k` (the join key) are derived and compress well, but the value columns are
+    // uniform random doubles (seeded per column) so they do not compress -- the file lands near
+    // its logical size and column chunks are large enough that projections fetch a real fraction.
+    val valueExprs = (1 to valueCols).map(i => s"rand($i) AS v$i")
     spark
       .range(factRows)
-      .selectExpr(
-        "id",
-        s"cast(id % $dimKeys as long) AS k",
-        "cast(id as double) AS v1",
-        "cast(id % 1000 as double) AS v2",
-        "cast(id % 997 as double) AS v3",
-        "cast(id % 991 as double) AS v4",
-        "cast(id % 977 as double) AS v5")
+      .selectExpr(Seq("id", s"cast(id % $dimKeys as long) AS k") ++ valueExprs: _*)
       .write
       .mode("overwrite")
       .parquet(factPath)
