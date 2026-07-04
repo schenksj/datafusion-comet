@@ -17,13 +17,15 @@
  * under the License.
  */
 
-package org.apache.spark;
+package org.apache.spark.comet;
 
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.spark.SparkConf;
+import org.apache.spark.SparkEnv;
 import org.apache.spark.memory.MemoryManager;
 import org.apache.spark.memory.MemoryMode;
 import org.apache.spark.storage.BlockId;
@@ -36,9 +38,13 @@ import org.apache.comet.Native;
  * <em>storage</em> memory in Spark's unified memory manager, instead of consuming {@code
  * spark.executor.memoryOverhead} headroom (OBJECT_STORE_CACHE_DESIGN.md section 2.9).
  *
+ * <p>Lives in {@code org.apache.spark.comet} because Spark's {@link MemoryManager} is {@code
+ * private[spark]}; it is not in the root {@code org.apache.spark} package to avoid needing a
+ * jar-contents allowlist entry.
+ *
  * <p>Memory is reserved in fixed 64 MiB quanta (the SSD region unit). The native cache never
  * exceeds what Spark has granted: {@link #initialize(long)} acquires up to the configured cap, and
- * {@link #releaseQuanta(long)} - driven from {@link CometTaskMemoryManager}'s execution shortfall -
+ * {@link #releaseQuanta(long)} - driven from {@code CometTaskMemoryManager}'s execution shortfall -
  * shrinks the native cache (which evicts to the new budget) and returns the freed quanta so query
  * execution can borrow them. This keeps the reservation reclaimable even though it is not backed by
  * real {@code MemoryStore} blocks.

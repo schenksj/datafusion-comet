@@ -24,6 +24,7 @@ import java.lang.management.ManagementFactory
 import org.apache.hadoop.conf.Configuration
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.comet.CometCacheMemoryManager
 import org.apache.spark.internal.Logging
 import org.apache.spark.network.util.ByteUnit
 import org.apache.spark.sql.comet.CometMetricNode
