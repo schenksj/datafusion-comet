@@ -55,12 +55,15 @@ import org.apache.comet.{CometConf, CometSparkSessionExtensions}
  */
 object CometDataCacheBenchmark extends CometBenchmarkBase {
 
-  private val S3_PATH_ENV = "COMET_DATA_CACHE_BENCH_S3_PATH"
-  private val S3_CRED_PROVIDER_ENV = "COMET_DATA_CACHE_BENCH_S3_CRED_PROVIDER"
-  private val DEFAULT_CRED_PROVIDER =
+  // `final val` so Scala inlines these as compile-time constants. The base benchmark trait calls
+  // getSparkSession during its own initialization, before this object's plain vals are assigned,
+  // so a non-final val referenced there would still be null (NPE at startup).
+  private final val S3_PATH_ENV = "COMET_DATA_CACHE_BENCH_S3_PATH"
+  private final val S3_CRED_PROVIDER_ENV = "COMET_DATA_CACHE_BENCH_S3_CRED_PROVIDER"
+  private final val DEFAULT_CRED_PROVIDER =
     "software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider"
 
-  private val rows: Long = 8 * 1024 * 1024
+  private final val rows: Long = 8 * 1024 * 1024
 
   private def env(name: String): Option[String] =
     sys.env.get(name).orElse(sys.props.get(name)).map(_.trim).filter(_.nonEmpty)
