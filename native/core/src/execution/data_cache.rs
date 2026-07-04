@@ -54,6 +54,34 @@ pub(crate) fn global() -> Option<Arc<BlockCache>> {
     DATA_CACHE.get().and_then(|opt| opt.clone())
 }
 
+/// Snapshot of the global cache counters, or all zeros when the cache is disabled. Order:
+/// `[hits, misses, fetches, bytes_fetched, evictions, invalidations, ssd_hits, ssd_writes]`.
+pub(crate) fn stats() -> [i64; 8] {
+    match global() {
+        Some(cache) => {
+            let s = cache.stats();
+            [
+                s.hits as i64,
+                s.misses as i64,
+                s.fetches as i64,
+                s.bytes_fetched as i64,
+                s.evictions as i64,
+                s.invalidations as i64,
+                s.ssd_hits as i64,
+                s.ssd_writes as i64,
+            ]
+        }
+        None => [0i64; 8],
+    }
+}
+
+/// Drop all cached blocks from the global cache (maintenance / cold-cache benchmarking).
+pub(crate) fn clear() {
+    if let Some(cache) = global() {
+        cache.clear();
+    }
+}
+
 fn build(spark_config: &HashMap<String, String>, local_dirs: &[String]) -> Option<Arc<BlockCache>> {
     if !spark_config.get_bool(COMET_DATA_CACHE_ENABLED) {
         return None;

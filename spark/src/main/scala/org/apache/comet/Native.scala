@@ -113,6 +113,19 @@ class Native extends NativeBase {
   @native def setDataCacheMemoryBudget(bytes: Long): Unit
 
   /**
+   * Snapshot of the process-global object-store data cache counters, as `[hits, misses, fetches,
+   * bytesFetched, evictions, invalidations, ssdHits, ssdWrites]`. All zeros when the data cache
+   * is disabled. Used for benchmarking/observability.
+   */
+  @native def getDataCacheStats(): Array[Long]
+
+  /**
+   * Drop all cached blocks from the process-global object-store data cache. No-op if the cache is
+   * disabled. Used to force a cold cache (e.g. between benchmark scenarios).
+   */
+  @native def clearDataCache(): Unit
+
+  /**
    * Used by Comet shuffle external sorter to write sorted records to disk.
    *
    * @param addresses

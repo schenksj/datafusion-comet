@@ -190,6 +190,20 @@ impl BlockCache {
         }
     }
 
+    /// Drop all cached blocks and captured versions from every tier, forcing subsequent reads
+    /// to re-fetch from the underlying store. Used for maintenance and cold-cache benchmarking.
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            shard.lock().unwrap().clear();
+        }
+        if let Some(ssd) = &self.ssd {
+            ssd.clear();
+        }
+        let mut files = self.files.lock().unwrap();
+        files.ids.clear();
+        files.versions.clear();
+    }
+
     /// Serve `ranges` of `file`. Reads are quantized to blocks internally; misses go
     /// through `fetcher` exactly once per block regardless of concurrent callers. Returns
     /// one `Bytes` per input range, byte-for-byte identical to reading the store directly.

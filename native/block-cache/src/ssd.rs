@@ -317,6 +317,19 @@ impl SsdCache {
             flush_shard(shard, &self.metrics);
         }
     }
+
+    /// Drop the in-memory index so nothing is served from disk (the region files keep their
+    /// bytes but become unreachable and are overwritten as regions are reused).
+    pub(crate) fn clear(&self) {
+        for shard in &self.shards {
+            let mut g = shard.lock().unwrap();
+            g.index.clear();
+            g.regions.clear();
+            g.active = None;
+            g.pending.clear();
+            g.pending_bytes = 0;
+        }
+    }
 }
 
 /// Read + verify a single block. Runs on a blocking thread.

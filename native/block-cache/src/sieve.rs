@@ -248,4 +248,12 @@ impl Shard {
     pub(crate) fn in_flight_remove(&mut self, key: &BlockKey) {
         self.in_flight.remove(key);
     }
+
+    /// Drop all cached blocks (in-flight fetches are left to complete on their own).
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.queue.clear();
+        self.hand = 0;
+        self.current_bytes = 0;
+    }
 }

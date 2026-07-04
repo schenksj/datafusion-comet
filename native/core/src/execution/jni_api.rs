@@ -959,6 +959,35 @@ pub extern "system" fn Java_org_apache_comet_Native_setDataCacheMemoryBudget(
     })
 }
 
+#[no_mangle]
+/// Return a snapshot of the process-global data cache counters as a long array:
+/// `[hits, misses, fetches, bytes_fetched, evictions, invalidations, ssd_hits, ssd_writes]`.
+/// All zeros when the data cache is disabled. Used by benchmarks/observability.
+pub extern "system" fn Java_org_apache_comet_Native_getDataCacheStats(
+    e: EnvUnowned,
+    _class: JClass,
+) -> jlongArray {
+    try_unwrap_or_throw(&e, |env| {
+        let stats = crate::execution::data_cache::stats();
+        let array = env.new_long_array(stats.len())?;
+        array.set_region(env, 0, &stats)?;
+        Ok(array.into_raw())
+    })
+}
+
+#[no_mangle]
+/// Drop all cached blocks from the process-global data cache. No-op when disabled. Used to
+/// force a cold cache between benchmark scenarios.
+pub extern "system" fn Java_org_apache_comet_Native_clearDataCache(
+    e: EnvUnowned,
+    _class: JClass,
+) {
+    try_unwrap_or_throw(&e, |_env| {
+        crate::execution::data_cache::clear();
+        Ok(())
+    })
+}
+
 fn update_metrics(env: &mut Env, exec_context: &mut ExecutionContext) -> CometResult<()> {
     if let Some(native_query) = &exec_context.root_op {
         let metrics = exec_context.metrics.as_obj();
