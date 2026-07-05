@@ -228,7 +228,7 @@ object CometDataCacheBenchmark extends CometBenchmarkBase {
     val shape = if (compressible) "compressible (id-derived)" else "incompressible (random)"
     println("")
     println(
-      s"Object-store data cache: cold vs warm by operation  " +
+      "Object-store data cache: cold vs warm by operation  " +
         s"($base, fact=$factRows rows x $valueCols cols, $shape)")
     println(rule)
     println(header)
