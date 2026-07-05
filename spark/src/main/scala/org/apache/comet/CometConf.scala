@@ -219,12 +219,11 @@ object CometConf extends ShimCometConf {
   val COMET_PREFETCH_ENABLED: ConfigEntry[Boolean] =
     conf("spark.comet.scan.dataCache.prefetch.enabled")
       .category(CATEGORY_SCAN)
-      .doc(
-        "Whether to asynchronously prefetch the byte ranges a native scan is about to read " +
-          "into the data cache, ahead of the decoder, on Comet's background runtime (never on " +
-          "the Spark task thread). Removes the cold-scan first-read penalty by overlapping " +
-          "object-store I/O with decode. Requires spark.comet.scan.dataCache.enabled (the cache " +
-          "is the prefetch buffer); warn-and-ignored otherwise. Experimental.")
+      .doc("Whether to asynchronously prefetch the byte ranges a native scan is about to read " +
+        "into the data cache, ahead of the decoder, on Comet's background runtime (never on " +
+        "the Spark task thread). Removes the cold-scan first-read penalty by overlapping " +
+        "object-store I/O with decode. Requires spark.comet.scan.dataCache.enabled (the cache " +
+        "is the prefetch buffer); warn-and-ignored otherwise. Experimental.")
       .booleanConf
       .createWithDefault(false)
 
@@ -245,11 +244,10 @@ object CometConf extends ShimCometConf {
   val COMET_PREFETCH_MAX_CONCURRENT_REQUESTS: ConfigEntry[Int] =
     conf("spark.comet.scan.dataCache.prefetch.maxConcurrentRequests")
       .category(CATEGORY_SCAN)
-      .doc(
-        "Per-scan cap on concurrent upstream prefetch requests — the lever that lifts the " +
-          "single-outstanding-I/O ceiling of a cold scan. A process-wide semaphore additionally " +
-          "bounds total concurrent prefetch requests. Only used when " +
-          "spark.comet.scan.dataCache.prefetch.enabled is true.")
+      .doc("Per-scan cap on concurrent upstream prefetch requests — the lever that lifts the " +
+        "single-outstanding-I/O ceiling of a cold scan. A process-wide semaphore additionally " +
+        "bounds total concurrent prefetch requests. Only used when " +
+        "spark.comet.scan.dataCache.prefetch.enabled is true.")
       .intConf
       .createWithDefault(3)
 
