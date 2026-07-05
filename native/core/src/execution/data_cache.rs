@@ -55,8 +55,11 @@ pub(crate) fn global() -> Option<Arc<BlockCache>> {
 }
 
 /// Snapshot of the global cache counters, or all zeros when the cache is disabled. Order:
-/// `[hits, misses, fetches, bytes_fetched, evictions, invalidations, ssd_hits, ssd_writes]`.
-pub(crate) fn stats() -> [i64; 8] {
+/// `[hits, misses, fetches, bytes_fetched, evictions, invalidations, ssd_hits, ssd_writes,
+/// prefetch_bytes_fetched, prefetch_fetch_requests, prefetch_blocks_consumed,
+/// prefetch_blocks_wasted, prefetch_errors, prefetch_files_skipped]`. The prefetch columns
+/// (SCAN_PREFETCH_DESIGN.md §2.9) are appended so existing consumers keep their indices.
+pub(crate) fn stats() -> [i64; 14] {
     match global() {
         Some(cache) => {
             let s = cache.stats();
@@ -69,9 +72,15 @@ pub(crate) fn stats() -> [i64; 8] {
                 s.invalidations as i64,
                 s.ssd_hits as i64,
                 s.ssd_writes as i64,
+                s.prefetch_bytes_fetched as i64,
+                s.prefetch_fetch_requests as i64,
+                s.prefetch_blocks_consumed as i64,
+                s.prefetch_blocks_wasted as i64,
+                s.prefetch_errors as i64,
+                s.prefetch_files_skipped as i64,
             ]
         }
-        None => [0i64; 8],
+        None => [0i64; 14],
     }
 }
 

@@ -38,6 +38,11 @@ use datafusion_datasource::TableSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Parquet footer metadata prefetch hint (matches DataFusion's default). The scan pins this so
+/// the async reader fetches the footer tail in one request; the scan prefetcher reuses the same
+/// value so it lands byte-identical footer blocks (SCAN_PREFETCH_DESIGN.md §2.3.1).
+pub(crate) const METADATA_SIZE_HINT: usize = 512 * 1024;
+
 /// Initializes a DataSourceExec plan with a ParquetSource for Comet's native Parquet scan.
 ///
 ///   `required_schema`: Schema to be projected by the scan.
@@ -132,7 +137,7 @@ pub(crate) fn init_datasource_exec(
 
     let mut parquet_source = ParquetSource::new(table_schema)
         .with_table_parquet_options(table_parquet_options)
-        .with_metadata_size_hint(512 * 1024); // Same as DataFusion's default
+        .with_metadata_size_hint(METADATA_SIZE_HINT); // Same as DataFusion's default
 
     if encryption_enabled {
         parquet_source = parquet_source.with_encryption_factory(

@@ -80,9 +80,10 @@ use datafusion_spark::function::aggregate::collect::SparkCollectSet;
 use iceberg::expr::Bind;
 
 use crate::execution::operators::ExecutionError::GeneralError;
+use crate::execution::prefetch::{PrefetchConfig, PrefetchFile, PrefetchKind, PrefetchSpec};
 use crate::execution::shuffle::{CometPartitioning, CompressionCodec};
 use crate::execution::spark_plan::SparkPlan;
-use crate::parquet::parquet_support::prepare_object_store_with_configs;
+use crate::parquet::parquet_support::{caching_store_for, prepare_object_store_with_configs};
 use datafusion::common::scalar::ScalarStructBuilder;
 use datafusion::common::{
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
@@ -137,6 +138,7 @@ use itertools::Itertools;
 use jni::objects::{Global, JObject};
 use num::{BigInt, ToPrimitive};
 use object_store::path::Path;
+use std::cell::RefCell;
 use std::cmp::max;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
@@ -192,6 +194,12 @@ pub struct PhysicalPlanner {
     /// Captured at `createPlan` time on `ExecutionContext`; see that struct for the
     /// propagation rationale. `None` when no driving Spark task is available.
     task_context: Option<Arc<Global<JObject<'static>>>>,
+    /// Scan prefetch configuration (disabled by default). Read in the scan arms to decide
+    /// whether to accumulate a `PrefetchSpec` (SCAN_PREFETCH_DESIGN.md §2.2).
+    prefetch_config: PrefetchConfig,
+    /// Prefetch specs accumulated while building the plan, one per prefetchable scan. Drained
+    /// by `jni_api` after `create_plan` to spawn the background prefetch tasks.
+    prefetch_specs: RefCell<Vec<PrefetchSpec>>,
 }
 
 impl Default for PhysicalPlanner {
@@ -208,12 +216,52 @@ impl PhysicalPlanner {
             partition,
             query_context_registry: datafusion_comet_spark_expr::create_query_context_map(),
             task_context: None,
+            prefetch_config: PrefetchConfig::default(),
+            prefetch_specs: RefCell::new(Vec::new()),
         }
     }
 
     pub fn with_exec_id(mut self, exec_context_id: i64) -> Self {
         self.exec_context_id = exec_context_id;
         self
+    }
+
+    /// Enable scan prefetch spec accumulation with the given (already cache-gated) config.
+    pub fn with_prefetch_config(mut self, prefetch_config: PrefetchConfig) -> Self {
+        self.prefetch_config = prefetch_config;
+        self
+    }
+
+    /// Drain the prefetch specs accumulated during `create_plan`.
+    pub fn take_prefetch_specs(&self) -> Vec<PrefetchSpec> {
+        std::mem::take(&mut self.prefetch_specs.borrow_mut())
+    }
+
+    /// Accumulate one scan's prefetch spec, deriving per-file inputs (path, size, split range)
+    /// from the DataFusion `PartitionedFile`s in scan-consumption order.
+    fn push_prefetch_spec(
+        &self,
+        store: Arc<datafusion_comet_object_store_cache::CachingObjectStore>,
+        files: &[PartitionedFile],
+        kind: PrefetchKind,
+    ) {
+        let prefetch_files: Vec<PrefetchFile> = files
+            .iter()
+            .map(|pf| PrefetchFile {
+                path: pf.object_meta.location.clone(),
+                size: pf.object_meta.size,
+                range: pf
+                    .range
+                    .as_ref()
+                    .map(|r| (r.start.max(0) as u64)..(r.end.max(0) as u64)),
+            })
+            .collect();
+        self.prefetch_specs.borrow_mut().push(PrefetchSpec {
+            store,
+            files: prefetch_files,
+            kind,
+            config: self.prefetch_config,
+        });
     }
 
     /// Attach a propagated Spark `TaskContext` global reference. Called by the JNI `executePlan`
@@ -1450,13 +1498,32 @@ impl PhysicalPlanner {
                     .collect();
                 let (object_store_url, _) = prepare_object_store_with_configs(
                     self.session_ctx.runtime_env(),
-                    one_file,
+                    one_file.clone(),
                     &object_store_options,
                 )?;
 
                 // Get files for this partition
                 let files = self.get_partitioned_files(partition_files)?;
                 let file_groups: Vec<Vec<PartitionedFile>> = vec![files];
+
+                let data_filters = data_filters?;
+
+                // Accumulate a prefetch spec for this scan (SCAN_PREFETCH_DESIGN.md §2.2), when
+                // prefetch is enabled and the store is the wrapped caching store.
+                if self.prefetch_config.enabled {
+                    if let Some(store) = caching_store_for(&one_file, &object_store_options) {
+                        self.push_prefetch_spec(
+                            store,
+                            &file_groups[0],
+                            PrefetchKind::Parquet {
+                                projection: projection_vector.clone(),
+                                data_filters: data_filters.clone(),
+                                filter_schema: Arc::clone(&required_schema),
+                                encryption: common.encryption_enabled,
+                            },
+                        );
+                    }
+                }
 
                 let scan = init_datasource_exec(
                     required_schema,
@@ -1465,7 +1532,7 @@ impl PhysicalPlanner {
                     object_store_url,
                     file_groups,
                     Some(projection_vector),
-                    Some(data_filters?),
+                    Some(data_filters),
                     default_values,
                     common.session_timezone.as_str(),
                     common.case_sensitive,
@@ -1502,12 +1569,21 @@ impl PhysicalPlanner {
                     .ok_or(GeneralError("Failed to locate file".to_string()))?;
                 let (object_store_url, _) = prepare_object_store_with_configs(
                     self.session_ctx.runtime_env(),
-                    one_file,
+                    one_file.clone(),
                     &object_store_options,
                 )?;
                 let files =
                     self.get_partitioned_files(&scan.file_partitions[self.partition as usize])?;
                 let file_groups: Vec<Vec<PartitionedFile>> = vec![files];
+
+                // A CSV split `[start, end)` is exactly what the reader consumes — sequential
+                // prefetch of the split range is exact (SCAN_PREFETCH_DESIGN.md §2.3).
+                if self.prefetch_config.enabled {
+                    if let Some(store) = caching_store_for(&one_file, &object_store_options) {
+                        self.push_prefetch_spec(store, &file_groups[0], PrefetchKind::Csv);
+                    }
+                }
+
                 let scan = init_csv_datasource_exec(
                     object_store_url,
                     file_groups,

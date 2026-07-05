@@ -106,6 +106,7 @@ use crate::execution::tracing::{
 };
 
 use crate::execution::memory_pools::logging_pool::LoggingMemoryPool;
+use crate::execution::prefetch::{PrefetchConfig, PrefetchHandle};
 use crate::execution::spark_config::{
     SparkConfig, COMET_DEBUG_ENABLED, COMET_DEBUG_MEMORY, COMET_EXPLAIN_NATIVE_ENABLED,
     COMET_MAX_TEMP_DIRECTORY_SIZE, COMET_PARQUET_ROW_FILTER_PUSHDOWN_ENABLED,
@@ -113,7 +114,7 @@ use crate::execution::spark_config::{
 };
 use crate::parquet::encryption_support::{CometEncryptionFactory, ENCRYPTION_FACTORY_ID};
 use datafusion_comet_proto::spark_operator::operator::OpStruct;
-use log::info;
+use log::{info, warn};
 use std::sync::OnceLock;
 #[cfg(feature = "jemalloc")]
 use tikv_jemalloc_ctl::{epoch, stats};
@@ -322,6 +323,13 @@ struct ExecutionContext {
     /// cheap to clone; the underlying `Global<JObject>` releases its JNI global ref on drop
     /// via `jni`'s `Drop` impl.
     pub task_context: Option<Arc<Global<JObject<'static>>>>,
+    /// Scan prefetch config resolved at `createPlan` (already gated on the data cache being
+    /// enabled). Passed to the planner so its scan arms accumulate prefetch specs.
+    pub prefetch_config: PrefetchConfig,
+    /// Cancel handles for the background prefetch tasks spawned for this plan's scans. Tripped
+    /// in `releasePlan` so a completing/killed/LIMIT-satisfied task tears prefetch down
+    /// cooperatively (SCAN_PREFETCH_DESIGN.md §2.2).
+    pub prefetch_handles: Vec<PrefetchHandle>,
 }
 
 /// Accept serialized query plan and return the address of the native query plan.
@@ -425,6 +433,17 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_createPlan(
             // creates any object store so remote stores get wrapped.
             crate::execution::data_cache::init_once(&spark_config, &local_dirs_vec);
 
+            // Resolve scan prefetch config. Prefetch requires the data cache (the cache is the
+            // prefetch buffer); warn-and-ignore if enabled without it (SCAN_PREFETCH_DESIGN.md §2.8).
+            let mut prefetch_config = PrefetchConfig::from_spark(&spark_config);
+            if prefetch_config.enabled && crate::execution::data_cache::global().is_none() {
+                warn!(
+                    "spark.comet.scan.dataCache.prefetch.enabled is set but the data cache is \
+                     disabled; ignoring (prefetch requires spark.comet.scan.dataCache.enabled)"
+                );
+                prefetch_config.enabled = false;
+            }
+
             // We need to keep the session context alive. Some session state like temporary
             // dictionaries are stored in session context. If it is dropped, the temporary
             // dictionaries will be dropped as well.
@@ -511,6 +530,8 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_createPlan(
                 ),
                 tracing_event_name,
                 task_context,
+                prefetch_config,
+                prefetch_handles: Vec::new(),
             });
 
             Ok(Box::into_raw(exec_context) as i64)
@@ -754,13 +775,26 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_executePlan(
                 let planner =
                     PhysicalPlanner::new(Arc::clone(&exec_context.session_ctx), partition)
                         .with_exec_id(exec_context_id)
-                        .with_task_context(exec_context.task_context.clone());
+                        .with_task_context(exec_context.task_context.clone())
+                        .with_prefetch_config(exec_context.prefetch_config);
                 let (scans, shuffle_scans, root_op) = planner.create_plan(
                     &exec_context.spark_plan,
                     &mut exec_context.input_sources.clone(),
                     exec_context.partition_count,
                 )?;
                 let physical_plan_time = start.elapsed();
+
+                // Spawn one background prefetch task per scan onto the shared tokio runtime.
+                // This is the only prefetch work on the Spark task thread: building the specs
+                // (cheap Arc clones) plus `tokio::spawn` (SCAN_PREFETCH_DESIGN.md §2.2).
+                for spec in planner.take_prefetch_specs() {
+                    let handle = PrefetchHandle::new();
+                    let task_handle = handle.clone();
+                    get_runtime().spawn(async move {
+                        crate::execution::prefetch::run(spec, task_handle).await;
+                    });
+                    exec_context.prefetch_handles.push(handle);
+                }
 
                 exec_context.plan_creation_time += physical_plan_time;
                 exec_context.scans = scans;
@@ -919,6 +953,13 @@ pub extern "system" fn Java_org_apache_comet_Native_releasePlan(
     try_unwrap_or_throw(&e, |env| unsafe {
         let execution_context = get_execution_context(exec_context);
 
+        // Cancel this plan's background prefetch tasks cooperatively before teardown. At most
+        // the in-flight requests complete (and still benefit later queries); no `abort`, so no
+        // single-flight waiter is poisoned (SCAN_PREFETCH_DESIGN.md §2.2).
+        for handle in &execution_context.prefetch_handles {
+            handle.cancel();
+        }
+
         // Update metrics
         update_metrics(env, execution_context)?;
 
@@ -961,7 +1002,9 @@ pub extern "system" fn Java_org_apache_comet_Native_setDataCacheMemoryBudget(
 
 #[no_mangle]
 /// Return a snapshot of the process-global data cache counters as a long array:
-/// `[hits, misses, fetches, bytes_fetched, evictions, invalidations, ssd_hits, ssd_writes]`.
+/// `[hits, misses, fetches, bytes_fetched, evictions, invalidations, ssd_hits, ssd_writes,
+/// prefetch_bytes_fetched, prefetch_fetch_requests, prefetch_blocks_consumed,
+/// prefetch_blocks_wasted, prefetch_errors, prefetch_files_skipped]`.
 /// All zeros when the data cache is disabled. Used by benchmarks/observability.
 pub extern "system" fn Java_org_apache_comet_Native_getDataCacheStats(
     e: EnvUnowned,

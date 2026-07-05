@@ -54,6 +54,7 @@
 
 mod cache;
 mod error;
+mod ledger;
 mod metrics;
 mod sieve;
 mod ssd;
@@ -64,5 +65,6 @@ pub use cache::{
     DEFAULT_NUM_SHARDS, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE,
 };
 pub use error::{CacheError, Result};
+pub use ledger::{PrefetchIntent, PrefetchLedger, PrefetchStats, ReleaseOutcome};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use version::{FileKey, FileVersion};

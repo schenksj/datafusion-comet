@@ -20,42 +20,92 @@
 //! level, so all operations here run under that lock.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::{BoxFuture, Shared};
 
 use crate::error::CacheError;
+use crate::ledger::PrefetchLedger;
 use crate::metrics::Metrics;
+
+/// Prefetch intent tag stored on a [`Block`] (SCAN_PREFETCH_DESIGN.md §2.5). Two bits are
+/// reserved by design; phase 3a uses only `NONE`/`PREFETCH` (the warm tag lands with the
+/// cross-task warm-set in phase 3b).
+pub(crate) const INTENT_NONE: u8 = 0;
+pub(crate) const INTENT_PREFETCH: u8 = 1;
 
 /// A cached block. `data` is the block's bytes (short for the final block of a file);
 /// `visited` is SIEVE's per-entry reference bit (set on hit, cleared by the eviction hand);
 /// `ever_visited` is a monotonic "was hit at least once" flag used as the SSD admission
 /// gate (accessed >= 2 times) — it is set on hit and never cleared, unlike `visited`.
+///
+/// `intent`/`ledger`/`charged` carry prefetch bookkeeping: a block inserted ahead of demand
+/// carries `INTENT_PREFETCH` plus the plan's [`PrefetchLedger`] and the byte credit charged
+/// for it. The first demand hit or the eviction — whichever CASes `intent` back to
+/// `INTENT_NONE` first — releases that credit exactly once (§2.4, §2.5).
 #[derive(Debug)]
 pub(crate) struct Block {
     pub data: Bytes,
     pub visited: AtomicBool,
     pub ever_visited: AtomicBool,
+    pub intent: AtomicU8,
+    pub ledger: Option<Arc<PrefetchLedger>>,
+    pub charged: u64,
 }
 
 impl Block {
+    /// A demand-filled block: no prefetch tag, no ledger credit.
     pub(crate) fn new(data: Bytes) -> Arc<Self> {
         Arc::new(Block {
             data,
             visited: AtomicBool::new(false),
             ever_visited: AtomicBool::new(false),
+            intent: AtomicU8::new(INTENT_NONE),
+            ledger: None,
+            charged: 0,
         })
+    }
+
+    /// A prefetched block: tagged `INTENT_PREFETCH`, holding `charged` bytes of `ledger`
+    /// credit until its tag resolves. Inserted SIEVE-coldest (`visited = false`).
+    pub(crate) fn new_prefetch(
+        data: Bytes,
+        ledger: Arc<PrefetchLedger>,
+        charged: u64,
+    ) -> Arc<Self> {
+        Arc::new(Block {
+            data,
+            visited: AtomicBool::new(false),
+            ever_visited: AtomicBool::new(false),
+            intent: AtomicU8::new(INTENT_PREFETCH),
+            ledger: Some(ledger),
+            charged,
+        })
+    }
+
+    /// Atomically clear a `INTENT_PREFETCH` tag, returning `true` if this call performed the
+    /// transition (and is therefore responsible for releasing the ledger credit). Concurrent
+    /// consume/evict callers race here so credit is released exactly once.
+    pub(crate) fn take_prefetch_tag(&self) -> bool {
+        self.intent
+            .compare_exchange(
+                INTENT_PREFETCH,
+                INTENT_NONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 
 /// A block removed from the memory tier by eviction, handed to the caller so a visited
-/// block can be admitted to the SSD tier.
+/// block can be admitted to the SSD tier (and an unconsumed prefetch block can release its
+/// ledger credit as waste).
 pub(crate) struct Evicted {
     pub key: BlockKey,
-    pub data: Bytes,
-    pub ever_visited: bool,
+    pub block: Arc<Block>,
 }
 
 /// `(file_id, block_index)` — 12 bytes, cheap to hash and shard.
@@ -108,12 +158,20 @@ impl Shard {
         }
     }
 
-    /// Hit path: return a clone of the block if present, setting its reference bits.
+    /// Hit path: return a clone of the block if present, setting the SIEVE reference bit
+    /// (`visited`) under the shard lock so a concurrent eviction hand cannot pass over a
+    /// just-hit block. The heavier consumption bookkeeping — resolving a prefetch tag,
+    /// releasing ledger credit (which may notify), and setting `ever_visited` — is deferred to
+    /// `BlockCache::note_demand_hit` once the lock is released.
     pub(crate) fn get(&self, key: &BlockKey) -> Option<Arc<Block>> {
         let block = self.map.get(key)?;
         block.visited.store(true, Ordering::Relaxed);
-        block.ever_visited.store(true, Ordering::Relaxed);
         Some(Arc::clone(block))
+    }
+
+    /// Whether a block is resident (a prefetch probe — no bit-touch, no clone).
+    pub(crate) fn contains(&self, key: &BlockKey) -> bool {
+        self.map.contains_key(key)
     }
 
     /// Insert a freshly fetched block, evicting in SIEVE order until back under budget.
@@ -193,16 +251,10 @@ impl Shard {
                 };
             } else {
                 // Evict this entry.
-                let evicted = self.map.remove(&key).map(|b| {
-                    (
-                        block_cost(b.data.len()),
-                        Evicted {
-                            key,
-                            data: b.data.clone(),
-                            ever_visited: b.ever_visited.load(Ordering::Relaxed),
-                        },
-                    )
-                });
+                let evicted = self
+                    .map
+                    .remove(&key)
+                    .map(|b| (block_cost(b.data.len()), Evicted { key, block: b }));
                 self.queue.remove(self.hand);
                 // The hand now refers to the element that followed the victim toward the
                 // tail; leave it there (clamped on next entry). Nothing to adjust.
@@ -252,6 +304,11 @@ impl Shard {
 
     pub(crate) fn in_flight_remove(&mut self, key: &BlockKey) {
         self.in_flight.remove(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
     }
 
     /// Drop all cached blocks (in-flight fetches are left to complete on their own).

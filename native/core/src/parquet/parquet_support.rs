@@ -559,7 +559,7 @@ fn object_store_cache() -> &'static ObjectStoreCache {
 fn maybe_wrap_with_data_cache(
     store: Arc<dyn ObjectStore>,
     url_key: &str,
-    config_hash: u64,
+    object_store_configs: &HashMap<String, String>,
     scheme: &str,
 ) -> Arc<dyn ObjectStore> {
     // Local filesystem reads are already served from the OS page cache; don't wrap them.
@@ -568,24 +568,141 @@ fn maybe_wrap_with_data_cache(
     }
     match crate::execution::data_cache::global() {
         Some(cache) => {
-            let namespace = data_cache_namespace(url_key, config_hash);
+            let namespace = data_cache_namespace(url_key, object_store_configs);
             debug!("Wrapping object store {url_key} with Comet data cache (namespace {namespace})");
-            Arc::new(CachingObjectStore::new(store, cache, namespace))
+            let wrapper = Arc::new(CachingObjectStore::new(store, cache, namespace));
+            // Record the concrete wrapper so the scan prefetcher can reach its inherent
+            // `prefetch_ranges` (the `ObjectStore` trait object cannot be downcast to it).
+            register_caching_store(namespace, Arc::clone(&wrapper));
+            wrapper
         }
         None => store,
     }
 }
 
-/// Derive the cache namespace that isolates one logical store from another. Uses the same
-/// distinguishing inputs as the object-store instance cache key `(url_key, config_hash)`.
-fn data_cache_namespace(url_key: &str, config_hash: u64) -> u64 {
+/// Process-wide registry of the concrete `CachingObjectStore` wrappers, keyed by cache
+/// namespace. Mirrors the object-store instance cache's lifetime and bounded size (one entry
+/// per distinct store), and exists so the scan prefetcher can obtain the wrapper to call its
+/// inherent `prefetch_ranges` — the demand path only ever sees `Arc<dyn ObjectStore>`.
+fn caching_store_registry() -> &'static RwLock<HashMap<u64, Arc<CachingObjectStore>>> {
+    static REGISTRY: OnceLock<RwLock<HashMap<u64, Arc<CachingObjectStore>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn register_caching_store(namespace: u64, store: Arc<CachingObjectStore>) {
+    if let Ok(mut registry) = caching_store_registry().write() {
+        registry.insert(namespace, store);
+    }
+}
+
+/// The `CachingObjectStore` wrapping the store identified by `url` + `object_store_configs`, if
+/// the data cache is enabled and the store is remote. Recomputes the same namespace
+/// [`prepare_object_store_with_configs`] derived at wrap time (via the shared
+/// [`store_identity_parts`]) so the prefetcher warms exactly the namespace demand reads use.
+/// Returns `None` for local (`file`) stores or a disabled cache.
+pub(crate) fn caching_store_for(
+    url: &str,
+    object_store_configs: &HashMap<String, String>,
+) -> Option<Arc<CachingObjectStore>> {
+    let mut parsed = Url::parse(url).ok()?;
+    let (_is_hdfs, scheme, url_key) =
+        store_identity_parts(&mut parsed, object_store_configs).ok()?;
+    if scheme == "file" {
+        return None;
+    }
+    let namespace = data_cache_namespace(&url_key, object_store_configs);
+    caching_store_registry()
+        .read()
+        .ok()?
+        .get(&namespace)
+        .cloned()
+}
+
+/// The store-instance identity derived from an already-parsed `url`: `(is_hdfs, scheme,
+/// url_key)`. `url` is normalized in place (`s3a` → `s3`). This is the single source of truth
+/// for the identity computation, shared by [`prepare_object_store_with_configs`] (which then
+/// uses the normalized `url` to build the store) and [`caching_store_for`], so the two can
+/// never drift.
+fn store_identity_parts(
+    url: &mut Url,
+    object_store_configs: &HashMap<String, String>,
+) -> Result<(bool, String, String), ExecutionError> {
+    let is_hdfs = is_hdfs_scheme(url, object_store_configs);
+    let mut scheme = url.scheme().to_string();
+    if !is_hdfs && scheme == "s3a" {
+        scheme = "s3".to_string();
+        url.set_scheme("s3").map_err(|_| {
+            ExecutionError::GeneralError("Could not convert scheme from s3a to s3".to_string())
+        })?;
+    }
+    let url_key = format!(
+        "{}://{}",
+        scheme,
+        &url[url::Position::BeforeHost..url::Position::AfterPort],
+    );
+    Ok((is_hdfs, scheme, url_key))
+}
+
+/// Derive the data-cache namespace isolating one logical store from another.
+///
+/// Namespaces are derived from **storage identity** — the `url_key` (scheme + host + port) plus
+/// the non-credential object-store settings (endpoint, region, path-style, …) — and never from
+/// credential material (OBJECT_STORE_CACHE_DESIGN §2.4, SCAN_PREFETCH_DESIGN.md §4.3). Rotating
+/// credentials (STS/IRSA session tokens, access keys, account keys) produce a new *store
+/// instance* — correct, connections must be rebuilt — but read the *same bytes*, so a
+/// credential-sensitive namespace would silently zero the cache on every rotation (hourly in
+/// some deployments). Two stores that differ only in credentials and would read different bytes
+/// do not exist for the immutable-object workloads this cache targets, and an unauthorized read
+/// fails at fetch time before anything is cached.
+///
+/// Note this is intentionally *narrower* than the object-store instance cache key
+/// (`hash_object_store_configs`, which keeps credentials so a rotation rebuilds the instance).
+fn data_cache_namespace(url_key: &str, configs: &HashMap<String, String>) -> u64 {
     let mut hasher = DefaultHasher::new();
     url_key.hash(&mut hasher);
-    config_hash.hash(&mut hasher);
+    let mut kv: Vec<(&String, &String)> = configs
+        .iter()
+        .filter(|(k, _)| !is_credential_config_key(k))
+        .collect();
+    kv.sort();
+    for (key, value) in kv {
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
-/// Compute a hash of the object store configuration for cache keying.
+/// Whether an object-store config key carries credential material that must be excluded from
+/// the cache namespace (§4.3). Deliberately broad: over-excluding an auth-related key only
+/// merges namespaces that read identical bytes, whereas under-excluding a rotating secret would
+/// discard the cache on rotation. None of these substrings appear in keys that select *which*
+/// bytes are read (endpoint, region, bucket, path-style).
+fn is_credential_config_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "secret",
+        "password",
+        "credential",
+        "token",
+        "access.key",
+        "access_key",
+        "accesskey",
+        "account.key",
+        "account_key",
+        "accountkey",
+        "oauth",
+        "sas",
+        "private.key",
+        "private_key",
+        "service.account",
+        "service_account",
+    ];
+    NEEDLES.iter().any(|needle| k.contains(needle))
+}
+
+/// Compute a hash of the object store configuration for the **instance** cache key. Unlike the
+/// data-cache namespace (`data_cache_namespace`) this includes credentials, so a credential
+/// change rebuilds the store instance (new connections) as intended.
 fn hash_object_store_configs(configs: &HashMap<String, String>) -> u64 {
     let mut hasher = DefaultHasher::new();
     let mut keys: Vec<&String> = configs.keys().collect();
@@ -606,19 +723,9 @@ pub(crate) fn prepare_object_store_with_configs(
 ) -> Result<(ObjectStoreUrl, Path), ExecutionError> {
     let mut url = Url::parse(url.as_str())
         .map_err(|e| ExecutionError::GeneralError(format!("Error parsing URL {url}: {e}")))?;
-    let is_hdfs_scheme = is_hdfs_scheme(&url, object_store_configs);
-    let mut scheme = url.scheme();
-    if !is_hdfs_scheme && scheme == "s3a" {
-        scheme = "s3";
-        url.set_scheme("s3").map_err(|_| {
-            ExecutionError::GeneralError("Could not convert scheme from s3a to s3".to_string())
-        })?;
-    }
-    let url_key = format!(
-        "{}://{}",
-        scheme,
-        &url[url::Position::BeforeHost..url::Position::AfterPort],
-    );
+    // Shared identity computation (also used by `caching_store_for`) so the two never drift.
+    let (is_hdfs_scheme, scheme, url_key) = store_identity_parts(&mut url, object_store_configs)?;
+    let scheme = scheme.as_str();
 
     let config_hash = hash_object_store_configs(object_store_configs);
     let cache_key = (url_key.clone(), config_hash);
@@ -654,7 +761,7 @@ pub(crate) fn prepare_object_store_with_configs(
             let store: Arc<dyn ObjectStore> = Arc::from(store);
             // Wrap remote stores with the process-global data cache when enabled. Wrapping
             // before the instance-cache insert means later reuses pick up the cached wrapper.
-            let store = maybe_wrap_with_data_cache(store, &url_key, config_hash, scheme);
+            let store = maybe_wrap_with_data_cache(store, &url_key, object_store_configs, scheme);
             // Insert into cache
             if let Ok(mut cache) = object_store_cache().write() {
                 cache.insert(cache_key, Arc::clone(&store));
@@ -665,6 +772,89 @@ pub(crate) fn prepare_object_store_with_configs(
     let object_store_url = ObjectStoreUrl::parse(url_key.clone())?;
     runtime_env.register_object_store(&url, object_store);
     Ok((object_store_url, object_store_path))
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::{data_cache_namespace, is_credential_config_key};
+    use std::collections::HashMap;
+
+    fn cfg(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn credential_keys_detected_storage_keys_not() {
+        for k in [
+            "fs.s3a.access.key",
+            "fs.s3a.secret.key",
+            "fs.s3a.session.token",
+            "fs.azure.account.key.acct.blob.core.windows.net",
+            "fs.azure.account.oauth2.client.secret",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+            "google.cloud.auth.service.account.json.keyfile",
+        ] {
+            assert!(
+                is_credential_config_key(k),
+                "{k} should be a credential key"
+            );
+        }
+        for k in [
+            "fs.s3a.endpoint",
+            "fs.s3a.path.style.access",
+            "fs.s3a.region",
+            "aws_region",
+            "endpoint",
+            "virtual_hosted_style_request",
+        ] {
+            assert!(
+                !is_credential_config_key(k),
+                "{k} must not be treated as a credential"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_survives_credential_rotation_but_tracks_storage_identity() {
+        // §4.3: rotating a session token (or access/secret keys) must NOT change the namespace.
+        let before = cfg(&[
+            ("fs.s3a.endpoint", "s3.example.com"),
+            ("fs.s3a.access.key", "AKIA_OLD"),
+            ("fs.s3a.secret.key", "old-secret"),
+            ("fs.s3a.session.token", "token-hour-1"),
+        ]);
+        let after = cfg(&[
+            ("fs.s3a.endpoint", "s3.example.com"),
+            ("fs.s3a.access.key", "AKIA_NEW"),
+            ("fs.s3a.secret.key", "new-secret"),
+            ("fs.s3a.session.token", "token-hour-2"),
+        ]);
+        assert_eq!(
+            data_cache_namespace("s3://bucket", &before),
+            data_cache_namespace("s3://bucket", &after),
+            "credential rotation must preserve the namespace"
+        );
+
+        // A storage-identity change (endpoint) must change the namespace.
+        let other_endpoint = cfg(&[("fs.s3a.endpoint", "s3.other.com")]);
+        let same_endpoint = cfg(&[("fs.s3a.endpoint", "s3.example.com")]);
+        assert_ne!(
+            data_cache_namespace("s3://bucket", &other_endpoint),
+            data_cache_namespace("s3://bucket", &same_endpoint),
+            "a non-credential setting change must change the namespace"
+        );
+
+        // A different bucket (url_key) is a different namespace.
+        assert_ne!(
+            data_cache_namespace("s3://bucket-a", &same_endpoint),
+            data_cache_namespace("s3://bucket-b", &same_endpoint),
+        );
+    }
 }
 
 #[cfg(test)]

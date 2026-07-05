@@ -216,6 +216,54 @@ object CometConf extends ShimCometConf {
       .booleanConf
       .createWithDefault(false)
 
+  val COMET_PREFETCH_ENABLED: ConfigEntry[Boolean] =
+    conf("spark.comet.scan.dataCache.prefetch.enabled")
+      .category(CATEGORY_SCAN)
+      .doc(
+        "Whether to asynchronously prefetch the byte ranges a native scan is about to read " +
+          "into the data cache, ahead of the decoder, on Comet's background runtime (never on " +
+          "the Spark task thread). Removes the cold-scan first-read penalty by overlapping " +
+          "object-store I/O with decode. Requires spark.comet.scan.dataCache.enabled (the cache " +
+          "is the prefetch buffer); warn-and-ignored otherwise. Experimental.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val COMET_PREFETCH_AHEAD_BUDGET: ConfigEntry[Long] =
+    conf("spark.comet.scan.dataCache.prefetch.aheadBudget")
+      .category(CATEGORY_SCAN)
+      .doc(
+        "Per-scan credit budget bounding the in-flight plus fetched-but-unconsumed prefetched " +
+          "bytes, so the prefetcher stays a bounded window ahead of the decoder and a stalled " +
+          "or LIMIT-satisfied consumer freezes it. Only used when " +
+          "spark.comet.scan.dataCache.prefetch.enabled is true.")
+      // ByteUnit.BYTE (like every other dataCache byte config) so `.get.toString` serializes a
+      // byte count over JNI; native `get_u64` reads raw bytes. Using MiB here would serialize
+      // the MiB *count* (e.g. "32"), which native would read as 32 bytes — collapsing the budget.
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefault(32L * 1024 * 1024)
+
+  val COMET_PREFETCH_MAX_CONCURRENT_REQUESTS: ConfigEntry[Int] =
+    conf("spark.comet.scan.dataCache.prefetch.maxConcurrentRequests")
+      .category(CATEGORY_SCAN)
+      .doc(
+        "Per-scan cap on concurrent upstream prefetch requests — the lever that lifts the " +
+          "single-outstanding-I/O ceiling of a cold scan. A process-wide semaphore additionally " +
+          "bounds total concurrent prefetch requests. Only used when " +
+          "spark.comet.scan.dataCache.prefetch.enabled is true.")
+      .intConf
+      .createWithDefault(3)
+
+  val COMET_PREFETCH_FILTER_AWARE: ConfigEntry[Boolean] =
+    conf("spark.comet.scan.dataCache.prefetch.filterAware")
+      .category(CATEGORY_SCAN)
+      .doc(
+        "Whether to apply row-group statistics pruning (best-effort) when computing prefetch " +
+          "ranges, so a selective scan prefetches fewer bytes. Off falls back to split-range " +
+          "and projection pruning only. Only used when " +
+          "spark.comet.scan.dataCache.prefetch.enabled is true.")
+      .booleanConf
+      .createWithDefault(true)
+
   val COMET_CSV_V2_NATIVE_ENABLED: ConfigEntry[Boolean] =
     conf("spark.comet.scan.csv.v2.enabled")
       .category(CATEGORY_TESTING)

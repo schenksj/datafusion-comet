@@ -24,6 +24,7 @@ pub(crate) mod merge_as_partial;
 pub(crate) mod metrics;
 pub mod operators;
 pub(crate) mod planner;
+pub(crate) mod prefetch;
 pub mod serde;
 pub use datafusion_comet_shuffle as shuffle;
 pub(crate) mod sort;

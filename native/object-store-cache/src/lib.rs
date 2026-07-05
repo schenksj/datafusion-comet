@@ -40,7 +40,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use datafusion_comet_block_cache::{
-    BlockCache, CacheError, FileKey, FileVersion, RangeFetcher, Result as CacheResult,
+    BlockCache, CacheError, FileKey, FileVersion, PrefetchIntent, PrefetchLedger, PrefetchStats,
+    RangeFetcher, Result as CacheResult,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -80,6 +81,47 @@ impl CachingObjectStore {
             store: Arc::clone(&self.inner),
             path: location.clone(),
         }
+    }
+
+    /// The cache's block quantum in bytes. Exposed so the prefetch front-end can compute
+    /// block-aligned ranges (e.g. the footer tail block).
+    pub fn block_size(&self) -> u64 {
+        self.cache.block_size()
+    }
+
+    /// Record that a file's data prefetch was skipped (SCAN_PREFETCH_DESIGN.md §2.6). Routes to
+    /// the shared cache metrics so it surfaces in `getDataCacheStats`.
+    pub fn note_prefetch_file_skipped(&self) {
+        self.cache.note_prefetch_file_skipped();
+    }
+
+    /// Warm the cache with the blocks covering `ranges` of `location`, ahead of demand
+    /// (SCAN_PREFETCH_DESIGN.md §2.1). This is an **inherent** method, deliberately *not* on
+    /// the `ObjectStore` trait: only the scan prefetcher — which holds a concrete
+    /// `CachingObjectStore` — calls it, and it must never appear on the demand read path.
+    ///
+    /// Routes straight to [`BlockCache::prefetch_ranges`] using the same per-path fetcher and
+    /// `FileKey` namespace demand reads use, so a prefetched block is byte-identical to (and
+    /// single-flight-shared with) the block a demand read would fetch.
+    pub async fn prefetch_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+        intent: PrefetchIntent,
+        ledger: &Arc<PrefetchLedger>,
+        max_concurrent: usize,
+    ) -> CacheResult<PrefetchStats> {
+        let fetcher = self.range_fetcher(location);
+        self.cache
+            .prefetch_ranges(
+                &self.file_key(location),
+                ranges,
+                &fetcher,
+                intent,
+                ledger,
+                max_concurrent,
+            )
+            .await
     }
 
     /// Serve a plain bounded-range `get_opts` from the cache, synthesizing an `ObjectMeta`
@@ -296,6 +338,7 @@ fn to_os_error(err: CacheError) -> object_store::Error {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
     use datafusion_comet_block_cache::BlockCacheConfig;
@@ -452,6 +495,38 @@ mod tests {
             counting.calls() > before,
             "conditional get must reach inner store"
         );
+    }
+
+    #[tokio::test]
+    async fn prefetch_then_demand_issues_zero_upstream_requests() {
+        let data = seq((1 << 20) * 3 + 500);
+        let (counting, store, path) = setup(&data);
+        let ledger = std::sync::Arc::new(PrefetchLedger::new(32 << 20));
+
+        // Prefetch the first two blocks.
+        let stats = store
+            .prefetch_ranges(
+                &path,
+                &[0..(1 << 20) * 2],
+                PrefetchIntent::Prefetch,
+                &ledger,
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.blocks_fetched, 2);
+        let after_prefetch = counting.calls();
+        assert!(after_prefetch >= 1);
+
+        // A demand read over the prefetched region issues no new upstream requests and returns
+        // byte-identical data.
+        let out = store.get_ranges(&path, &[0..(1 << 20) * 2]).await.unwrap();
+        assert_eq!(
+            counting.calls(),
+            after_prefetch,
+            "demand read is all cache hits"
+        );
+        assert_eq!(&out[0][..], &data[0..(1 << 20) * 2]);
     }
 
     #[tokio::test]

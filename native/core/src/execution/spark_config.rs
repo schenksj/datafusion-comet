@@ -34,6 +34,16 @@ pub(crate) const COMET_DATA_CACHE_BLOCK_SIZE: &str = "spark.comet.scan.dataCache
 pub(crate) const COMET_DATA_CACHE_SSD_LIMIT: &str = "spark.comet.scan.dataCache.ssd.limit";
 pub(crate) const COMET_DATA_CACHE_SSD_PATH: &str = "spark.comet.scan.dataCache.ssd.path";
 
+// Asynchronous scan prefetch (see SCAN_PREFETCH_DESIGN.md §2.8). Read on the native side at
+// plan creation to build each scan's prefetch task; requires the data cache to be enabled.
+pub(crate) const COMET_PREFETCH_ENABLED: &str = "spark.comet.scan.dataCache.prefetch.enabled";
+pub(crate) const COMET_PREFETCH_AHEAD_BUDGET: &str =
+    "spark.comet.scan.dataCache.prefetch.aheadBudget";
+pub(crate) const COMET_PREFETCH_MAX_CONCURRENT_REQUESTS: &str =
+    "spark.comet.scan.dataCache.prefetch.maxConcurrentRequests";
+pub(crate) const COMET_PREFETCH_FILTER_AWARE: &str =
+    "spark.comet.scan.dataCache.prefetch.filterAware";
+
 pub(crate) trait SparkConfig {
     fn get_bool(&self, name: &str) -> bool;
     fn get_u64(&self, name: &str, default_value: u64) -> u64;

@@ -302,6 +302,22 @@ object CometExecIterator extends Logging {
       CometConf.COMET_DATA_CACHE_SSD_LIMIT.key,
       CometConf.COMET_DATA_CACHE_SSD_LIMIT.get(SQLConf.get).toString)
 
+    // Scan prefetch configs read by the native side at plan creation (SCAN_PREFETCH_DESIGN.md
+    // §2.8). Force-added so native defaults never drift from Scala. Prefetch is gated on the
+    // data cache being enabled natively.
+    builder.putEntries(
+      CometConf.COMET_PREFETCH_ENABLED.key,
+      CometConf.COMET_PREFETCH_ENABLED.get(SQLConf.get).toString)
+    builder.putEntries(
+      CometConf.COMET_PREFETCH_AHEAD_BUDGET.key,
+      CometConf.COMET_PREFETCH_AHEAD_BUDGET.get(SQLConf.get).toString)
+    builder.putEntries(
+      CometConf.COMET_PREFETCH_MAX_CONCURRENT_REQUESTS.key,
+      CometConf.COMET_PREFETCH_MAX_CONCURRENT_REQUESTS.get(SQLConf.get).toString)
+    builder.putEntries(
+      CometConf.COMET_PREFETCH_FILTER_AWARE.key,
+      CometConf.COMET_PREFETCH_FILTER_AWARE.get(SQLConf.get).toString)
+
     builder.build().toByteArray
   }
 
