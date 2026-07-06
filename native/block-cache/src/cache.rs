@@ -39,6 +39,13 @@ use crate::version::{FileKey, FileVersion};
 /// cannot pile requests onto the store ahead of demand reads. A deliberate constant, not a config.
 const PREFETCH_GLOBAL_CONCURRENCY: usize = 16;
 
+/// Per-call cap on concurrent upstream fetches for a single demand `get_ranges`. Mirrors
+/// `object_store::get_ranges`, which fetches a request's coalesced ranges in parallel rather
+/// than serially — the cache must not turn a demand read's independent column-chunk fetches
+/// into a serial chain. The number of coalesced runs per call is bounded by the projected
+/// columns, so this cap only guards pathologically scattered reads.
+const DEMAND_FETCH_CONCURRENCY: usize = 16;
+
 /// The process-wide prefetch fetch semaphore.
 fn prefetch_semaphore() -> &'static Semaphore {
     static SEM: Semaphore = Semaphore::const_new(PREFETCH_GLOBAL_CONCURRENCY);
@@ -730,30 +737,45 @@ impl BlockCache {
             senders.insert(b, tx);
         }
 
-        // --- fetch phase: our owned blocks, coalesced. Must happen BEFORE awaiting other
-        // owners' futures so that two callers cross-owning each other's blocks cannot
-        // deadlock (each fetches what it owns first, then waits). ---
+        // --- fetch phase: our owned blocks, coalesced. Runs are fetched CONCURRENTLY (like
+        // `object_store::get_ranges`) so the cache never serializes a demand read's independent
+        // column-chunk fetches; each run is published as soon as it lands (the loop body
+        // consumes the stream sequentially, so the mutations stay single-threaded and waiters
+        // wake promptly). Must happen BEFORE awaiting other owners' futures so two callers
+        // cross-owning each other's blocks cannot deadlock (each fetches what it owns first). ---
         let mut first_error: Option<CacheError> = None;
-        for run in coalesce_runs(&owned, self.max_coalesce_blocks) {
-            let start_block = run[0];
-            let end_block = *run.last().unwrap();
-            let abs_start = start_block as u64 * self.block_size;
-            // Over-read past EOF is fine: the store truncates a partially-out-of-bounds
-            // range, yielding the short final block.
-            let abs_end = (end_block as u64 + 1) * self.block_size;
+        let block_size = self.block_size;
+        let mut fetches = futures::stream::iter(
+            coalesce_runs(&owned, self.max_coalesce_blocks)
+                .into_iter()
+                .map(|run| {
+                    let start_block = run[0];
+                    let end_block = *run.last().unwrap();
+                    let abs_start = start_block as u64 * block_size;
+                    // Over-read past EOF is fine: the store truncates a partially-out-of-bounds
+                    // range, yielding the short final block.
+                    let abs_end = (end_block as u64 + 1) * block_size;
+                    async move {
+                        let range = abs_start..abs_end;
+                        let res = fetcher.fetch(std::slice::from_ref(&range)).await;
+                        (run, start_block, res)
+                    }
+                }),
+        )
+        .buffer_unordered(DEMAND_FETCH_CONCURRENCY);
 
-            let fetch_range = abs_start..abs_end;
-            match fetcher.fetch(std::slice::from_ref(&fetch_range)).await {
+        while let Some((run, start_block, res)) = fetches.next().await {
+            match res {
                 Ok((bytes_vec, version)) => {
                     let full = concat_bytes(bytes_vec);
                     self.metrics.record_fetch(full.len() as u64);
                     self.reconcile_version(file_id, &version);
                     for &b in &run {
-                        let off = ((b - start_block) as u64 * self.block_size) as usize;
+                        let off = ((b - start_block) as u64 * block_size) as usize;
                         let data = if off >= full.len() {
                             Bytes::new()
                         } else {
-                            let end = (off + self.block_size as usize).min(full.len());
+                            let end = (off + block_size as usize).min(full.len());
                             full.slice(off..end)
                         };
                         let block = Block::new(data);
@@ -1175,6 +1197,57 @@ mod prefetch_tests {
         }
     }
 
+    /// A fetcher that delays each fetch and tracks the peak number of concurrent `fetch` calls,
+    /// to prove the demand path issues independent runs in parallel rather than serially.
+    struct ConcurrentSeqFetcher {
+        size: u64,
+        delay: std::time::Duration,
+        in_flight: AtomicU64,
+        max_in_flight: AtomicU64,
+    }
+
+    impl ConcurrentSeqFetcher {
+        fn new(size: u64, delay: std::time::Duration) -> Self {
+            ConcurrentSeqFetcher {
+                size,
+                delay,
+                in_flight: AtomicU64::new(0),
+                max_in_flight: AtomicU64::new(0),
+            }
+        }
+        fn max_in_flight(&self) -> u64 {
+            self.max_in_flight.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl RangeFetcher for ConcurrentSeqFetcher {
+        async fn fetch(&self, ranges: &[Range<u64>]) -> Result<(Vec<Bytes>, FileVersion)> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            let mut out = Vec::with_capacity(ranges.len());
+            for r in ranges {
+                let end = r.end.min(self.size);
+                let mut v = Vec::new();
+                let mut off = r.start;
+                while off < end {
+                    v.push(byte_at(off));
+                    off += 1;
+                }
+                out.push(Bytes::from(v));
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok((
+                out,
+                FileVersion {
+                    size: self.size,
+                    ..Default::default()
+                },
+            ))
+        }
+    }
+
     fn mem_cache(block_size: u64, budget: u64, shards: usize) -> Arc<BlockCache> {
         BlockCache::new(BlockCacheConfig {
             block_size,
@@ -1392,6 +1465,32 @@ mod prefetch_tests {
             fetcher.calls.load(Ordering::SeqCst) >= 2,
             "B issued a second fetch"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn demand_fetches_nonadjacent_runs_concurrently() {
+        // The block-cache demand path must fetch a request's independent (non-adjacent) coalesced
+        // runs in parallel, like object_store::get_ranges — not serialize them.
+        let cache = mem_cache(MIB, 64 * MIB, 4);
+        let file = FileKey::new(1, "a.parquet");
+        let fetcher = ConcurrentSeqFetcher::new(20 * MIB, std::time::Duration::from_millis(50));
+
+        // Two far-apart ranges → blocks 0 and 10 → two separate coalesced runs.
+        let out = cache
+            .get_ranges(&file, &[0..1000, 10 * MIB..10 * MIB + 1000], &fetcher)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(
+            fetcher.max_in_flight() >= 2,
+            "demand read must fetch non-adjacent runs concurrently (peak in-flight = {})",
+            fetcher.max_in_flight()
+        );
+        // Byte-exact.
+        for i in 0..1000u64 {
+            assert_eq!(out[0][i as usize], byte_at(i));
+            assert_eq!(out[1][i as usize], byte_at(10 * MIB + i));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
