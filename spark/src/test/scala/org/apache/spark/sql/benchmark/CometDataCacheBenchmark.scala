@@ -155,10 +155,29 @@ object CometDataCacheBenchmark extends CometBenchmarkBase {
     (System.nanoTime() - start) / 1000000L
   }
 
-  /** Bytes fetched from the object store so far (native counter). 0 if the cache is disabled. */
-  private def bytesFetched(): Long = {
+  /** Read one `getDataCacheStats` column (0 if the cache is disabled / column absent). */
+  private def stat(i: Int): Long = {
     val s = nativeLib.getDataCacheStats()
-    if (s != null && s.length > 3) s(3) else 0L
+    if (s != null && s.length > i) s(i) else 0L
+  }
+
+  /** Bytes fetched from the object store so far (native counter). 0 if the cache is disabled. */
+  private def bytesFetched(): Long = stat(3)
+  // Prefetch counters (see data_cache.rs column order).
+  private def prefetchConsumed(): Long = stat(10)
+  private def prefetchWasted(): Long = stat(11)
+
+  /** Run `body` with scan prefetch toggled on/off (read per-plan from the SQLConf). */
+  private def withPrefetch[T](enabled: Boolean)(body: => T): T = {
+    val key = CometConf.COMET_PREFETCH_ENABLED.key
+    val prev = spark.conf.getOption(key)
+    spark.conf.set(key, enabled.toString)
+    try body
+    finally
+      prev match {
+        case Some(v) => spark.conf.set(key, v)
+        case None => spark.conf.unset(key)
+      }
   }
 
   private def prepareData(base: String): Unit = {
@@ -196,53 +215,78 @@ object CometDataCacheBenchmark extends CometBenchmarkBase {
       category: String,
       name: String,
       coldMs: Long,
+      coldPrefetchMs: Long,
       warmMs: Long,
       coldMb: Double,
-      warmMb: Double) {
-    def speedup: Double = if (warmMs > 0) coldMs.toDouble / warmMs.toDouble else 0.0
+      coverage: Double) {
+
+    /** Cold-scan speedup from prefetch (cache-only cold vs cache+prefetch cold). */
+    def prefetchSpeedup: Double =
+      if (coldPrefetchMs > 0) coldMs.toDouble / coldPrefetchMs.toDouble else 0.0
+
+    /** Warm re-read speedup (repeat scan served from cache). */
+    def warmSpeedup: Double = if (warmMs > 0) coldMs.toDouble / warmMs.toDouble else 0.0
   }
 
   private def measure(s: Scenario): Result = {
-    // Force a cold cache so the first run genuinely fetches this scenario's bytes from S3.
+    // (1) Cold, cache-only (prefetch off): the first run genuinely fetches this scenario's bytes.
     nativeLib.clearDataCache()
     val b0 = bytesFetched()
-    val cold = timeMillis(run(s.sql))
+    val cold = withPrefetch(false)(timeMillis(run(s.sql)))
     val coldMb = (bytesFetched() - b0).toDouble / (1024 * 1024)
 
-    // Warm: one warm-up (populate any not-yet-cached blocks), then time `warmIters` runs.
+    // (2) Cold, cache+prefetch: cold again (cleared), with the async prefetcher racing ahead of
+    // the decoder. Same ColdFetch bytes as (1); the delta is the fetch<->decode overlap win.
+    nativeLib.clearDataCache()
+    val cons0 = prefetchConsumed()
+    val waste0 = prefetchWasted()
+    val coldPrefetch = withPrefetch(true)(timeMillis(run(s.sql)))
+    val consumed = prefetchConsumed() - cons0
+    val wasted = prefetchWasted() - waste0
+    val coverage = if (consumed + wasted > 0) consumed.toDouble / (consumed + wasted) else 0.0
+
+    // (3) Warm: one warm-up, then time `warmIters` repeat scans (served from cache).
     run(s.sql)
-    val bWarm = bytesFetched()
     val warmTimes = (0 until warmIters).map(_ => timeMillis(run(s.sql))).sorted
     val warmMs = warmTimes(warmTimes.length / 2) // median
-    val warmMb = (bytesFetched() - bWarm).toDouble / (1024 * 1024) / warmIters
 
-    Result(s.category, s.name, cold, warmMs, coldMb, warmMb)
+    Result(s.category, s.name, cold, coldPrefetch, warmMs, coldMb, coverage)
   }
 
   private def printResults(base: String, results: Seq[Result]): Unit = {
     // scalastyle:off println
     val header =
-      f"${"Category"}%-8s ${"Scenario"}%-24s ${"Cold(ms)"}%9s ${"Warm(ms)"}%9s " +
-        f"${"Speedup"}%8s ${"ColdFetch"}%10s ${"WarmFetch"}%10s"
+      f"${"Category"}%-8s ${"Scenario"}%-24s ${"Cold(ms)"}%9s ${"Cold+PF(ms)"}%12s " +
+        f"${"PF-Speedup"}%11s ${"Warm(ms)"}%9s ${"Coverage"}%9s ${"ColdFetch"}%10s"
     val rule = "-" * header.length
     val shape = if (compressible) "compressible (id-derived)" else "incompressible (random)"
     println("")
     println(
-      "Object-store data cache: cold vs warm by operation  " +
+      "Object-store data cache: cold vs cold+prefetch vs warm by operation  " +
         s"($base, fact=$factRows rows x $valueCols cols, $shape)")
     println(rule)
     println(header)
     println(rule)
     for (r <- results) {
       println(
-        f"${r.category}%-8s ${r.name}%-24s ${r.coldMs}%9d ${r.warmMs}%9d " +
-          f"${r.speedup}%7.1fx ${r.coldMb}%8.1fMB ${r.warmMb}%8.1fMB")
+        f"${r.category}%-8s ${r.name}%-24s ${r.coldMs}%9d ${r.coldPrefetchMs}%12d " +
+          f"${r.prefetchSpeedup}%10.2fx ${r.warmMs}%9d ${r.coverage * 100}%7.0f%% " +
+          f"${r.coldMb}%8.1fMB")
     }
     println(rule)
-    val avgSpeedup = if (results.nonEmpty) results.map(_.speedup).sum / results.size else 0.0
-    println(f"mean warm speedup: $avgSpeedup%.1fx across ${results.size} scenarios")
+    val meanPf =
+      if (results.nonEmpty) results.map(_.prefetchSpeedup).sum / results.size else 0.0
+    val meanWarm =
+      if (results.nonEmpty) results.map(_.warmSpeedup).sum / results.size else 0.0
     println(
-      "ColdFetch/WarmFetch = bytes read from S3 per run (native counter); warm should be ~0.")
+      f"mean cold prefetch speedup: $meanPf%.2fx | mean warm speedup: $meanWarm%.1fx " +
+        f"across ${results.size} scenarios")
+    println(
+      "Cold = cache-only cold scan; Cold+PF = cache+prefetch cold scan (same ColdFetch bytes) — " +
+        "the delta is the fetch<->decode overlap win. Coverage = prefetched blocks consumed / " +
+        "(consumed+wasted). Warm = repeat scan from cache. A Cold+PF near Cold means the scan is " +
+        "bandwidth-bound (little overlap to reclaim); a large PF-Speedup means it was " +
+        "fetch<->decode-serialized (decode-bound-ish).")
     // scalastyle:on println
   }
 
