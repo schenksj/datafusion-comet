@@ -95,11 +95,15 @@ green "OK: cargo tree default is clean of contrib + kernel"
 
 TREE_CONTRIB="$(cargo tree -p datafusion-comet --features contrib-delta 2>/dev/null)"
 # The gated tree must pull in both the contrib crate AND the heavy `delta_kernel` it
-# depends on (driver-side log replay). Require >=2 hits; the symbol check below guards
-# against grep-pattern drift either way.
-CONTRIB_HITS="$(printf '%s\n' "$TREE_CONTRIB" | grep -cE 'comet-contrib-delta|delta_kernel|delta-kernel' || true)"
-if [[ "$CONTRIB_HITS" -lt 2 ]]; then
-  red "FAIL: --features contrib-delta tree missing expected Delta-related entries (hits=$CONTRIB_HITS)"
+# depends on (driver-side log replay). Check each independently -- a combined >=2 line
+# count could be satisfied by delta_kernel alone (it prints on multiple tree lines),
+# which is exactly the contrib-crate-dropped drift this guards against.
+if ! printf '%s\n' "$TREE_CONTRIB" | grep -qE 'comet-contrib-delta'; then
+  red "FAIL: --features contrib-delta tree missing the comet-contrib-delta crate"
+  exit 1
+fi
+if ! printf '%s\n' "$TREE_CONTRIB" | grep -qE 'delta_kernel|delta-kernel'; then
+  red "FAIL: --features contrib-delta tree missing delta_kernel"
   exit 1
 fi
 green "OK: cargo tree with contrib-delta correctly pulls comet-contrib-delta + delta_kernel"
@@ -243,13 +247,14 @@ green "OK: default build registers no contrib services (empty ServiceLoader regi
 # further edits to this script. One Spark version is enough for a compile check; the full
 # 3.5/4.0/4.1 matrix is exercised by the contrib test workflow once the suites exist.
 hdr "Contrib build: -Pcontrib-delta still compiles"
+COMPILE_LOG="$(mktemp -t contrib-delta-compile.XXXXXX)"
 if "$MVNW" -Pspark-4.1,contrib-delta -Djava.version=17 -Dmaven.compiler.source=17 \
     -Dmaven.compiler.target=17 -Dmaven.gitcommitid.skip -pl spark -am clean test-compile \
-    -q -DskipTests=true >/tmp/contrib-delta-compile.log 2>&1; then
+    -q -DskipTests=true >"$COMPILE_LOG" 2>&1; then
   green "OK: -Pcontrib-delta compiles (main + test sources)"
 else
   red "FAIL: -Pcontrib-delta build does not compile. Last 40 lines:"
-  tail -40 /tmp/contrib-delta-compile.log
+  tail -40 "$COMPILE_LOG"
   exit 1
 fi
 
@@ -263,6 +268,13 @@ if [[ -z "$CONTRIB_CLASSES" ]]; then
   exit 1
 fi
 green "OK: contrib build produced $(echo "$CONTRIB_CLASSES" | wc -l | tr -d ' ') contrib class file(s)"
+
+# Leave the tree the way a default build expects it: the contrib compile above left contrib
+# classes AND META-INF/services registrations in spark/target/classes -- the exact stale-artifact
+# state (see the warning at the compiled-class gate above) that breaks the developer's NEXT
+# default-mode test run with false SPI failures / vacuously-passing registry tests.
+"$MVNW" -Dmaven.gitcommitid.skip -pl spark clean -q >/dev/null 2>&1 || true
+green "OK: cleaned spark/target after the contrib compile (no stale contrib artifacts left)"
 
 # ---- libcomet symbol/size gate -------------------------------------------
 

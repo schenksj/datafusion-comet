@@ -166,14 +166,14 @@ fn read_schema_from_json(json: &str) -> DeltaResult<delta_kernel::schema::Schema
 /// `TahoeBatchFileIndex` / ...), where the file list comes from Delta's `AddFile`s (NOT kernel log
 /// replay, for correctness) but the kernel-read executor still needs kernel's resolved
 /// physical/logical schemas. Builds the snapshot at `version` + a `Scan` projected to
-/// `projected_schema_json` and returns its `(physical_schema_ipc, logical_schema_ipc)`. Does NOT
-/// enumerate files.
+/// `projected_schema_json` and returns `(actual_snapshot_version, physical_schema_ipc,
+/// logical_schema_ipc)`. Does NOT enumerate files.
 pub fn plan_delta_read_schemas(
     url_str: &str,
     config: &DeltaStorageConfig,
     version: Option<u64>,
     projected_schema_json: String,
-) -> DeltaResult<(Vec<u8>, Vec<u8>)> {
+) -> DeltaResult<(u64, Vec<u8>, Vec<u8>)> {
     let url = normalize_url(url_str)?;
     let engine = get_or_create_engine(&url, config)?;
     let snapshot = {
@@ -183,11 +183,13 @@ pub fn plan_delta_read_schemas(
         }
         builder.build(&*engine)?
     };
+    let actual_version = snapshot.version();
     let read_schema = read_schema_from_json(&projected_schema_json)?;
     // `Snapshot::build()` already returns `Arc<Snapshot>` (= `SnapshotRef`); `scan_builder` consumes
     // it by value.
     let scan = snapshot.scan_builder().with_schema(read_schema).build()?;
-    scan_schemas_to_ipc(&scan)
+    let (physical, logical) = scan_schemas_to_ipc(&scan)?;
+    Ok((actual_version, physical, logical))
 }
 
 /// Build the top-level Delta column mappings (`logical_name` -> `physical_name`) for a column-mapped
@@ -564,7 +566,8 @@ fn ensure_trailing_slash(url: &mut Url) {
 ///
 /// `kernel/src/scan/log_replay.rs::SCAN_ROW_SCHEMA` defines the schema:
 ///   { path, size, modificationTime, stats, deletionVector,
-///     fileConstantValues: { partitionValues, baseRowId, defaultRowCommitVersion, tags } }
+///     fileConstantValues: { partitionValues, baseRowId, defaultRowCommitVersion, tags,
+///     clusteringProvider } }
 /// So the fileConstantValues struct is the 6th top-level field (index 5), and within it
 /// baseRowId is at field index 1 and defaultRowCommitVersion at field index 2.
 ///
@@ -600,14 +603,21 @@ fn extract_row_tracking_for_selected(
     };
 
     let sel = meta.scan_files.selection_vector();
-    // FilteredEngineData::try_new asserts `sel.len() <= data.len()`; rows beyond
-    // sel.len() are treated as not-selected. visit_scan_files visits only rows that ARE
-    // selected, so any rows past sel.len() won't appear in the callback and our parallel
-    // vec stays aligned. The explicit bound below makes the contract obvious.
-    let bounded_rows = total_rows.min(sel.len());
+    // Kernel's gap semantics are "rows past sel.len() are SELECTED" (FilteredEngineData:
+    // "gaps represent rows that are assumed to be selected"), so a short selection
+    // vector would make visit_scan_files visit rows these parallel vecs skipped --
+    // silent misalignment (DVs/row-ids attached to the wrong files). Kernel 0.24's
+    // scan_metadata always emits sel.len() == num_rows (enforced by require! at both
+    // ScanMetadata::try_new call sites); fail loudly if that ever changes.
+    if sel.len() != total_rows {
+        return Err(DeltaError::Internal(format!(
+            "scan_files selection vector length {} != batch rows {total_rows}",
+            sel.len()
+        )));
+    }
     let mut out: Vec<(Option<i64>, Option<i64>)> =
         Vec::with_capacity(sel.iter().filter(|b| **b).count());
-    for (i, &keep) in sel.iter().enumerate().take(bounded_rows) {
+    for (i, &keep) in sel.iter().enumerate() {
         if !keep {
             continue;
         }
@@ -643,9 +653,16 @@ fn extract_dv_descriptors_for_selected(
     let engine_data = meta.scan_files.data();
     let arrow = match engine_data.any_ref().downcast_ref::<ArrowEngineData>() {
         Some(a) => a,
-        // Non-Arrow engine (shouldn't happen for our DefaultEngine path); return
-        // empty so downstream sees None per row -- which matches the no-DV case.
-        None => return Ok(Vec::new()),
+        // Non-Arrow engine (impossible with the bundled DefaultEngine): fail LOUDLY.
+        // Returning empty here would read every file as DV-less -- silently
+        // resurrecting deleted rows -- and unlike row tracking there is no downstream
+        // decline gate to catch it.
+        None => {
+            return Err(DeltaError::Internal(
+                "scan_files engine data is not ArrowEngineData; cannot extract DV descriptors"
+                    .to_string(),
+            ))
+        }
     };
     let batch = arrow.record_batch();
     let total_rows = batch.num_rows();
@@ -670,10 +687,16 @@ fn extract_dv_descriptors_for_selected(
     };
 
     let sel = meta.scan_files.selection_vector();
-    let bounded_rows = total_rows.min(sel.len());
+    // Same hard alignment contract as `extract_row_tracking_for_selected` -- see there.
+    if sel.len() != total_rows {
+        return Err(DeltaError::Internal(format!(
+            "scan_files selection vector length {} != batch rows {total_rows}",
+            sel.len()
+        )));
+    }
     let mut out: Vec<Option<crate::proto::DeltaDvDescriptor>> =
         Vec::with_capacity(sel.iter().filter(|b| **b).count());
-    for (i, &keep) in sel.iter().enumerate().take(bounded_rows) {
+    for (i, &keep) in sel.iter().enumerate() {
         if !keep {
             continue;
         }

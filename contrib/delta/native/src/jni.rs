@@ -42,9 +42,10 @@ use crate::proto::{DeltaPartitionValue, DeltaScanTask, DeltaScanTaskList};
 /// 1. `table_url` — absolute URL or bare path of the Delta table root
 /// 2. `snapshot_version` — `-1` for latest, otherwise the exact version
 /// 3. `storage_options` — a `java.util.Map<String, String>` of cloud
-///    credentials. **Phase 1 currently only consumes a small subset** (the
-///    AWS / Azure keys listed in `DeltaStorageConfig`); unknown keys are
-///    silently ignored. Full options-map plumbing lands with Phase 2.
+///    credentials (the Hadoop `fs.s3a.*` / `fs.azure.*` / `fs.gs.*` keys
+///    `NativeConfig.extractObjectStoreOptions` ships, plus kernel-style
+///    `aws_*` / `azure_*` overrides). Bridged into [`DeltaStorageConfig`]
+///    by `delta_storage_config_from_map`; unrecognised keys are ignored.
 ///
 /// # Returns
 /// A Java `byte[]` containing a prost-encoded [`DeltaScanTaskList`]
@@ -93,12 +94,7 @@ pub unsafe extern "system" fn Java_org_apache_comet_contrib_delta_Native_planDel
             extract_storage_config(env, &jmap, table_url_parsed.as_ref())?
         };
 
-        // Phase 2: read column names for BoundReference resolution.
-        // storageOptions map carries Hadoop-style keys (fs.s3a.access.key,
-        // fs.s3a.secret.key, fs.s3a.endpoint, fs.s3a.path.style.access,
-        // fs.s3a.endpoint.region, fs.s3a.session.token) extracted by
-        // NativeConfig.extractObjectStoreOptions on the Scala side.
-        // extract_storage_config below maps these to kernel's DeltaStorageConfig.
+        // Column names for BoundReference index->name resolution in the predicate.
         let col_names = read_string_array(env, &column_names)?;
 
         // Phase 2: deserialize the Catalyst predicate (if provided) for
@@ -265,17 +261,21 @@ pub unsafe extern "system" fn Java_org_apache_comet_contrib_delta_Native_planDel
         };
 
         // The data-read schema (Delta JSON) for kernel's `with_schema`. Empty => zero data columns
-        // => no kernel schemas needed.
-        let (physical_schema, logical_schema) = match decode_jstring(env, &projected_schema_json)? {
-            Some(json) => crate::scan::plan_delta_read_schemas(&url_str, &config, version, json)
+        // => no kernel schemas needed (and no snapshot is built, so the requested version is
+        // echoed back as-is).
+        let (actual_version, physical_schema, logical_schema) =
+            match decode_jstring(env, &projected_schema_json)? {
+                Some(json) => crate::scan::plan_delta_read_schemas(
+                    &url_str, &config, version, json,
+                )
                 .map_err(|e| {
                     CometError::Internal(format!("delta kernel read-schema build failed: {e}"))
                 })?,
-            None => (Vec::new(), Vec::new()),
-        };
+                None => (version.unwrap_or(0), Vec::new(), Vec::new()),
+            };
 
         let msg = DeltaScanTaskList {
-            snapshot_version: version.unwrap_or(0),
+            snapshot_version: actual_version,
             table_root: url_str,
             tasks: Vec::new(),
             unsupported_features: Vec::new(),
@@ -301,6 +301,20 @@ fn resolve_file_path(table_root: &str, relative: &str) -> String {
         return relative.to_string();
     }
 
+    // Scheme-less ABSOLUTE paths are absolute on the table's filesystem, per Hadoop
+    // `Path` / Spark `DeltaFileOperations.absolutePath` semantics -- resolve against the
+    // root's scheme+authority (RFC 3986 path replacement), never concatenate. For a bare
+    // local root the absolute path already IS the file path.
+    if relative.starts_with('/') {
+        return match url::Url::parse(table_root) {
+            Ok(root) => root
+                .join(relative)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| relative.to_string()),
+            Err(_) => relative.to_string(),
+        };
+    }
+
     if table_root.ends_with('/') {
         format!("{table_root}{relative}")
     } else {
@@ -317,9 +331,9 @@ fn has_uri_scheme(s: &str) -> bool {
     if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
         return false;
     }
-    for (i, &b) in bytes.iter().enumerate().skip(1) {
+    for &b in bytes.iter().skip(1) {
         if b == b':' {
-            return i >= 1;
+            return true;
         }
         if !(b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.') {
             return false;
@@ -409,6 +423,19 @@ pub fn delta_storage_config_from_map(
             .cloned()
             .or_else(|| s3_hadoop(m, bucket, suffix))
     };
+    // Hadoop XML values routinely carry stray whitespace/newlines; core trims every S3
+    // value (`get_config_trimmed`), and a trailing newline on a secret authenticates
+    // differently untrimmed. Empty-after-trim collapses to None (Hadoop's core-default.xml
+    // ships `fs.s3a.endpoint` EMPTY, and `Some("")` must not reach the builder).
+    let clean = |v: Option<String>| -> Option<String> {
+        v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    // Booleans are case-insensitive, like core (`path.style.access=True` must count).
+    let is_true = |v: Option<String>| {
+        clean(v)
+            .map(|s| s.to_lowercase() == "true")
+            .unwrap_or(false)
+    };
     // ---- Azure: account-scoped resolution, mirroring core's `objectstore::azure` ----
     //
     // When the URL supplies no account (bare `az://container`, or no URL at all), fall back
@@ -457,21 +484,27 @@ pub fn delta_storage_config_from_map(
     let gcs_service_account_key = m.get("google_service_account_key").cloned();
 
     DeltaStorageConfig {
-        aws_access_key: kernel_or_s3("aws_access_key_id", "access.key"),
-        aws_secret_key: kernel_or_s3("aws_secret_access_key", "secret.key"),
-        aws_session_token: kernel_or_s3("aws_session_token", "session.token"),
-        aws_region: m
-            .get("aws_region")
-            .cloned()
-            .or_else(|| s3_hadoop(m, bucket, "endpoint.region"))
-            .or_else(|| s3_hadoop(m, bucket, "region")),
-        aws_endpoint: kernel_or_s3("aws_endpoint", "endpoint"),
-        aws_force_path_style: m
-            .get("aws_force_path_style")
-            .cloned()
-            .or_else(|| s3_hadoop(m, bucket, "path.style.access"))
-            .map(|s| s == "true")
-            .unwrap_or(false),
+        aws_access_key: clean(kernel_or_s3("aws_access_key_id", "access.key")),
+        aws_secret_key: clean(kernel_or_s3("aws_secret_access_key", "secret.key")),
+        aws_session_token: clean(kernel_or_s3("aws_session_token", "session.token")),
+        aws_region: clean(
+            m.get("aws_region")
+                .cloned()
+                .or_else(|| s3_hadoop(m, bucket, "endpoint.region"))
+                .or_else(|| s3_hadoop(m, bucket, "region")),
+        ),
+        aws_endpoint: clean(kernel_or_s3("aws_endpoint", "endpoint"))
+            .and_then(|e| normalize_s3_endpoint(&e)),
+        aws_force_path_style: is_true(
+            m.get("aws_force_path_style")
+                .cloned()
+                .or_else(|| s3_hadoop(m, bucket, "path.style.access")),
+        ),
+        aws_requester_pays: is_true(
+            m.get("aws_request_payer")
+                .cloned()
+                .or_else(|| s3_hadoop(m, bucket, "requester.pays.enabled")),
+        ),
         azure_account_name,
         azure_account_key,
         azure_sas_token,
@@ -483,6 +516,24 @@ pub fn delta_storage_config_from_map(
         azure_federated_token_file,
         gcs_service_account_path,
         gcs_service_account_key,
+    }
+}
+
+/// Port of core's `objectstore::s3::normalize_endpoint` (minus the virtual-hosted-style
+/// bucket append -- the contrib uses the direct path-style flag instead; keep in
+/// lock-step otherwise). Empty endpoints and Hadoop's default sentinel
+/// `s3.amazonaws.com` are dropped so object_store falls back to its own default (core:
+/// "explicitly specifying this endpoint will lead to HTTP request failures"); a
+/// scheme-less endpoint gets `https://` prefixed because object_store uses the value
+/// verbatim as the request URL base.
+fn normalize_s3_endpoint(endpoint: &str) -> Option<String> {
+    if endpoint.is_empty() || endpoint == "s3.amazonaws.com" {
+        return None;
+    }
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        Some(format!("https://{endpoint}"))
+    } else {
+        Some(endpoint.to_string())
     }
 }
 
@@ -590,14 +641,12 @@ fn read_string_array(env: &mut Env, arr: &jni::objects::JObjectArray) -> CometRe
     Ok(result)
 }
 
-/// Iterate a `java.util.Map<String, String>` into a Rust `HashMap`. Used when we need to
-/// pass the full Hadoop config map to a downstream consumer (e.g.,
-/// `s3::resolve_static_credentials`) that walks its own provider chain.
+/// Iterate a `java.util.Map<String, String>` into a Rust `HashMap` for
+/// `delta_storage_config_from_map`.
 ///
-/// Uses `env.cast_local::<JString>(...)` to safely downcast each key/value entry rather
-/// than the `unsafe { JString::from_raw(..., into_raw()) }` shortcut used elsewhere in
-/// this file -- the runtime cast performs the same JNI-side type check the JLS implies
-/// for `Map<String, String>` but without the unchecked transmute.
+/// Uses `env.cast_local::<JString>(...)` to safely downcast each key/value entry -- the
+/// runtime cast performs the JNI-side type check the JLS implies for
+/// `Map<String, String>`, so an unexpected element type surfaces as a clean error.
 fn jmap_to_hashmap(
     env: &mut Env,
     jmap: &JMap<'_>,
@@ -650,12 +699,11 @@ mod tests {
         );
     }
 
-    /// Cred-audit regression: full matrix of storage-option keys that the
-    /// Scala side (`NativeConfig.extractObjectStoreOptions` +
-    /// `augmentWithResolvedAwsCredentials`) is allowed to send, mapped to
-    /// the expected [`DeltaStorageConfig`] field values. When new
-    /// translation branches land here, extend this matrix so a future
-    /// silent drop is caught.
+    /// Cred-audit regression: full matrix of storage-option keys the Scala side
+    /// (`NativeConfig.extractObjectStoreOptions`, plus the contrib's resolved static
+    /// AWS credentials in later parts) is allowed to send, mapped to the expected
+    /// [`DeltaStorageConfig`] field values. When new translation branches land here,
+    /// extend this matrix so a future silent drop is caught.
     #[test]
     fn extract_storage_config_matrix() {
         use std::collections::HashMap;
@@ -752,6 +800,55 @@ mod tests {
         kernel_style.insert("aws_force_path_style".to_string(), "true".to_string());
         assert!(delta_storage_config_from_map(&kernel_style, None).aws_force_path_style);
 
+        // Case 4d: endpoint normalization, mirroring core's `normalize_endpoint`.
+        // Hadoop's core-default.xml ships `fs.s3a.endpoint` EMPTY -- it must NOT reach
+        // the builder as Some("") (that breaks every request); the Hadoop default
+        // sentinel is dropped so object_store uses its own default; scheme-less
+        // endpoints get https:// prefixed (object_store uses the value verbatim).
+        let ep = |v: &str| {
+            let mut m = HashMap::new();
+            m.insert("fs.s3a.endpoint".to_string(), v.to_string());
+            delta_storage_config_from_map(&m, None).aws_endpoint
+        };
+        assert_eq!(ep(""), None);
+        assert_eq!(ep("s3.amazonaws.com"), None);
+        assert_eq!(ep("minio:9000").as_deref(), Some("https://minio:9000"));
+        assert_eq!(
+            ep("http://localhost:9000").as_deref(),
+            Some("http://localhost:9000")
+        );
+        assert_eq!(
+            ep("https://s3.example").as_deref(),
+            Some("https://s3.example")
+        );
+
+        // Case 4e: values are trimmed (Hadoop XML carries stray whitespace/newlines --
+        // a trailing newline on a secret authenticates differently untrimmed) and
+        // booleans are case-insensitive, like core's `get_config_trimmed`.
+        let mut messy = HashMap::new();
+        messy.insert("fs.s3a.secret.key".to_string(), "  SK\n".to_string());
+        messy.insert("fs.s3a.path.style.access".to_string(), "True".to_string());
+        let cfg = delta_storage_config_from_map(&messy, None);
+        assert_eq!(cfg.aws_secret_key.as_deref(), Some("SK"));
+        assert!(cfg.aws_force_path_style);
+
+        // Case 4f: requester-pays bridges from both the Hadoop key (per-bucket capable)
+        // and the kernel-style key.
+        let mut rp = HashMap::new();
+        rp.insert(
+            "fs.s3a.bucket.my-bucket.requester.pays.enabled".to_string(),
+            "true".to_string(),
+        );
+        assert!(
+            delta_storage_config_from_map(&rp, Some(&turl("s3://my-bucket/t"))).aws_requester_pays
+        );
+        assert!(
+            !delta_storage_config_from_map(&rp, Some(&turl("s3://other/t"))).aws_requester_pays
+        );
+        let mut rp_kernel = HashMap::new();
+        rp_kernel.insert("aws_request_payer".to_string(), "true".to_string());
+        assert!(delta_storage_config_from_map(&rp_kernel, None).aws_requester_pays);
+
         // Case 5: empty map -> all defaults (no creds, force_path_style=false).
         let cfg = delta_storage_config_from_map(&HashMap::new(), None);
         assert!(cfg.aws_access_key.is_none());
@@ -760,6 +857,7 @@ mod tests {
         assert!(cfg.aws_region.is_none());
         assert!(cfg.aws_endpoint.is_none());
         assert!(!cfg.aws_force_path_style);
+        assert!(!cfg.aws_requester_pays);
     }
 
     /// Azure / GCS credentials are bridged into their OWN `DeltaStorageConfig` fields;
@@ -1051,6 +1149,26 @@ mod tests {
         assert!(opts
             .iter()
             .any(|(k, v)| k.as_ref() == "azure_storage_tenant_id" && v == "msi-tenant"));
+    }
+
+    /// Scheme-less ABSOLUTE AddFile paths are absolute on the table's filesystem
+    /// (Hadoop `Path` semantics) -- they resolve against the root's scheme+authority,
+    /// never concatenate onto the table root.
+    #[test]
+    fn resolve_file_path_scheme_less_absolute() {
+        assert_eq!(
+            resolve_file_path("file:///tmp/t/", "/abs/dir/part-0.parquet"),
+            "file:///abs/dir/part-0.parquet"
+        );
+        assert_eq!(
+            resolve_file_path("s3://bucket/t/", "/other/part-0.parquet"),
+            "s3://bucket/other/part-0.parquet"
+        );
+        // Bare local root: the absolute path already IS the file path.
+        assert_eq!(
+            resolve_file_path("/tmp/t", "/abs/part-0.parquet"),
+            "/abs/part-0.parquet"
+        );
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub struct DeltaStorageConfig {
     pub aws_region: Option<String>,
     pub aws_endpoint: Option<String>,
     pub aws_force_path_style: bool,
+    /// `fs.s3a.requester.pays.enabled` -- requester-pays buckets 403 without it.
+    pub aws_requester_pays: bool,
     // Azure (abfs/abfss/wasb/wasbs/az). Bridged from `fs.azure.*` so the native reader uses the
     // SAME credentials Spark would, instead of falling back to ambient `AZURE_*` env on executors.
     pub azure_account_name: Option<String>,
@@ -135,6 +137,7 @@ impl std::fmt::Debug for DeltaStorageConfig {
             .field("aws_region", &self.aws_region)
             .field("aws_endpoint", &self.aws_endpoint)
             .field("aws_force_path_style", &self.aws_force_path_style)
+            .field("aws_requester_pays", &self.aws_requester_pays)
             .field("azure_account_name", &self.azure_account_name)
             .field("azure_account_key", &redact(&self.azure_account_key))
             .field("azure_sas_token", &redact(&self.azure_sas_token))
@@ -163,8 +166,10 @@ impl std::fmt::Debug for DeltaStorageConfig {
 /// `MicrosoftAzureBuilder::from_env()` (ambient `AZURE_*` / AKS workload identity, exactly
 /// like core's `objectstore::azure::create_store`) and layers the bridged `fs.azure.*`
 /// credentials on top. GCS (`gs` / `gcs`) goes through `object_store::parse_url[_opts]`
-/// (ADC / instance-metadata fallback, parity with core, which has no GCS translation
-/// either). Any other scheme is rejected with [`DeltaError::UnsupportedScheme`].
+/// (which resolves credentials lazily from the ADC well-known path or the instance
+/// metadata server -- parity with core, which has no GCS translation either; `gcs://`
+/// is rewritten to `gs://` first because `ObjectStoreScheme::parse` only knows `gs`).
+/// Any other scheme is rejected with [`DeltaError::UnsupportedScheme`].
 pub fn create_object_store(
     url: &Url,
     config: &DeltaStorageConfig,
@@ -176,7 +181,12 @@ pub fn create_object_store(
             let bucket = url.host_str().ok_or_else(|| DeltaError::MissingBucket {
                 url: url.to_string(),
             })?;
-            let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+            // `allow_http` unconditionally, mirroring core's `objectstore::s3::create_store`
+            // (MinIO / LocalStack endpoints are `http://`; against real AWS the endpoint is
+            // https anyway).
+            let mut builder = AmazonS3Builder::new()
+                .with_bucket_name(bucket)
+                .with_allow_http(true);
 
             if let Some(ref key) = config.aws_access_key {
                 builder = builder.with_access_key_id(key);
@@ -196,13 +206,17 @@ pub fn create_object_store(
             if config.aws_force_path_style {
                 builder = builder.with_virtual_hosted_style_request(false);
             }
-            // Allow HTTP endpoints (MinIO, LocalStack, custom S3-compat)
-            if config
-                .aws_endpoint
-                .as_ref()
-                .is_some_and(|e| e.starts_with("http://"))
-            {
-                builder = builder.with_allow_http(true);
+            if config.aws_requester_pays {
+                builder =
+                    builder.with_config(object_store::aws::AmazonS3ConfigKey::RequestPayer, "true");
+            }
+            // With neither an endpoint nor a region, object_store defaults to us-east-1 and
+            // every request against a bucket in any other region fails with 301
+            // PermanentRedirect (object_store does not follow region redirects). Mirror core:
+            // resolve the bucket's real region via a cached HeadBucket probe.
+            if config.aws_endpoint.is_none() && config.aws_region.is_none() {
+                let region = resolve_bucket_region_blocking(bucket)?;
+                builder = builder.with_region(region);
             }
 
             Arc::new(builder.build()?)
@@ -210,12 +224,20 @@ pub fn create_object_store(
         "az" | "azure" | "abfs" | "abfss" | "wasb" | "wasbs" => build_azure_store(url, config)?,
         "gs" | "gcs" => {
             // Build the GCS store from the service account Spark bridged from `fs.gs.*`; with no
-            // bridged creds, fall back to `parse_url` (ambient `GOOGLE_*` / ADC), parity with core.
+            // bridged creds, fall back to `parse_url` (lazy ADC / instance-metadata resolution,
+            // parity with core). `ObjectStoreScheme::parse` recognises only `gs`, so rewrite the
+            // `gcs` alias first -- without this the arm can never build a store.
+            let mut gs_url = url.clone();
+            if scheme == "gcs" {
+                gs_url.set_scheme("gs").map_err(|_| {
+                    DeltaError::Internal(format!("cannot rewrite gcs:// scheme for {url}"))
+                })?;
+            }
             let opts = config.gcs_object_store_options();
             let (store, _path) = if opts.is_empty() {
-                object_store::parse_url(url)?
+                object_store::parse_url(&gs_url)?
             } else {
-                object_store::parse_url_opts(url, opts)?
+                object_store::parse_url_opts(&gs_url, opts)?
             };
             Arc::from(store)
         }
@@ -231,13 +253,75 @@ pub fn create_object_store(
     Ok(store)
 }
 
-/// Build the Azure store: start from the ambient environment, apply the URL, then layer the
-/// bridged Hadoop credentials on top.
+/// Process-wide cache of resolved S3 bucket regions (a bucket's region is fixed at
+/// creation, so no invalidation). Port of core's `objectstore::s3::region_cache`.
+fn region_cache() -> &'static std::sync::RwLock<HashMap<String, String>> {
+    static CACHE: OnceLock<std::sync::RwLock<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Resolve an S3 bucket's region via the HeadBucket API (`x-amz-bucket-region` response
+/// header), cached per bucket. Port of core's `objectstore::s3::resolve_bucket_region`
+/// (itself adapted from the object_store crate as a workaround for
+/// arrow-rs-object-store#479).
+///
+/// Runs the probe on a dedicated OS thread with a one-shot current-thread runtime rather
+/// than `block_on` in place: engine construction can happen on a tokio worker (the
+/// executor-side read path), where any in-context `block_on` panics. The thread cost is
+/// paid once per bucket; subsequent lookups hit the cache.
+fn resolve_bucket_region_blocking(bucket: &str) -> DeltaResult<String> {
+    if let Some(region) = region_cache()
+        .read()
+        .ok()
+        .and_then(|c| c.get(bucket).cloned())
+    {
+        return Ok(region);
+    }
+    let bucket_owned = bucket.to_string();
+    let resolved = std::thread::spawn(move || -> Result<String, String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("tokio runtime for region probe: {e}"))?;
+        rt.block_on(async {
+            let endpoint = format!("https://{bucket_owned}.s3.amazonaws.com");
+            let response = reqwest::Client::new()
+                .head(&endpoint)
+                .send()
+                .await
+                .map_err(|e| format!("HeadBucket {endpoint}: {e}"))?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(format!("Bucket not found: {bucket_owned}"));
+            }
+            response
+                .headers()
+                .get("x-amz-bucket-region")
+                .ok_or_else(|| format!("Missing region for bucket: {bucket_owned}"))?
+                .to_str()
+                .map(str::to_string)
+                .map_err(|e| format!("x-amz-bucket-region for {bucket_owned}: {e}"))
+        })
+    })
+    .join()
+    .map_err(|_| DeltaError::Internal("S3 region resolution thread panicked".to_string()))?
+    .map_err(|e| DeltaError::Internal(format!("failed to resolve S3 bucket region: {e}")))?;
+    if let Ok(mut cache) = region_cache().write() {
+        cache.insert(bucket.to_string(), resolved.clone());
+    }
+    Ok(resolved)
+}
+
+/// Build the Azure store: start from the ambient environment, then layer the bridged Hadoop
+/// credentials, with the URL supplying account/container.
 ///
 /// Mirrors core's `objectstore::azure::create_store`: `from_env()` first so AKS Workload
 /// Identity (`AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_FEDERATED_TOKEN_FILE`) and
 /// explicit `AZURE_STORAGE_*` variables are honoured with no further configuration, then the
-/// translated Hadoop configs override. (`object_store::parse_url` would use
+/// translated Hadoop CREDENTIAL configs override. Note the account/container are the other
+/// way round: `with_url` is applied inside `build()` AFTER all `with_config` calls, so the
+/// URL-derived account/container override a bridged `AccountName` -- which is correct: the
+/// table URL, not the config map, names the store. (Credential keys are never URL-derived,
+/// so credentials always layer on top of env as described.) (`object_store::parse_url` would use
 /// `MicrosoftAzureBuilder::new()`, which reads NO environment at all -- a store built that way
 /// has no credentials whatsoever, so it is not a usable fallback.)
 ///
@@ -540,6 +624,27 @@ mod tests {
             dbg.contains("azure") || dbg.contains("microsoft"),
             "got: {dbg}"
         );
+    }
+
+    #[test]
+    fn create_object_store_gcs_alias_scheme_builds() {
+        // `gcs://` must be rewritten to `gs://` before parse_url --
+        // ObjectStoreScheme::parse only recognises `gs`, so without the rewrite this
+        // arm could never build a store.
+        create_object_store(&url("gcs://my-bucket/path"), &empty_config())
+            .expect("gcs:// alias builds via scheme rewrite");
+    }
+
+    #[test]
+    fn create_object_store_s3_requester_pays_builds() {
+        let cfg = DeltaStorageConfig {
+            aws_access_key: Some("k".into()),
+            aws_secret_key: Some("s".into()),
+            aws_region: Some("us-east-1".into()),
+            aws_requester_pays: true,
+            ..Default::default()
+        };
+        create_object_store(&url("s3://rp-bucket/p"), &cfg).expect("requester-pays store builds");
     }
 
     #[test]

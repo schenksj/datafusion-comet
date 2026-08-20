@@ -103,11 +103,15 @@ fn translate_predicate(expr: &Expr, names: &[String]) -> Predicate {
             None => Predicate::unknown("not_missing_child"),
         },
         Some(ExprStruct::In(in_expr)) => translate_in(in_expr, names),
-        // Unwrap Cast: kernel stats don't need type coercion, pass child through
-        Some(ExprStruct::Cast(cast)) => match cast.child.as_deref() {
-            Some(child) => translate_predicate(child, names),
-            None => Predicate::unknown("cast_missing_child"),
-        },
+        // Cast subtrees become unknown rather than unwrapping to the child: after
+        // unwrapping, the literal on the other side carries the cast's TARGET type,
+        // which by construction differs from the column's stats type, and kernel's
+        // stats evaluator hard-errors on mismatched comparisons ("Invalid comparison:
+        // Int64 <= Int32") -- aborting the scan and forcing the predicate-less retry,
+        // which drops pruning for EVERY conjunct. Localizing the cast conjunct to
+        // unknown keeps the other conjuncts pruning. (Spark's numeric-promotion casts
+        // are always widening, so an unwrap essentially never type-checks anyway.)
+        Some(ExprStruct::Cast(_)) => Predicate::unknown("cast_not_pushed"),
         _ => Predicate::unknown("unsupported_catalyst_expr"),
     }
 }
@@ -124,6 +128,15 @@ fn translate_in(in_expr: &spark_expression::In, names: &[String]) -> Predicate {
         .filter_map(catalyst_literal_to_scalar)
         .collect();
 
+    // Every element must translate, or the whole IN becomes unknown. Dropping an
+    // untranslatable element (decimal, binary, NULL, non-literal) would produce a
+    // STRICTLY STRONGER predicate -- `col IN (1, <decimal 2.5>)` must not prune a file
+    // whose only matches carry 2.5. (Kernel 0.24 doesn't evaluate In for skipping yet,
+    // so this is a latent bug, but its `eval_pred_in` is an explicit TODO -- the first
+    // kernel upgrade that implements it would silently drop rows.)
+    if scalars.len() != in_expr.lists.len() {
+        return Predicate::unknown("in_unsupported_element");
+    }
     if scalars.is_empty() {
         return Predicate::unknown("in_no_literal_values");
     }
@@ -232,11 +245,10 @@ pub fn catalyst_to_kernel_expression_with_names(
             }
         }
         Some(ExprStruct::Literal(lit)) => catalyst_literal_to_kernel(lit),
-        // Unwrap Cast: pass child expression through for kernel stats evaluation
-        Some(ExprStruct::Cast(cast)) => match cast.child.as_deref() {
-            Some(child) => catalyst_to_kernel_expression_with_names(child, column_names),
-            None => Expression::unknown("cast_missing_child"),
-        },
+        // Cast operands become unknown, not the unwrapped child -- see the Cast arm in
+        // `translate_predicate` for why (widening casts make the comparison mistype and
+        // abort the scan instead of pruning).
+        Some(ExprStruct::Cast(_)) => Expression::unknown("cast_not_pushed"),
         _ => Expression::unknown("unsupported_expr_operand"),
     }
 }
@@ -251,8 +263,12 @@ fn catalyst_literal_to_kernel(lit: &spark_expression::Literal) -> Expression {
     let type_id = lit.datatype.as_ref().map(|d| d.type_id);
     match &lit.value {
         Some(literal::Value::BoolVal(b)) => Expression::literal(*b),
-        Some(literal::Value::ByteVal(v)) => Expression::literal(*v),
-        Some(literal::Value::ShortVal(v)) => Expression::literal(*v),
+        // Byte/Short arrive in int32 slots (protobuf has no int8/int16); emit the NARROW
+        // kernel scalar so the literal's type matches the column's stats type -- an
+        // Integer literal against Byte/Short stats hard-errors kernel's evaluator
+        // (same class as the Int64<=Int32 abort). Mirrors `catalyst_literal_to_scalar`.
+        Some(literal::Value::ByteVal(v)) => Expression::literal(Scalar::Byte(*v as i8)),
+        Some(literal::Value::ShortVal(v)) => Expression::literal(Scalar::Short(*v as i16)),
         Some(literal::Value::IntVal(v)) if type_id == Some(DataTypeId::Date as i32) => {
             Expression::literal(Scalar::Date(*v))
         }
@@ -585,6 +601,49 @@ mod tests {
     // ---- IN ----
 
     #[test]
+    fn in_with_untranslatable_element_becomes_unknown() {
+        // `col IN (1, <decimal>)` must NOT translate to `col IN (1)` -- a partial list
+        // is a strictly stronger predicate (could prune files whose only matches carry
+        // the dropped value).
+        let in_expr = In {
+            in_value: Some(Box::new(bound_ref(0))),
+            lists: vec![
+                lit_int(1),
+                mk_expr(ExprStruct::Literal(Literal {
+                    value: Some(literal::Value::DecimalVal(vec![1, 2])),
+                    ..Default::default()
+                })),
+            ],
+            negated: false,
+        };
+        let p = translate_in(&in_expr, &["c".to_string()]);
+        assert!(
+            pred_str(&p).contains("in_unsupported_element"),
+            "got: {}",
+            pred_str(&p)
+        );
+    }
+
+    #[test]
+    fn byte_short_literals_carry_narrow_kernel_types() {
+        // Byte/Short literals must produce NARROW kernel scalars in the comparison
+        // path -- an Integer literal against Byte/Short column stats hard-errors
+        // kernel's evaluator (Int32-vs-Int8 class of abort).
+        let byte_lit = mk_expr(ExprStruct::Literal(Literal {
+            value: Some(literal::Value::ByteVal(7)),
+            ..Default::default()
+        }));
+        let e = catalyst_to_kernel_expression_with_names(&byte_lit, &[]);
+        assert!(format!("{e:?}").contains("Byte"), "got: {e:?}");
+        let short_lit = mk_expr(ExprStruct::Literal(Literal {
+            value: Some(literal::Value::ShortVal(300)),
+            ..Default::default()
+        }));
+        let e = catalyst_to_kernel_expression_with_names(&short_lit, &[]);
+        assert!(format!("{e:?}").contains("Short"), "got: {e:?}");
+    }
+
+    #[test]
     fn in_translates_with_literal_list() {
         let in_expr = In {
             in_value: Some(Box::new(bound_ref(0))),
@@ -633,34 +692,43 @@ mod tests {
     // ---- Cast unwrap ----
 
     #[test]
-    fn cast_unwraps_in_predicate_context() {
+    fn cast_becomes_unknown_in_predicate_context() {
+        // Casts are NOT unwrapped: post-unwrap the literal carries the cast's target
+        // type, which mismatches the column's stats type and aborts kernel's stats
+        // evaluator (whole-scan retry, all conjuncts lose pruning). Unknown localizes
+        // the damage to this conjunct.
         let cast = Cast {
             child: Some(Box::new(binary(ExprStruct::Eq, bound_ref(0), lit_int(1)))),
             ..Default::default()
         };
         let expr = mk_expr(ExprStruct::Cast(Box::new(cast)));
         let p = catalyst_to_kernel_predicate_with_names(&expr, &["c".to_string()]);
-        let s = pred_str(&p);
-        assert!(!s.contains("unsupported"), "Cast didn't unwrap: {s}");
+        assert!(
+            pred_str(&p).contains("cast_not_pushed"),
+            "got: {}",
+            pred_str(&p)
+        );
     }
 
     #[test]
-    fn cast_unwraps_in_expression_context() {
+    fn cast_becomes_unknown_in_expression_context() {
         let cast = Cast {
             child: Some(Box::new(bound_ref(0))),
             ..Default::default()
         };
         let expr = mk_expr(ExprStruct::Cast(Box::new(cast)));
         let kernel_expr = catalyst_to_kernel_expression_with_names(&expr, &["x".to_string()]);
-        // After unwrap: should resolve to column "x"
-        assert!(format!("{kernel_expr:?}").contains("x"));
+        assert!(
+            format!("{kernel_expr:?}").contains("cast_not_pushed"),
+            "got: {kernel_expr:?}"
+        );
     }
 
     #[test]
     fn cast_missing_child_falls_back_to_unknown() {
         let expr = mk_expr(ExprStruct::Cast(Box::default()));
         let p = catalyst_to_kernel_predicate(&expr);
-        assert!(pred_str(&p).contains("cast_missing_child"));
+        assert!(pred_str(&p).contains("cast_not_pushed"));
     }
 
     // ---- BoundReference resolution ----
