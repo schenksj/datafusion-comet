@@ -417,6 +417,47 @@ mod tests {
     }
 
     #[test]
+    fn debug_redacts_azure_and_gcs_credential_material() {
+        // Same guard as the AWS variant, for the Azure/GCS secret fields: account key,
+        // SAS, OAuth client secret, and the GCS inline key must never survive a `{:?}`.
+        // Identifiers (account/client/tenant ids, endpoints, file PATHS) stay visible.
+        let c = DeltaStorageConfig {
+            azure_account_name: Some("myacct".to_string()),
+            azure_account_key: Some("AZKEYSECRETVALUE".to_string()),
+            azure_sas_token: Some("SASSECRETVALUE".to_string()),
+            azure_client_id: Some("client-id-visible".to_string()),
+            azure_client_secret: Some("CLIENTSECRETVALUE".to_string()),
+            azure_tenant_id: Some("tenant-visible".to_string()),
+            azure_msi_endpoint: Some("http://169.254.169.254/msi".to_string()),
+            azure_authority_host: Some("https://login.example".to_string()),
+            azure_federated_token_file: Some("/var/run/secrets/token".to_string()),
+            gcs_service_account_path: Some("/etc/gcs/key.json".to_string()),
+            gcs_service_account_key: Some("GCSKEYSECRETVALUE".to_string()),
+            ..Default::default()
+        };
+        let s = format!("{c:?}");
+        assert!(!s.contains("AZKEYSECRETVALUE"), "azure key leaked: {s}");
+        assert!(!s.contains("SASSECRETVALUE"), "azure SAS leaked: {s}");
+        assert!(
+            !s.contains("CLIENTSECRETVALUE"),
+            "azure client secret leaked: {s}"
+        );
+        assert!(!s.contains("GCSKEYSECRETVALUE"), "gcs key leaked: {s}");
+        // Non-secret identifiers remain visible for diagnosability.
+        for visible in [
+            "myacct",
+            "client-id-visible",
+            "tenant-visible",
+            "169.254.169.254",
+            "login.example",
+            "/var/run/secrets/token",
+            "/etc/gcs/key.json",
+        ] {
+            assert!(s.contains(visible), "{visible} should be visible: {s}");
+        }
+    }
+
+    #[test]
     fn create_object_store_local_file() {
         let store = create_object_store(&url("file:///tmp/x"), &empty_config()).unwrap();
         // Just verify Arc construction succeeded; LocalFileSystem doesn't expose
@@ -532,6 +573,32 @@ mod tests {
     // `google_service_account` reads + parses the keyfile at build time, so it can't be
     // exercised with a fake path. The bridging is covered by jni::tests::gcs_creds_bridged_from_hadoop
     // (extraction -> gcs_object_store_options) and exercised end-to-end against real GCS.
+
+    #[test]
+    fn create_object_store_azure_oauth_client_creds_builds() {
+        // OAuth2 client-credential fields reach the builder without erroring construction
+        // (token exchange is lazy, so no network here).
+        let cfg = DeltaStorageConfig {
+            azure_client_id: Some("client".to_string()),
+            azure_client_secret: Some("secret".to_string()),
+            azure_tenant_id: Some("tenant".to_string()),
+            ..Default::default()
+        };
+        let u = url("abfss://container@myacct.dfs.core.windows.net/path");
+        create_object_store(&u, &cfg).expect("azure store builds with oauth client creds");
+    }
+
+    #[test]
+    fn create_object_store_wasb_requires_authority() {
+        // A wasb URL with no authority has no account to bind -- must error, not build a
+        // store pointed at nothing.
+        let bad = url("wasbs:///just/a/path");
+        let err = create_object_store(&bad, &empty_config()).unwrap_err();
+        match err {
+            DeltaError::MissingBucket { .. } => {}
+            other => panic!("expected MissingBucket, got {other:?}"),
+        }
+    }
 
     #[test]
     fn create_object_store_unsupported_scheme() {

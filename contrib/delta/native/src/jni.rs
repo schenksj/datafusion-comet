@@ -719,6 +719,39 @@ mod tests {
             Some("GLOBAL")
         );
 
+        // Case 4b: per-bucket overrides apply to EVERY bridged S3 knob, not just the
+        // access key (all suffixes flow through the same s3_hadoop helper -- this guards
+        // against a future per-field special-case regressing one of them).
+        let mut per_bucket_all = HashMap::new();
+        for (k, v) in [
+            ("fs.s3a.secret.key", "SK_GLOBAL"),
+            ("fs.s3a.bucket.my-bucket.secret.key", "SK_BKT"),
+            ("fs.s3a.session.token", "TOK_GLOBAL"),
+            ("fs.s3a.bucket.my-bucket.session.token", "TOK_BKT"),
+            ("fs.s3a.endpoint", "https://global.example"),
+            ("fs.s3a.bucket.my-bucket.endpoint", "https://bkt.example"),
+            ("fs.s3a.endpoint.region", "eu-west-1"),
+            ("fs.s3a.bucket.my-bucket.endpoint.region", "us-east-2"),
+        ] {
+            per_bucket_all.insert(k.to_string(), v.to_string());
+        }
+        let cfg = delta_storage_config_from_map(&per_bucket_all, Some(&turl("s3://my-bucket/t")));
+        assert_eq!(cfg.aws_secret_key.as_deref(), Some("SK_BKT"));
+        assert_eq!(cfg.aws_session_token.as_deref(), Some("TOK_BKT"));
+        assert_eq!(cfg.aws_endpoint.as_deref(), Some("https://bkt.example"));
+        assert_eq!(cfg.aws_region.as_deref(), Some("us-east-2"));
+        let cfg = delta_storage_config_from_map(&per_bucket_all, Some(&turl("s3://other/t")));
+        assert_eq!(cfg.aws_secret_key.as_deref(), Some("SK_GLOBAL"));
+        assert_eq!(cfg.aws_session_token.as_deref(), Some("TOK_GLOBAL"));
+        assert_eq!(cfg.aws_endpoint.as_deref(), Some("https://global.example"));
+        assert_eq!(cfg.aws_region.as_deref(), Some("eu-west-1"));
+
+        // Case 4c: kernel-style `aws_force_path_style` is honored (the Hadoop
+        // `fs.s3a.path.style.access` form is covered in Case 1).
+        let mut kernel_style = HashMap::new();
+        kernel_style.insert("aws_force_path_style".to_string(), "true".to_string());
+        assert!(delta_storage_config_from_map(&kernel_style, None).aws_force_path_style);
+
         // Case 5: empty map -> all defaults (no creds, force_path_style=false).
         let cfg = delta_storage_config_from_map(&HashMap::new(), None);
         assert!(cfg.aws_access_key.is_none());
@@ -888,6 +921,59 @@ mod tests {
                 .as_deref(),
             Some("GLOBAL")
         );
+    }
+
+    /// Scoped keys resolve under EVERY accepted form: the `blob.core.windows.net`
+    /// endpoint suffix and the bare `<base>.<account>` (suffix-less) variant, not just
+    /// `dfs.core.windows.net` -- core's `account_scoped_value` probe order.
+    #[test]
+    fn azure_scoped_key_suffix_variants() {
+        use std::collections::HashMap;
+        let u = turl("wasbs://data@myacct.blob.core.windows.net/t");
+        let mut blob = HashMap::new();
+        blob.insert(
+            "fs.azure.account.key.myacct.blob.core.windows.net".to_string(),
+            "BLOB_KEY".to_string(),
+        );
+        assert_eq!(
+            delta_storage_config_from_map(&blob, Some(&u))
+                .azure_account_key
+                .as_deref(),
+            Some("BLOB_KEY")
+        );
+        let mut bare = HashMap::new();
+        bare.insert(
+            "fs.azure.account.key.myacct".to_string(),
+            "BARE_KEY".to_string(),
+        );
+        assert_eq!(
+            delta_storage_config_from_map(&bare, Some(&u))
+                .azure_account_key
+                .as_deref(),
+            Some("BARE_KEY")
+        );
+    }
+
+    /// One account listed under BOTH endpoint suffixes is still unambiguous: the
+    /// single-account fallback (used when the URL carries no account) must resolve it,
+    /// not bail as "multiple accounts".
+    #[test]
+    fn azure_single_account_under_two_suffixes_resolves_without_url() {
+        use std::collections::HashMap;
+        let mut m = HashMap::new();
+        m.insert(
+            "fs.azure.account.key.myacct.dfs.core.windows.net".to_string(),
+            "DFS_KEY".to_string(),
+        );
+        m.insert(
+            "fs.azure.account.key.myacct.blob.core.windows.net".to_string(),
+            "BLOB_KEY".to_string(),
+        );
+        let cfg = delta_storage_config_from_map(&m, None);
+        assert_eq!(cfg.azure_account_name.as_deref(), Some("myacct"));
+        // Probe order is dfs then blob (AZURE_ENDPOINT_SUFFIXES), so the dfs key wins
+        // deterministically.
+        assert_eq!(cfg.azure_account_key.as_deref(), Some("DFS_KEY"));
     }
 
     /// SAS resolves per `fs.azure.sas.<container>.<account>[.<endpoint-suffix>]`
