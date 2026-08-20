@@ -29,6 +29,7 @@ use url::Url;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use object_store::aws::AmazonS3Builder;
+use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 
@@ -37,14 +38,16 @@ use super::error::{DeltaError, DeltaResult};
 /// Concrete engine type returned by [`get_or_create_engine`].
 pub type DeltaEngine = DefaultEngine<TokioBackgroundExecutor>;
 
-/// S3 credentials used to construct kernel's engine.
+/// Storage credentials used to construct kernel's engine, bridged from the Hadoop
+/// configuration the JVM ships (see `jni::delta_storage_config_from_map`).
 ///
-/// Only S3 is field-per-knob: like core Comet (`parquet_support::prepare_object_store_with_configs`),
-/// the Hadoop `fs.s3a.*` keys (incl. per-bucket overrides) are bridged explicitly because
-/// `object_store::parse_url` cannot read them. Azure / GCS / other schemes are built straight
-/// through `object_store::parse_url`, which sources credentials from the ambient environment
-/// (`AZURE_*` / `GOOGLE_*` / ADC / instance metadata) -- matching core's non-S3 path -- so they
-/// need no fields here.
+/// S3 mirrors core Comet's `objectstore::s3` static-key subset (`fs.s3a.*` incl. per-bucket
+/// overrides); the Hadoop credential-provider classes core additionally emulates are a
+/// documented residual (08-known-limitations.md A2e). Azure mirrors core's
+/// `objectstore::azure::translate_hadoop_configs` mapping (account key, SAS, OAuth client
+/// credentials, MSI, workload identity), resolved account/container-scoped on the JNI side.
+/// GCS bridges the Hadoop service-account keyfile; anything not bridged falls back to the
+/// builder's ambient resolution (env / ADC / instance metadata).
 #[derive(Clone, Default, Hash, PartialEq, Eq)]
 pub struct DeltaStorageConfig {
     pub aws_access_key: Option<String>,
@@ -58,27 +61,44 @@ pub struct DeltaStorageConfig {
     pub azure_account_name: Option<String>,
     pub azure_account_key: Option<String>,
     pub azure_sas_token: Option<String>,
+    // Azure OAuth2 client credentials / MSI / workload identity -- the same
+    // `fs.azure.account.oauth2.*` surface core's `objectstore::azure` bridges.
+    pub azure_client_id: Option<String>,
+    pub azure_client_secret: Option<String>,
+    pub azure_tenant_id: Option<String>,
+    pub azure_msi_endpoint: Option<String>,
+    pub azure_authority_host: Option<String>,
+    pub azure_federated_token_file: Option<String>,
     // GCS (gs/gcs). Bridged from `fs.gs.*`.
     pub gcs_service_account_path: Option<String>,
     pub gcs_service_account_key: Option<String>,
 }
 
 impl DeltaStorageConfig {
-    /// `object_store`-style config key/value pairs for the Azure store, derived from the bridged
-    /// Hadoop creds. Empty when nothing was bridged -- the caller then falls back to ambient creds.
-    /// (`object_store` reads the account/container from the abfss/wasb URL authority; for the
-    /// `az://` scheme the account name is supplied here when known.)
-    pub fn azure_object_store_options(&self) -> Vec<(&'static str, String)> {
+    /// Typed `object_store` config pairs for the Azure store, derived from the bridged Hadoop
+    /// creds. Empty when nothing was bridged -- the builder then runs on `from_env()` alone
+    /// (ambient `AZURE_*` / workload identity), matching core's `objectstore::azure` fallback.
+    /// (`object_store` reads the account/container from the abfss/wasb URL authority; the
+    /// account name is supplied here when known, e.g. for the `az://` scheme.)
+    pub fn azure_object_store_options(&self) -> Vec<(AzureConfigKey, String)> {
         let mut o = Vec::new();
-        if let Some(v) = &self.azure_account_name {
-            o.push(("azure_storage_account_name", v.clone()));
-        }
-        if let Some(v) = &self.azure_account_key {
-            o.push(("azure_storage_account_key", v.clone()));
-        }
-        if let Some(v) = &self.azure_sas_token {
-            o.push(("azure_storage_sas_key", v.clone()));
-        }
+        let mut push = |k: AzureConfigKey, v: &Option<String>| {
+            if let Some(v) = v {
+                o.push((k, v.clone()));
+            }
+        };
+        push(AzureConfigKey::AccountName, &self.azure_account_name);
+        push(AzureConfigKey::AccessKey, &self.azure_account_key);
+        push(AzureConfigKey::SasKey, &self.azure_sas_token);
+        push(AzureConfigKey::ClientId, &self.azure_client_id);
+        push(AzureConfigKey::ClientSecret, &self.azure_client_secret);
+        push(AzureConfigKey::AuthorityId, &self.azure_tenant_id);
+        push(AzureConfigKey::MsiEndpoint, &self.azure_msi_endpoint);
+        push(AzureConfigKey::AuthorityHost, &self.azure_authority_host);
+        push(
+            AzureConfigKey::FederatedTokenFile,
+            &self.azure_federated_token_file,
+        );
         o
     }
 
@@ -118,6 +138,15 @@ impl std::fmt::Debug for DeltaStorageConfig {
             .field("azure_account_name", &self.azure_account_name)
             .field("azure_account_key", &redact(&self.azure_account_key))
             .field("azure_sas_token", &redact(&self.azure_sas_token))
+            .field("azure_client_id", &self.azure_client_id)
+            .field("azure_client_secret", &redact(&self.azure_client_secret))
+            .field("azure_tenant_id", &self.azure_tenant_id)
+            .field("azure_msi_endpoint", &self.azure_msi_endpoint)
+            .field("azure_authority_host", &self.azure_authority_host)
+            .field(
+                "azure_federated_token_file",
+                &self.azure_federated_token_file,
+            )
             .field("gcs_service_account_path", &self.gcs_service_account_path)
             .field(
                 "gcs_service_account_key",
@@ -130,9 +159,12 @@ impl std::fmt::Debug for DeltaStorageConfig {
 /// Build an `ObjectStore` for the given URL and credentials.
 ///
 /// `s3://` / `s3a://` are built from the bridged `fs.s3a.*` config; `file://` is local.
-/// Azure (`az` / `azure` / `abfs` / `abfss` / `wasb` / `wasbs`) and GCS (`gs` / `gcs`) are
-/// built via `object_store::parse_url` (ambient/env credentials), mirroring core Comet's
-/// non-S3 read path. Any other scheme is rejected with [`DeltaError::UnsupportedScheme`].
+/// Azure (`az` / `azure` / `abfs` / `abfss` / `wasb` / `wasbs`) starts from
+/// `MicrosoftAzureBuilder::from_env()` (ambient `AZURE_*` / AKS workload identity, exactly
+/// like core's `objectstore::azure::create_store`) and layers the bridged `fs.azure.*`
+/// credentials on top. GCS (`gs` / `gcs`) goes through `object_store::parse_url[_opts]`
+/// (ADC / instance-metadata fallback, parity with core, which has no GCS translation
+/// either). Any other scheme is rejected with [`DeltaError::UnsupportedScheme`].
 pub fn create_object_store(
     url: &Url,
     config: &DeltaStorageConfig,
@@ -175,20 +207,7 @@ pub fn create_object_store(
 
             Arc::new(builder.build()?)
         }
-        "az" | "azure" | "abfs" | "abfss" | "wasb" | "wasbs" => {
-            // Build the Azure store from the credentials Spark bridged from `fs.azure.*`
-            // (account key / SAS) so executors use the SAME identity Spark would, instead of
-            // ambient `AZURE_*` env / managed identity. `object_store` reads the account and
-            // container from the abfss/wasb URL authority. With no bridged creds, fall back to
-            // `parse_url` (ambient), parity with core's non-S3 read path.
-            let opts = config.azure_object_store_options();
-            let (store, _path) = if opts.is_empty() {
-                object_store::parse_url(url)?
-            } else {
-                object_store::parse_url_opts(url, opts)?
-            };
-            Arc::from(store)
-        }
+        "az" | "azure" | "abfs" | "abfss" | "wasb" | "wasbs" => build_azure_store(url, config)?,
         "gs" | "gcs" => {
             // Build the GCS store from the service account Spark bridged from `fs.gs.*`; with no
             // bridged creds, fall back to `parse_url` (ambient `GOOGLE_*` / ADC), parity with core.
@@ -210,6 +229,42 @@ pub fn create_object_store(
     };
 
     Ok(store)
+}
+
+/// Build the Azure store: start from the ambient environment, apply the URL, then layer the
+/// bridged Hadoop credentials on top.
+///
+/// Mirrors core's `objectstore::azure::create_store`: `from_env()` first so AKS Workload
+/// Identity (`AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_FEDERATED_TOKEN_FILE`) and
+/// explicit `AZURE_STORAGE_*` variables are honoured with no further configuration, then the
+/// translated Hadoop configs override. (`object_store::parse_url` would use
+/// `MicrosoftAzureBuilder::new()`, which reads NO environment at all -- a store built that way
+/// has no credentials whatsoever, so it is not a usable fallback.)
+///
+/// `wasb[s]://container@account.blob.core.windows.net/...` is handled by extracting the
+/// account/container manually: neither `parse_url` nor the builder's `with_url` recognises
+/// the wasb scheme.
+fn build_azure_store(url: &Url, config: &DeltaStorageConfig) -> DeltaResult<Arc<dyn ObjectStore>> {
+    let mut builder = MicrosoftAzureBuilder::from_env();
+    match url.scheme() {
+        "wasb" | "wasbs" => {
+            let host = url.host_str().ok_or_else(|| DeltaError::MissingBucket {
+                url: url.to_string(),
+            })?;
+            // wasb authority is `container@account.blob.core.windows.net`; the account is the
+            // first host label, the container is the URL user-info.
+            let account = host.split('.').next().unwrap_or(host);
+            builder = builder.with_account(account);
+            if !url.username().is_empty() {
+                builder = builder.with_container_name(url.username());
+            }
+        }
+        _ => builder = builder.with_url(url.to_string()),
+    }
+    for (key, value) in config.azure_object_store_options() {
+        builder = builder.with_config(key, value);
+    }
+    Ok(Arc::new(builder.build()?))
 }
 
 /// Process-wide cache of constructed engines, keyed by (scheme, authority, config).
@@ -260,13 +315,18 @@ fn engine_cache() -> &'static Mutex<EngineCacheState> {
 
 fn engine_key(url: &Url, config: &DeltaStorageConfig) -> EngineKey {
     let scheme = url.scheme().to_string();
-    // host+port form the storage target (e.g. S3 bucket, ABFS account); for file://
-    // the authority is empty which collapses every local table to a single entry.
-    let authority = match (url.host_str(), url.port()) {
+    // userinfo+host+port form the storage target (S3 bucket; ABFS container@account -- the
+    // container is part of the store's identity, so two containers on one account must NOT
+    // share a cached engine); for file:// the authority is empty, which collapses every
+    // local table to a single entry.
+    let mut authority = match (url.host_str(), url.port()) {
         (Some(h), Some(p)) => format!("{h}:{p}"),
         (Some(h), None) => h.to_string(),
         _ => String::new(),
     };
+    if !url.username().is_empty() {
+        authority = format!("{}@{authority}", url.username());
+    }
     (scheme, authority, config.clone())
 }
 
@@ -418,12 +478,27 @@ mod tests {
     }
 
     #[test]
-    fn create_object_store_azure_via_parse_url() {
-        // Azure schemes are built through object_store::parse_url (parity with core's
-        // non-S3 path). The account comes from the abfss host; credentials resolve from
-        // the ambient environment at request time, so construction succeeds with no config.
+    fn create_object_store_azure_ambient_fallback() {
+        // With no bridged creds, the Azure store is still built -- from
+        // `MicrosoftAzureBuilder::from_env()` + the URL, the same ambient path core's
+        // `objectstore::azure::create_store` uses (workload identity / AZURE_* env
+        // resolve lazily, so construction succeeds with no config).
         let u = url("abfss://container@myacct.dfs.core.windows.net/path");
-        create_object_store(&u, &empty_config()).expect("azure store builds via parse_url");
+        create_object_store(&u, &empty_config()).expect("azure store builds from env + url");
+    }
+
+    #[test]
+    fn create_object_store_wasb_builds() {
+        // wasb[s] is NOT recognised by object_store's parse_url / with_url; the account +
+        // container are extracted manually from the authority. Regression guard: this arm
+        // used to route through parse_url and failed at runtime for every wasb table.
+        let u = url("wasbs://container@myacct.blob.core.windows.net/path");
+        let store = create_object_store(&u, &empty_config()).expect("wasb store builds");
+        let dbg = format!("{store:?}").to_lowercase();
+        assert!(
+            dbg.contains("azure") || dbg.contains("microsoft"),
+            "got: {dbg}"
+        );
     }
 
     #[test]
@@ -437,8 +512,8 @@ mod tests {
 
     #[test]
     fn create_object_store_azure_with_explicit_key() {
-        // With bridged fs.azure.* creds, the store is built via parse_url_opts using the
-        // explicit account key (not ambient env). Construction is lazy, so no network.
+        // With bridged fs.azure.* creds, the builder applies the explicit account key on
+        // top of the env baseline. Construction is lazy, so no network.
         let cfg = DeltaStorageConfig {
             azure_account_name: Some("myacct".to_string()),
             azure_account_key: Some("dGVzdGtleQ==".to_string()),
@@ -483,6 +558,16 @@ mod tests {
         let a = engine_key(&url("s3://bucket-a/path"), &cfg);
         let b = engine_key(&url("s3://bucket-b/path"), &cfg);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn engine_key_distinguishes_azure_containers() {
+        // The Azure store is CONTAINER-bound (`container@account` authority), so two
+        // containers on one account must not share a cached engine.
+        let cfg = empty_config();
+        let a = engine_key(&url("abfss://data@acct.dfs.core.windows.net/t1"), &cfg);
+        let b = engine_key(&url("abfss://logs@acct.dfs.core.windows.net/t2"), &cfg);
+        assert_ne!(a, b, "different containers must not share a cached engine");
     }
 
     #[test]

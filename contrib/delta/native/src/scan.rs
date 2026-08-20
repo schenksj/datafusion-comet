@@ -349,23 +349,11 @@ pub fn plan_delta_scan_with_predicate(
     //
     // Comet's native synthetic-columns exec uses base_row_id / default_row_commit_version
     // to synthesise Delta's logical `row_id` and `row_commit_version`.
-    struct RawEntry {
-        path: String,
-        size: i64,
-        modification_time: i64,
-        num_records: Option<u64>,
-        partition_values: HashMap<String, String>,
-        dv_descriptor: Option<crate::proto::DeltaDvDescriptor>,
-        base_row_id: Option<i64>,
-        default_row_commit_version: Option<i64>,
-        transform_json: Vec<u8>,
-    }
-
     // Kernel's `visit_scan_files` requires a `fn` callback (not `FnMut`), so any
     // per-call state must live in the `context` we pass in. Use a struct that carries
     // both the accumulator AND the per-row lookups for the current batch.
     struct RawEntryAcc {
-        entries: Vec<RawEntry>,
+        entries: Vec<DeltaFileEntry>,
         row_tracking: Vec<(Option<i64>, Option<i64>)>,
         dv_descriptors: Vec<Option<crate::proto::DeltaDvDescriptor>>,
         next_idx: usize,
@@ -425,7 +413,7 @@ pub fn plan_delta_scan_with_predicate(
                     },
                     None => Vec::new(),
                 };
-                acc.entries.push(RawEntry {
+                acc.entries.push(DeltaFileEntry {
                     path: scan_file.path,
                     size: scan_file.size,
                     modification_time: scan_file.modification_time,
@@ -442,30 +430,13 @@ pub fn plan_delta_scan_with_predicate(
             return Err(DeltaError::Internal(msg));
         }
     }
-    let raw = acc.entries;
-
-    // No more driver-side DV materialisation -- just forward the descriptor. The
+    // No driver-side DV materialisation -- the descriptor is forwarded as-is. The
     // executor (`dv_reader::read_dv_indexes` invoked from `DeltaSyntheticColumnsExec`)
-    // reads + decodes the RoaringBitmap on-task. Pre-refactor this loop called
+    // reads + decodes the RoaringBitmap on-task. Pre-refactor this path called
     // `DvInfo::get_row_indexes` and produced a `Vec<u64>` per file, which on the
     // 99 M-row "huge table delete" DV reached ~800 MB per scan exec (task #218).
-    let mut entries: Vec<DeltaFileEntry> = Vec::with_capacity(raw.len());
-    for r in raw {
-        entries.push(DeltaFileEntry {
-            path: r.path,
-            size: r.size,
-            modification_time: r.modification_time,
-            num_records: r.num_records,
-            partition_values: r.partition_values,
-            dv_descriptor: r.dv_descriptor,
-            base_row_id: r.base_row_id,
-            default_row_commit_version: r.default_row_commit_version,
-            transform_json: r.transform_json,
-        });
-    }
-
     Ok(DeltaScanPlan {
-        entries,
+        entries: acc.entries,
         version: actual_version,
         unsupported_features,
         column_mappings,
@@ -478,8 +449,10 @@ pub fn plan_delta_scan_with_predicate(
 /// appends rather than replaces. Bare paths become `file://` URLs.
 ///
 /// Accepts three shapes:
-///   1. `s3://`, `s3a://`, `az://`, `azure://`, `abfs://`, `abfss://`,
-///      `file://` — already-formed URLs, parsed directly.
+///   1. Already-formed URLs on any scheme `create_object_store` handles
+///      (`s3`, `s3a`, `az`, `azure`, `abfs`, `abfss`, `wasb`, `wasbs`,
+///      `gs`, `gcs`, `file`) — parsed directly. Keep this list in sync with
+///      the `create_object_store` match arms.
 ///   2. `file:/Users/...` — Hadoop's `Path.toUri.toString` output, which
 ///      uses a *single* slash and is NOT a valid `Url::parse` input. We
 ///      rewrite this to `file://` before parsing.
@@ -511,14 +484,11 @@ pub(crate) fn normalize_url(url_str: &str) -> DeltaResult<Url> {
         return Ok(url);
     }
 
-    if url_str.starts_with("s3://")
-        || url_str.starts_with("s3a://")
-        || url_str.starts_with("az://")
-        || url_str.starts_with("azure://")
-        || url_str.starts_with("abfs://")
-        || url_str.starts_with("abfss://")
-        || url_str.starts_with("file://")
-    {
+    const URL_SCHEMES: &[&str] = &[
+        "s3://", "s3a://", "az://", "azure://", "abfs://", "abfss://", "wasb://", "wasbs://",
+        "gs://", "gcs://", "file://",
+    ];
+    if URL_SCHEMES.iter().any(|p| url_str.starts_with(p)) {
         let mut url = Url::parse(url_str).map_err(|e| DeltaError::InvalidUrl {
             url: url_str.to_string(),
             source: e,
@@ -724,6 +694,17 @@ mod tests {
 
         let url = normalize_url("s3://bucket/path/to/table").unwrap();
         assert!(url.path().ends_with('/'), "URL should end with /: {url}");
+
+        // Every scheme `create_object_store` supports must survive normalization
+        // (gs:// used to fall through to local-path canonicalization and fail).
+        for u in [
+            "gs://bucket/table",
+            "gcs://bucket/table",
+            "wasbs://container@acct.blob.core.windows.net/table",
+        ] {
+            let url = normalize_url(u).unwrap();
+            assert!(url.path().ends_with('/'), "URL should end with /: {url}");
+        }
     }
 
     #[test]

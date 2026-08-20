@@ -75,22 +75,22 @@ pub unsafe extern "system" fn Java_org_apache_comet_contrib_delta_Native_planDel
         } else {
             Some(snapshot_version as u64)
         };
-        // S3 bucket (URL host) for per-bucket credential resolution; None for non-S3.
-        let s3_bucket = url::Url::parse(&url_str)
-            .ok()
-            .filter(|u| matches!(u.scheme(), "s3" | "s3a"))
-            .and_then(|u| u.host_str().map(|h| h.to_string()));
+        // Table URL context for scoped credential resolution: the S3 bucket for
+        // per-bucket `fs.s3a.bucket.<bucket>.*` keys, the Azure account/container for
+        // account-scoped `fs.azure.*` keys. `None` when the root is a bare local path.
+        let table_url_parsed = url::Url::parse(&url_str).ok();
         let config = if storage_options.is_null() {
             DeltaStorageConfig::default()
         } else {
             let jmap: JMap<'_> = env.cast_local::<JMap>(storage_options)?;
-            // S3 static keys (global + per-bucket) are bridged here; Azure / GCS go
-            // through object_store::parse_url + ambient creds in `create_object_store`.
-            // Residual (08-known-limitations.md A2e): Hadoop's explicit S3
-            // credential-provider classes (`fs.s3a.aws.credentials.provider` =
-            // AssumedRole / WebIdentity / ...) are not honored -- object_store's own
-            // default chain (static keys here, else IMDS / ECS / env) is used instead.
-            extract_storage_config(env, &jmap, s3_bucket.as_deref())?
+            // S3 static keys (global + per-bucket) and the Azure credential surface
+            // (account key / SAS / OAuth / MSI / workload identity, account-scoped like
+            // core's `objectstore::azure`) are bridged here; GCS bridges the
+            // service-account keyfile. Residual (08-known-limitations.md A2e): Hadoop's
+            // explicit S3 credential-provider classes (`fs.s3a.aws.credentials.provider`
+            // = AssumedRole / WebIdentity / ...) are not honored -- object_store's own
+            // fallback (static keys here, else IMDS / ECS) is used instead.
+            extract_storage_config(env, &jmap, table_url_parsed.as_ref())?
         };
 
         // Phase 2: read column names for BoundReference resolution.
@@ -256,15 +256,12 @@ pub unsafe extern "system" fn Java_org_apache_comet_contrib_delta_Native_planDel
         } else {
             Some(snapshot_version as u64)
         };
-        let s3_bucket = url::Url::parse(&url_str)
-            .ok()
-            .filter(|u| matches!(u.scheme(), "s3" | "s3a"))
-            .and_then(|u| u.host_str().map(|h| h.to_string()));
+        let table_url_parsed = url::Url::parse(&url_str).ok();
         let config = if storage_options.is_null() {
             DeltaStorageConfig::default()
         } else {
             let jmap: JMap<'_> = env.cast_local::<JMap>(storage_options)?;
-            extract_storage_config(env, &jmap, s3_bucket.as_deref())?
+            extract_storage_config(env, &jmap, table_url_parsed.as_ref())?
         };
 
         // The data-read schema (Delta JSON) for kernel's `with_schema`. Empty => zero data columns
@@ -331,9 +328,10 @@ fn has_uri_scheme(s: &str) -> bool {
     false
 }
 
-/// Walk a `java.util.Map<String, String>` of storage options into the S3
-/// [`DeltaStorageConfig`]. `bucket` is the table's S3 bucket (URL host), used to
-/// prefer per-bucket Hadoop keys over global ones; pass `None` for non-S3 tables.
+/// Walk a `java.util.Map<String, String>` of storage options into a
+/// [`DeltaStorageConfig`]. `table_url` is the table root, used for scoped key
+/// resolution (S3 per-bucket keys, Azure account/container-scoped keys); pass
+/// `None` when the root is a bare local path.
 ///
 /// Reads the JMap into a Rust `HashMap` and delegates to
 /// [`delta_storage_config_from_map`] for the actual key mapping. Splitting
@@ -342,34 +340,58 @@ fn has_uri_scheme(s: &str) -> bool {
 fn extract_storage_config(
     env: &mut Env,
     jmap: &JMap<'_>,
-    bucket: Option<&str>,
+    table_url: Option<&url::Url>,
 ) -> CometResult<DeltaStorageConfig> {
     let m = jmap_to_hashmap(env, jmap)?;
-    Ok(delta_storage_config_from_map(&m, bucket))
+    Ok(delta_storage_config_from_map(&m, table_url))
 }
 
-/// Pure (JVM-free) mapping from a generic options map to the S3 [`DeltaStorageConfig`].
+/// Pure (JVM-free) mapping from a generic options map to a [`DeltaStorageConfig`].
 ///
-/// Only S3 credentials are bridged here -- accepting kernel-style keys
-/// (`aws_access_key_id`, ...) AND the Hadoop-style keys Comet's
-/// `NativeConfig.extractObjectStoreOptions` produces (`fs.s3a.access.key`, ...).
-/// The kernel-style key wins when both are present. Per-bucket Hadoop keys
-/// (`fs.s3a.bucket.<bucket>.<suffix>`) override the global `fs.s3a.<suffix>` when
-/// `bucket` (the table's S3 bucket) is supplied -- matching Hadoop S3A / core Comet.
+/// Accepts kernel-style keys (`aws_access_key_id`, `azure_storage_account_key`, ...)
+/// AND the Hadoop-style keys Comet's `NativeConfig.extractObjectStoreOptions` produces
+/// (`fs.s3a.access.key`, `fs.azure.account.key`, ...). The kernel-style key wins when
+/// both are present.
 ///
-/// Azure and GCS are intentionally NOT bridged here: `create_object_store` builds
-/// them via `object_store::parse_url`, which sources credentials from the ambient
-/// environment (`AZURE_*` / `GOOGLE_*` / ADC / instance metadata), exactly as core
-/// Comet's non-S3 read path does. So `fs.azure.*` / `fs.gs.*` keys are not consulted.
+/// Scoped resolution uses `table_url`:
+///   - S3: per-bucket Hadoop keys (`fs.s3a.bucket.<bucket>.<suffix>`) override the
+///     global `fs.s3a.<suffix>` -- matching Hadoop S3A / core Comet.
+///   - Azure: account-scoped keys (`fs.azure.X.<account>[.<endpoint-suffix>]`) win over
+///     global ones, and SAS resolves per `fs.azure.sas.<container>.<account>` -- the
+///     SAME precedence as core's `objectstore::azure::translate_hadoop_configs` (keep
+///     the two in lock-step). When the URL carries no account (e.g. `az://container`),
+///     a scoped key is still honored iff exactly ONE account appears in the map, so
+///     resolution stays deterministic.
 ///
 /// Residual (tracked in `08-known-limitations.md` A2e): Hadoop's explicit S3
 /// credential-provider classes (`fs.s3a.aws.credentials.provider` =
-/// AssumedRole / WebIdentity / ...) are not honored; object_store's own default
-/// chain (static keys here, else IMDS / ECS / env) is used instead.
+/// AssumedRole / WebIdentity / ...) are not honored; object_store's own fallback
+/// (static keys here, else IMDS / ECS) is used instead.
 pub fn delta_storage_config_from_map(
     m: &std::collections::HashMap<String, String>,
-    bucket: Option<&str>,
+    table_url: Option<&url::Url>,
 ) -> DeltaStorageConfig {
+    // ---- URL-derived scope: S3 bucket / Azure account + container ----
+    let scheme = table_url.map(|u| u.scheme()).unwrap_or("");
+    let bucket: Option<&str> = if matches!(scheme, "s3" | "s3a") {
+        table_url.and_then(|u| u.host_str())
+    } else {
+        None
+    };
+    // abfs[s]/wasb[s]: authority is `container@account.<endpoint-suffix>` -- account is the
+    // first host label, container the user-info. az://container has the container as host
+    // and carries no account.
+    let (azure_account, azure_container): (Option<String>, Option<&str>) = match scheme {
+        "abfs" | "abfss" | "wasb" | "wasbs" => (
+            table_url
+                .and_then(|u| u.host_str())
+                .and_then(|h| h.split('.').next())
+                .map(str::to_string),
+            table_url.map(|u| u.username()).filter(|c| !c.is_empty()),
+        ),
+        "az" | "azure" => (None, table_url.and_then(|u| u.host_str())),
+        _ => (None, None),
+    };
     // A per-bucket Hadoop key (`fs.s3a.bucket.<bucket>.<suffix>`) overrides the
     // global `fs.s3a.<suffix>`.
     fn s3_hadoop(
@@ -387,32 +409,46 @@ pub fn delta_storage_config_from_map(
             .cloned()
             .or_else(|| s3_hadoop(m, bucket, suffix))
     };
-    // First map entry whose key starts with `prefix`, returning (key, value). Used for the Hadoop
-    // Azure forms that embed the account/container in the key name
-    // (`fs.azure.account.key.<account>.dfs.core.windows.net`, `fs.azure.sas.<container>.<account>...`).
-    let first_with_prefix = |prefix: &str| -> Option<(&String, &String)> {
-        m.iter().find(|(k, _)| k.starts_with(prefix))
-    };
-    // Azure account key: kernel-style `azure_storage_account_key` wins, else any `fs.azure.account.key*`.
+    // ---- Azure: account-scoped resolution, mirroring core's `objectstore::azure` ----
+    //
+    // When the URL supplies no account (bare `az://container`, or no URL at all), fall back
+    // to the single account named by the map's `fs.azure.account.key.<account>.*` keys --
+    // but ONLY if exactly one distinct account appears, so resolution never depends on
+    // HashMap iteration order.
+    let effective_account: Option<String> = azure_account
+        .clone()
+        .or_else(|| single_azure_account_in_map(m));
+    // `<base>.<account>.<endpoint-suffix>` > `<base>.<account>` > `<base>` (core's
+    // `account_scoped_value` precedence).
+    let scoped = |base: &str| azure_account_scoped_value(m, base, effective_account.as_deref());
     let azure_account_key = m
         .get("azure_storage_account_key")
         .cloned()
-        .or_else(|| first_with_prefix("fs.azure.account.key").map(|(_, v)| v.clone()));
-    // Azure account name: kernel-style key, else parsed from the `fs.azure.account.key.<account>.*`
-    // key name (object_store otherwise reads it from the abfss/wasb URL authority).
-    let azure_account_name = m.get("azure_storage_account_name").cloned().or_else(|| {
-        first_with_prefix("fs.azure.account.key.").and_then(|(k, _)| {
-            k.strip_prefix("fs.azure.account.key.")
-                .and_then(|rest| rest.split('.').next())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        })
-    });
-    // Azure SAS: kernel-style `azure_storage_sas_key`, else any `fs.azure.sas*` (fixed or scoped).
+        .or_else(|| scoped("fs.azure.account.key"));
+    let azure_account_name = m
+        .get("azure_storage_account_name")
+        .cloned()
+        .or_else(|| effective_account.clone());
+    // SAS: kernel-style key > container/account-scoped `fs.azure.sas.<container>.<account>`
+    // (core's `sas_value`) > ABFS fixed-token key.
     let azure_sas_token = m
         .get("azure_storage_sas_key")
         .cloned()
-        .or_else(|| first_with_prefix("fs.azure.sas").map(|(_, v)| v.clone()));
+        .or_else(|| azure_sas_scoped_value(m, azure_container, effective_account.as_deref()))
+        .or_else(|| m.get("fs.azure.sas.fixed.token").cloned());
+    // OAuth2 client credentials / MSI / workload identity -- same Hadoop surface core
+    // bridges. The tenant comes from `msi.tenant` or, failing that, is extracted from the
+    // `client.endpoint` token URL (`https://login.microsoftonline.com/<tenant>/...`).
+    let azure_client_id = scoped("fs.azure.account.oauth2.client.id");
+    let azure_client_secret = scoped("fs.azure.account.oauth2.client.secret");
+    let azure_tenant_id = scoped("fs.azure.account.oauth2.msi.tenant").or_else(|| {
+        scoped("fs.azure.account.oauth2.client.endpoint")
+            .as_deref()
+            .and_then(azure_tenant_from_oauth_endpoint)
+    });
+    let azure_msi_endpoint = scoped("fs.azure.account.oauth2.msi.endpoint");
+    let azure_authority_host = scoped("fs.azure.account.oauth2.msi.authority");
+    let azure_federated_token_file = scoped("fs.azure.account.oauth2.token.file");
     // GCS service account: kernel-style path, else the Hadoop JSON keyfile path.
     let gcs_service_account_path = m
         .get("google_service_account")
@@ -439,9 +475,92 @@ pub fn delta_storage_config_from_map(
         azure_account_name,
         azure_account_key,
         azure_sas_token,
+        azure_client_id,
+        azure_client_secret,
+        azure_tenant_id,
+        azure_msi_endpoint,
+        azure_authority_host,
+        azure_federated_token_file,
         gcs_service_account_path,
         gcs_service_account_key,
     }
+}
+
+/// Azure endpoint suffixes recognised in account-scoped Hadoop keys; same list as core's
+/// `objectstore::azure::ENDPOINT_SUFFIXES`.
+const AZURE_ENDPOINT_SUFFIXES: &[&str] = &["dfs.core.windows.net", "blob.core.windows.net"];
+
+/// Look up `base_key`, preferring account-scoped variants -- a port of core's
+/// `objectstore::azure::account_scoped_value` (keep in lock-step).
+///
+/// Probes (in order): `<base>.<account>.<endpoint-suffix>`, `<base>.<account>`, then the
+/// unscoped `<base>`.
+fn azure_account_scoped_value(
+    m: &std::collections::HashMap<String, String>,
+    base_key: &str,
+    account: Option<&str>,
+) -> Option<String> {
+    if let Some(acc) = account {
+        for suffix in AZURE_ENDPOINT_SUFFIXES {
+            if let Some(v) = m.get(&format!("{base_key}.{acc}.{suffix}")) {
+                return Some(v.clone());
+            }
+        }
+        if let Some(v) = m.get(&format!("{base_key}.{acc}")) {
+            return Some(v.clone());
+        }
+    }
+    m.get(base_key).cloned()
+}
+
+/// Resolve the SAS token for `(container, account)` -- a port of core's
+/// `objectstore::azure::sas_value` (keep in lock-step).
+fn azure_sas_scoped_value(
+    m: &std::collections::HashMap<String, String>,
+    container: Option<&str>,
+    account: Option<&str>,
+) -> Option<String> {
+    let (container, account) = (container?, account?);
+    for suffix in AZURE_ENDPOINT_SUFFIXES {
+        if let Some(v) = m.get(&format!("fs.azure.sas.{container}.{account}.{suffix}")) {
+            return Some(v.clone());
+        }
+    }
+    m.get(&format!("fs.azure.sas.{container}.{account}"))
+        .cloned()
+}
+
+/// The single storage account named by the map's `fs.azure.account.key.<account>[.<suffix>]`
+/// keys, or `None` when zero or MULTIPLE distinct accounts appear (ambiguous -- picking one
+/// would depend on map iteration order).
+fn single_azure_account_in_map(m: &std::collections::HashMap<String, String>) -> Option<String> {
+    let mut found: Option<String> = None;
+    for k in m.keys() {
+        if let Some(rest) = k.strip_prefix("fs.azure.account.key.") {
+            let acct = rest.split('.').next().unwrap_or(rest);
+            if acct.is_empty() {
+                continue;
+            }
+            match &found {
+                Some(existing) if existing != acct => return None,
+                _ => found = Some(acct.to_string()),
+            }
+        }
+    }
+    found
+}
+
+/// Pull the tenant id out of an OAuth token endpoint like
+/// `https://login.microsoftonline.com/<tenant>/oauth2/token` -- a port of core's
+/// `objectstore::azure::tenant_from_oauth_endpoint` (keep in lock-step).
+fn azure_tenant_from_oauth_endpoint(endpoint: &str) -> Option<String> {
+    let parsed = url::Url::parse(endpoint).ok()?;
+    let mut segments = parsed.path_segments()?;
+    let tenant = segments.next()?;
+    if tenant.is_empty() {
+        return None;
+    }
+    Some(tenant.to_string())
 }
 
 /// Decode a Java `String` into `Option<String>`: `None` for null/empty.
@@ -507,6 +626,10 @@ fn jmap_to_hashmap(
 mod tests {
     use super::*;
 
+    fn turl(s: &str) -> url::Url {
+        url::Url::parse(s).unwrap()
+    }
+
     #[test]
     fn resolve_file_path_joins_with_slash() {
         assert_eq!(
@@ -546,6 +669,9 @@ mod tests {
         hadoop_s3.insert("fs.s3a.path.style.access".into(), "true".into());
         let cfg = delta_storage_config_from_map(&hadoop_s3, None);
         assert_eq!(cfg.aws_access_key.as_deref(), Some("AK"));
+        // With a table URL whose bucket has no per-bucket overrides, the global keys apply.
+        let cfg = delta_storage_config_from_map(&hadoop_s3, Some(&turl("s3://any-bucket/t")));
+        assert_eq!(cfg.aws_access_key.as_deref(), Some("AK"));
         assert_eq!(cfg.aws_secret_key.as_deref(), Some("SK"));
         assert_eq!(cfg.aws_session_token.as_deref(), Some("TOK"));
         assert_eq!(cfg.aws_region.as_deref(), Some("us-west-2"));
@@ -558,7 +684,7 @@ mod tests {
         both.insert("fs.s3a.access.key".into(), "HADOOP_AK".into());
         both.insert("aws_secret_access_key".into(), "KERNEL_SK".into());
         both.insert("fs.s3a.secret.key".into(), "HADOOP_SK".into());
-        let cfg = delta_storage_config_from_map(&both, None);
+        let cfg = delta_storage_config_from_map(&both, Some(&turl("s3://b/t")));
         assert_eq!(cfg.aws_access_key.as_deref(), Some("KERNEL_AK"));
         assert_eq!(cfg.aws_secret_key.as_deref(), Some("KERNEL_SK"));
 
@@ -575,13 +701,13 @@ mod tests {
         per_bucket.insert("fs.s3a.access.key".into(), "GLOBAL".into());
         per_bucket.insert("fs.s3a.bucket.my-bucket.access.key".into(), "PERBKT".into());
         assert_eq!(
-            delta_storage_config_from_map(&per_bucket, Some("my-bucket"))
+            delta_storage_config_from_map(&per_bucket, Some(&turl("s3://my-bucket/t")))
                 .aws_access_key
                 .as_deref(),
             Some("PERBKT")
         );
         assert_eq!(
-            delta_storage_config_from_map(&per_bucket, Some("other"))
+            delta_storage_config_from_map(&per_bucket, Some(&turl("s3a://other/t")))
                 .aws_access_key
                 .as_deref(),
             Some("GLOBAL")
@@ -603,12 +729,10 @@ mod tests {
         assert!(!cfg.aws_force_path_style);
     }
 
-    /// Azure / GCS credentials are deliberately NOT carried in `DeltaStorageConfig`:
-    /// `create_object_store` builds those via `object_store::parse_url` + ambient
-    /// credentials (parity with core's non-S3 path). This guards against accidentally
-    /// re-introducing config bridging that leaks `fs.azure.*` / `fs.gs.*` into the S3
-    /// fields. (A2e residual -- Hadoop S3 credential-provider classes -- is documented
-    /// in `08-known-limitations.md`, not asserted here.)
+    /// Azure / GCS credentials are bridged into their OWN `DeltaStorageConfig` fields;
+    /// this guards against `fs.azure.*` / `fs.gs.*` keys leaking into the S3 fields.
+    /// (A2e residual -- Hadoop S3 credential-provider classes -- is documented in
+    /// `08-known-limitations.md`, not asserted here.)
     #[test]
     fn azure_and_gcs_keys_do_not_leak_into_s3_config() {
         use std::collections::HashMap;
@@ -643,11 +767,12 @@ mod tests {
         let opts = cfg.azure_object_store_options();
         assert!(
             opts.iter()
-                .any(|(k, v)| *k == "azure_storage_account_key" && v == "HADOOP_AZKEY"),
+                .any(|(k, v)| k.as_ref() == "azure_storage_account_key" && v == "HADOOP_AZKEY"),
             "azure account key must reach object_store: {opts:?}"
         );
         assert!(
-            opts.iter().any(|(k, _)| *k == "azure_storage_account_name"),
+            opts.iter()
+                .any(|(k, _)| k.as_ref() == "azure_storage_account_name"),
             "azure account name must reach object_store: {opts:?}"
         );
         // S3 fields stay empty (non-leakage the other direction).
@@ -665,7 +790,7 @@ mod tests {
         assert!(cfg
             .azure_object_store_options()
             .iter()
-            .any(|(k, v)| *k == "azure_storage_sas_key" && v == "SAS_TOKEN_VALUE"));
+            .any(|(k, v)| k.as_ref() == "azure_storage_sas_key" && v == "SAS_TOKEN_VALUE"));
     }
 
     #[test]
@@ -697,7 +822,7 @@ mod tests {
         m.insert("fs.s3a.access.key".into(), "AK".into());
         m.insert("fs.s3a.secret.key".into(), "SK".into());
         m.insert("fs.s3a.session.token".into(), "TOK".into());
-        let cfg = delta_storage_config_from_map(&m, Some("my-bucket"));
+        let cfg = delta_storage_config_from_map(&m, Some(&turl("s3://my-bucket/t")));
         assert_eq!(cfg.aws_access_key.as_deref(), Some("AK")); // sanity: S3 still extracted
         assert!(cfg.azure_account_key.is_none());
         assert!(cfg.azure_account_name.is_none());
@@ -706,6 +831,140 @@ mod tests {
         assert!(cfg.gcs_service_account_key.is_none());
         assert!(cfg.azure_object_store_options().is_empty());
         assert!(cfg.gcs_object_store_options().is_empty());
+    }
+
+    /// The table URL's account must drive scoped-key resolution: with keys for TWO
+    /// accounts in the map, the account from the abfss authority wins -- never an
+    /// arbitrary (HashMap-iteration-order) pick. Mirrors core's
+    /// `objectstore::azure::account_scoped_key_takes_precedence_over_global`.
+    #[test]
+    fn azure_scoped_key_resolves_by_url_account() {
+        use std::collections::HashMap;
+        let mut m = HashMap::new();
+        m.insert(
+            "fs.azure.account.key.acct1.dfs.core.windows.net".into(),
+            "KEY_ONE".into(),
+        );
+        m.insert(
+            "fs.azure.account.key.acct2.dfs.core.windows.net".into(),
+            "KEY_TWO".into(),
+        );
+        let u2 = turl("abfss://data@acct2.dfs.core.windows.net/t");
+        let cfg = delta_storage_config_from_map(&m, Some(&u2));
+        assert_eq!(cfg.azure_account_key.as_deref(), Some("KEY_TWO"));
+        assert_eq!(cfg.azure_account_name.as_deref(), Some("acct2"));
+        let u1 = turl("abfss://data@acct1.dfs.core.windows.net/t");
+        let cfg = delta_storage_config_from_map(&m, Some(&u1));
+        assert_eq!(cfg.azure_account_key.as_deref(), Some("KEY_ONE"));
+        // With NO url and two accounts configured, resolution is ambiguous ->
+        // deterministically None (never an arbitrary pick).
+        let cfg = delta_storage_config_from_map(&m, None);
+        assert!(cfg.azure_account_key.is_none());
+        assert!(cfg.azure_account_name.is_none());
+    }
+
+    /// Account-scoped keys win over the global form; the global form still applies for
+    /// other accounts (core's `account_scoped_value` precedence).
+    #[test]
+    fn azure_account_scoped_key_wins_over_global() {
+        use std::collections::HashMap;
+        let mut m = HashMap::new();
+        m.insert("fs.azure.account.key".into(), "GLOBAL".into());
+        m.insert(
+            "fs.azure.account.key.myacct.dfs.core.windows.net".into(),
+            "SCOPED".into(),
+        );
+        let u = turl("abfss://data@myacct.dfs.core.windows.net/t");
+        assert_eq!(
+            delta_storage_config_from_map(&m, Some(&u))
+                .azure_account_key
+                .as_deref(),
+            Some("SCOPED")
+        );
+        let other = turl("abfss://data@otheracct.dfs.core.windows.net/t");
+        assert_eq!(
+            delta_storage_config_from_map(&m, Some(&other))
+                .azure_account_key
+                .as_deref(),
+            Some("GLOBAL")
+        );
+    }
+
+    /// SAS resolves per `fs.azure.sas.<container>.<account>[.<endpoint-suffix>]`
+    /// (core's `sas_value`), with `fs.azure.sas.fixed.token` as the unscoped fallback.
+    #[test]
+    fn azure_sas_scoped_by_container_and_account() {
+        use std::collections::HashMap;
+        let mut m = HashMap::new();
+        m.insert(
+            "fs.azure.sas.data.myacct.dfs.core.windows.net".into(),
+            "SCOPED_SAS".into(),
+        );
+        m.insert("fs.azure.sas.fixed.token".into(), "FIXED_SAS".into());
+        let u = turl("abfss://data@myacct.dfs.core.windows.net/t");
+        assert_eq!(
+            delta_storage_config_from_map(&m, Some(&u))
+                .azure_sas_token
+                .as_deref(),
+            Some("SCOPED_SAS")
+        );
+        // A different container doesn't match the scoped key -> fixed-token fallback.
+        let other = turl("abfss://logs@myacct.dfs.core.windows.net/t");
+        assert_eq!(
+            delta_storage_config_from_map(&m, Some(&other))
+                .azure_sas_token
+                .as_deref(),
+            Some("FIXED_SAS")
+        );
+    }
+
+    /// OAuth2 client credentials / MSI / workload identity bridge the same Hadoop keys
+    /// core's `objectstore::azure::translate_hadoop_configs` maps, including tenant
+    /// extraction from the token-endpoint URL.
+    #[test]
+    fn azure_oauth_msi_workload_identity_bridged() {
+        use std::collections::HashMap;
+        let mut m = HashMap::new();
+        m.insert(
+            "fs.azure.account.oauth2.client.id.myacct.dfs.core.windows.net".into(),
+            "CLIENT_ID".into(),
+        );
+        m.insert(
+            "fs.azure.account.oauth2.client.secret".into(),
+            "CLIENT_SECRET".into(),
+        );
+        m.insert(
+            "fs.azure.account.oauth2.client.endpoint".into(),
+            "https://login.microsoftonline.com/tenant-123/oauth2/token".into(),
+        );
+        m.insert(
+            "fs.azure.account.oauth2.token.file".into(),
+            "/var/run/secrets/azure/tokens/azure-identity-token".into(),
+        );
+        let u = turl("abfss://data@myacct.dfs.core.windows.net/t");
+        let cfg = delta_storage_config_from_map(&m, Some(&u));
+        assert_eq!(cfg.azure_client_id.as_deref(), Some("CLIENT_ID"));
+        assert_eq!(cfg.azure_client_secret.as_deref(), Some("CLIENT_SECRET"));
+        assert_eq!(cfg.azure_tenant_id.as_deref(), Some("tenant-123"));
+        assert_eq!(
+            cfg.azure_federated_token_file.as_deref(),
+            Some("/var/run/secrets/azure/tokens/azure-identity-token")
+        );
+        // msi.tenant wins over the endpoint-derived tenant when both are present.
+        m.insert(
+            "fs.azure.account.oauth2.msi.tenant".into(),
+            "msi-tenant".into(),
+        );
+        let cfg = delta_storage_config_from_map(&m, Some(&u));
+        assert_eq!(cfg.azure_tenant_id.as_deref(), Some("msi-tenant"));
+        // The bridged values reach object_store's typed config keys.
+        let opts = cfg.azure_object_store_options();
+        assert!(opts
+            .iter()
+            .any(|(k, v)| k.as_ref() == "azure_storage_client_id" && v == "CLIENT_ID"));
+        assert!(opts
+            .iter()
+            .any(|(k, v)| k.as_ref() == "azure_storage_tenant_id" && v == "msi-tenant"));
     }
 
     #[test]
