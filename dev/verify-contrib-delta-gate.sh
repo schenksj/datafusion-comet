@@ -75,15 +75,35 @@ hdr()   { printf '\n\033[36m==> %s\033[0m\n' "$*"; }
 
 hdr "Cargo: default build does not depend on comet-contrib-delta / delta_kernel"
 cd "$NATIVE_DIR"
-TREE_DEFAULT="$(cargo tree -p datafusion-comet --no-default-features 2>/dev/null)"
-# Anti-vacuous (mirrors the Maven gate below): a failing `cargo tree` yields empty output, and the
-# command-substitution failure doesn't trip `set -e` in an assignment -- so assert the root crate we
-# KNOW is always present before concluding "no Delta deps", otherwise a broken cargo-tree run would
-# pass the leak check vacuously. (`datafusion-comet ` with a trailing space matches only the root
-# crate line, not `datafusion-comet-proto`/`-common`.)
-if ! grep -q 'datafusion-comet ' <<<"$TREE_DEFAULT"; then
-  red "FAIL: default cargo tree produced no datafusion-comet entry (cargo tree likely failed;"
-  red "      refusing to conclude 'no Delta deps' vacuously)"
+TREE_ERR="$(mktemp -t contrib-delta-tree-err.XXXXXX)"
+# NOTE on `set -e`: a plain `VAR="$(cmd)"` assignment DOES propagate cmd's failure to
+# set -e (only `local`/`export`-prefixed assignments mask it), which would abort the
+# script with no diagnostic at all. Capture the status explicitly and print stderr so a
+# failing cargo-tree run is loud instead of silent (or, worse, vacuously green).
+run_cargo_tree() {
+  set +e
+  CARGO_TREE_OUT="$(cargo tree "$@" 2>"$TREE_ERR")"
+  CARGO_TREE_STATUS=$?
+  set -e
+}
+dump_tree_diag() {
+  red "      cargo: $(cargo --version 2>/dev/null || echo unknown), exit=$CARGO_TREE_STATUS"
+  red "      ---- stderr ----"
+  sed 's/^/      /' "$TREE_ERR" | tail -20
+  red "      ---- stdout (first 30 lines) ----"
+  # sed -n (not `head`): under pipefail, an early-exiting reader SIGPIPEs its writer and
+  # the pipeline reports 141 -- inside set -e that aborts the script mid-diagnostic.
+  sed -n '1,30p' <<<"$CARGO_TREE_OUT" | sed 's/^/      /'
+}
+run_cargo_tree -p datafusion-comet --no-default-features
+# Anti-vacuous (mirrors the Maven gate below): assert the root crate we KNOW is always
+# present before concluding "no Delta deps". (`datafusion-comet ` with a trailing space
+# matches only the root crate line, not `datafusion-comet-proto`/`-common`.)
+TREE_DEFAULT="$CARGO_TREE_OUT"
+if [[ $CARGO_TREE_STATUS -ne 0 ]] || ! grep -q 'datafusion-comet ' <<<"$TREE_DEFAULT"; then
+  red "FAIL: default cargo tree failed or produced no datafusion-comet entry;"
+  red "      refusing to conclude 'no Delta deps' vacuously"
+  dump_tree_diag
   exit 1
 fi
 if grep -qE 'comet-contrib-delta|delta_kernel|delta-kernel' <<<"$TREE_DEFAULT"; then
@@ -93,17 +113,29 @@ if grep -qE 'comet-contrib-delta|delta_kernel|delta-kernel' <<<"$TREE_DEFAULT"; 
 fi
 green "OK: cargo tree default is clean of contrib + kernel"
 
-TREE_CONTRIB="$(cargo tree -p datafusion-comet --features contrib-delta 2>/dev/null)"
+run_cargo_tree -p datafusion-comet --features contrib-delta
+TREE_CONTRIB="$CARGO_TREE_OUT"
 # The gated tree must pull in both the contrib crate AND the heavy `delta_kernel` it
 # depends on (driver-side log replay). Check each independently -- a combined >=2 line
 # count could be satisfied by delta_kernel alone (it prints on multiple tree lines),
 # which is exactly the contrib-crate-dropped drift this guards against.
-if ! printf '%s\n' "$TREE_CONTRIB" | grep -qE 'comet-contrib-delta'; then
-  red "FAIL: --features contrib-delta tree missing the comet-contrib-delta crate"
+if [[ $CARGO_TREE_STATUS -ne 0 ]]; then
+  red "FAIL: cargo tree --features contrib-delta failed"
+  dump_tree_diag
   exit 1
 fi
-if ! printf '%s\n' "$TREE_CONTRIB" | grep -qE 'delta_kernel|delta-kernel'; then
+# Here-strings, NOT `printf | grep -q`: grep -q exits at the first match, the printf
+# writer takes SIGPIPE on a tree larger than the pipe buffer, and under pipefail the
+# pipeline reports 141 -- turning a MATCH into a false "missing" failure. (Exactly how
+# this check first failed in CI: the tree was fine, the pipeline lied.)
+if ! grep -qE 'comet-contrib-delta' <<<"$TREE_CONTRIB"; then
+  red "FAIL: --features contrib-delta tree missing the comet-contrib-delta crate"
+  dump_tree_diag
+  exit 1
+fi
+if ! grep -qE 'delta_kernel|delta-kernel' <<<"$TREE_CONTRIB"; then
   red "FAIL: --features contrib-delta tree missing delta_kernel"
+  dump_tree_diag
   exit 1
 fi
 green "OK: cargo tree with contrib-delta correctly pulls comet-contrib-delta + delta_kernel"
