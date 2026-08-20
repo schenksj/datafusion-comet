@@ -308,13 +308,62 @@ pub fn plan_delta_scan_with_predicate(
         Vec::new()
     };
 
-    // `Snapshot::build()` returns `Arc<Snapshot>`, and `scan_builder` consumes
-    // it. Clone the Arc so we keep a stable handle through scan construction
-    // (driver no longer needs `table_root()` here -- DV decode now happens on the
-    // executor via `dv_reader::read_dv_indexes` -- but the Arc retention is still
-    // wanted for any future post-scan-build kernel API that wants the snapshot).
+    // `Snapshot::build()` returns `Arc<Snapshot>`; `collect_scan_entries` consumes a clone
+    // per attempt, and the retained handle lets the predicate-failure path rebuild the scan.
     let snapshot_arc: Arc<_> = snapshot;
-    let mut scan_builder = Arc::clone(&snapshot_arc).scan_builder();
+
+    let had_predicate = kernel_predicate.is_some();
+    let collected = collect_scan_entries(
+        &snapshot_arc,
+        &engine,
+        kernel_predicate,
+        projected_schema_json.as_deref(),
+    );
+    let (entries, physical_schema_ipc, logical_schema_ipc) = match collected {
+        Ok(v) => v,
+        Err(e) if had_predicate => {
+            // Kernel's stats evaluator hard-errors on type-mismatched comparisons (e.g.
+            // `Invalid comparison: Int64 <= Int32`, reachable via the Cast-unwrapping in
+            // `predicate.rs`) instead of degrading to "don't skip". The pushed predicate is a
+            // pure optimisation -- Spark re-applies every filter above the scan -- so retry
+            // without it (all files, no data skipping) rather than failing a scan that would
+            // succeed unpushed. A non-predicate error (corrupt log, IO) fails identically on
+            // the retry and still surfaces.
+            log::warn!(
+                "Delta data-skipping predicate failed during log replay ({e}); \
+                 retrying without the pushed predicate"
+            );
+            collect_scan_entries(
+                &snapshot_arc,
+                &engine,
+                None,
+                projected_schema_json.as_deref(),
+            )?
+        }
+        Err(e) => return Err(e),
+    };
+
+    Ok(DeltaScanPlan {
+        entries,
+        version: actual_version,
+        unsupported_features,
+        column_mappings,
+        physical_schema_ipc,
+        logical_schema_ipc,
+    })
+}
+
+/// Build the projected/predicated `Scan` from `snapshot` and walk `scan_metadata`, returning
+/// `(entries, physical_schema_ipc, logical_schema_ipc)`. Split out of
+/// [`plan_delta_scan_with_predicate`] so a predicate-induced kernel error can be retried
+/// without the predicate.
+fn collect_scan_entries(
+    snapshot: &Arc<delta_kernel::snapshot::Snapshot>,
+    engine: &super::engine::DeltaEngine,
+    kernel_predicate: Option<delta_kernel::expressions::Predicate>,
+    projected_schema_json: Option<&str>,
+) -> DeltaResult<(Vec<DeltaFileEntry>, Vec<u8>, Vec<u8>)> {
+    let mut scan_builder = Arc::clone(snapshot).scan_builder();
     if let Some(pred) = kernel_predicate {
         scan_builder = scan_builder.with_predicate(Arc::new(pred));
     }
@@ -322,7 +371,7 @@ pub fn plan_delta_scan_with_predicate(
     // `scan.logical_schema()` carry the projected shape kernel resolves -- from the analysis-time
     // schema so schema-change-since-analysis reads correctly (see `read_schema_from_json`).
     let projected = projected_schema_json.is_some();
-    if let Some(json) = &projected_schema_json {
+    if let Some(json) = projected_schema_json {
         scan_builder = scan_builder.with_schema(read_schema_from_json(json)?);
     }
     let scan = scan_builder.build()?;
@@ -368,7 +417,7 @@ pub fn plan_delta_scan_with_predicate(
         next_idx: 0,
         transform_err: None,
     };
-    let scan_metadata = scan.scan_metadata(&*engine)?;
+    let scan_metadata = scan.scan_metadata(engine)?;
 
     for meta_result in scan_metadata {
         let meta: delta_kernel::scan::ScanMetadata = meta_result?;
@@ -435,14 +484,7 @@ pub fn plan_delta_scan_with_predicate(
     // reads + decodes the RoaringBitmap on-task. Pre-refactor this path called
     // `DvInfo::get_row_indexes` and produced a `Vec<u64>` per file, which on the
     // 99 M-row "huge table delete" DV reached ~800 MB per scan exec (task #218).
-    Ok(DeltaScanPlan {
-        entries: acc.entries,
-        version: actual_version,
-        unsupported_features,
-        column_mappings,
-        physical_schema_ipc,
-        logical_schema_ipc,
-    })
+    Ok((acc.entries, physical_schema_ipc, logical_schema_ipc))
 }
 
 /// Normalize a table URL so kernel's `table_root.join("_delta_log/")`
@@ -725,6 +767,108 @@ mod tests {
         let url = normalize_url("file:///tmp/my_table").unwrap();
         let log_url = url.join("_delta_log/").unwrap();
         assert_eq!(log_url.as_str(), "file:///tmp/my_table/_delta_log/");
+    }
+
+    /// Minimal Delta table with one add action carrying min/max stats for `id` (long),
+    /// so kernel's data skipping actually evaluates pushed predicates.
+    fn mk_stats_table(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let table_dir = tmp.path().join("stats_delta");
+        let delta_log = table_dir.join("_delta_log");
+        std::fs::create_dir_all(&delta_log).unwrap();
+        let commit0 = [
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"tid","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1700000000000}}"#,
+            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":5000,"modificationTime":1700000000000,"dataChange":true,"stats":"{\"numRecords\":50,\"minValues\":{\"id\":1},\"maxValues\":{\"id\":100},\"nullCount\":{\"id\":0}}"}}"#,
+        ]
+        .join("\n");
+        std::fs::write(delta_log.join("00000000000000000000.json"), commit0).unwrap();
+        std::fs::write(table_dir.join("part-00000.parquet"), [0u8]).unwrap();
+        table_dir
+    }
+
+    fn plan_with_pred(
+        table: &std::path::Path,
+        pred: delta_kernel::expressions::Predicate,
+    ) -> DeltaResult<DeltaScanPlan> {
+        plan_delta_scan_with_predicate(
+            table.to_str().unwrap(),
+            &DeltaStorageConfig::default(),
+            None,
+            Some(pred),
+            None,
+        )
+    }
+
+    #[test]
+    fn test_predicate_pruning_works_when_well_typed() {
+        use delta_kernel::expressions::{Expression, Predicate, Scalar};
+        let tmp = tempfile::tempdir().unwrap();
+        let table = mk_stats_table(&tmp);
+        // id in [1, 100]; `id = 500` (correctly typed Long) prunes the file...
+        let plan = plan_with_pred(
+            &table,
+            Predicate::eq(
+                Expression::column(["id"]),
+                Expression::literal(Scalar::Long(500)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(plan.entries.len(), 0, "out-of-range predicate must prune");
+        // ...and `id = 5` keeps it.
+        let plan = plan_with_pred(
+            &table,
+            Predicate::eq(
+                Expression::column(["id"]),
+                Expression::literal(Scalar::Long(5)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.entries.len(),
+            1,
+            "in-range predicate must keep the file"
+        );
+    }
+
+    #[test]
+    fn test_type_mismatched_predicate_falls_back_to_full_scan() {
+        use delta_kernel::expressions::{Expression, Predicate, Scalar};
+        let tmp = tempfile::tempdir().unwrap();
+        let table = mk_stats_table(&tmp);
+        // A LONG column compared against an INT32 literal -- what `predicate.rs`'s
+        // Cast-unwrapping produces for Spark's width-promotion casts. Kernel's stats
+        // evaluator hard-errors on this (`Invalid comparison: Int64 <= Int32`); the
+        // scan must fall back to a predicate-less full scan, not fail. (Out-of-range
+        // value, so a silent wrong-typed skip would ALSO yield 0 -- the assert on 1
+        // catches both the abort and any accidental pruning.)
+        let plan = plan_with_pred(
+            &table,
+            Predicate::eq(
+                Expression::column(["id"]),
+                Expression::literal(Scalar::Integer(500)),
+            ),
+        )
+        .expect("type-mismatched predicate must not abort the scan");
+        assert_eq!(plan.entries.len(), 1, "fallback must scan all files");
+    }
+
+    #[test]
+    fn test_unknown_operand_does_not_prune() {
+        use delta_kernel::expressions::{Expression, Predicate};
+        let tmp = tempfile::tempdir().unwrap();
+        let table = mk_stats_table(&tmp);
+        // The unsupported-literal fallback (`Expression::unknown`) must be non-skipping:
+        // the file survives. (The old `NULL::string` fallback pruned EVERY file --
+        // silent wrong results.)
+        let plan = plan_with_pred(
+            &table,
+            Predicate::eq(
+                Expression::column(["id"]),
+                Expression::unknown("unsupported_literal_kind"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(plan.entries.len(), 1, "unknown operand must not prune");
     }
 
     #[test]

@@ -267,7 +267,14 @@ fn catalyst_literal_to_kernel(lit: &spark_expression::Literal) -> Expression {
         Some(literal::Value::FloatVal(v)) => Expression::literal(*v),
         Some(literal::Value::DoubleVal(v)) => Expression::literal(*v),
         Some(literal::Value::StringVal(s)) => Expression::literal(s.as_str()),
-        _ => Expression::null_literal(DataType::STRING),
+        // Any literal kind we can't faithfully type (decimal, binary, list, NULL, ...) becomes
+        // UNKNOWN, which kernel treats as non-skippable -- always correct. The two tempting
+        // fallbacks are both wrong: a typed-null literal makes `col = NULL` evaluate to NULL,
+        // which data skipping treats as "never true" and prunes EVERY file (silently dropping
+        // rows for e.g. a decimal-literal filter); and a wrongly-TYPED literal aborts the whole
+        // scan, because kernel's stats evaluator hard-errors on comparisons like
+        // `Int64 <= Int32` instead of degrading to "don't skip".
+        _ => Expression::unknown("unsupported_literal_kind"),
     }
 }
 
@@ -403,14 +410,37 @@ mod tests {
     }
 
     #[test]
-    fn literal_unsupported_becomes_null() {
-        let lit = Literal {
-            value: None,
-            ..Default::default()
-        };
-        let expr = catalyst_literal_to_kernel(&lit);
-        // Should be a NULL literal (DataType::STRING). Just sanity-check it's not panicking.
-        let _ = format!("{expr:?}");
+    fn literal_unsupported_becomes_unknown_not_null() {
+        // Literal kinds we can't type (decimal, binary, NULL, ...) must translate to
+        // UNKNOWN. A typed-null fallback silently prunes every file (`col = NULL` is never
+        // true under data skipping) and a mistyped literal aborts the scan on kernel's
+        // strict comparison type-check -- both proven against a live kernel scan in
+        // scan::tests.
+        for lit in [
+            Literal {
+                value: None,
+                ..Default::default()
+            },
+            Literal {
+                value: Some(literal::Value::DecimalVal(vec![1, 2, 3])),
+                ..Default::default()
+            },
+            Literal {
+                value: Some(literal::Value::BytesVal(vec![1])),
+                ..Default::default()
+            },
+        ] {
+            let expr = catalyst_literal_to_kernel(&lit);
+            let dbg = format!("{expr:?}");
+            assert!(
+                dbg.to_lowercase().contains("unknown"),
+                "unsupported literal must become UNKNOWN, got: {dbg}"
+            );
+            assert!(
+                !dbg.to_lowercase().contains("null"),
+                "unsupported literal must NOT become a null literal, got: {dbg}"
+            );
+        }
     }
 
     #[test]
