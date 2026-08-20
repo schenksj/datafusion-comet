@@ -94,7 +94,7 @@ isolate (see below).
 value }` envelope carries every out-of-tree contrib scan. Delta packs a
 `DeltaScan` into it and the native side dispatches on `type_url`. The
 typed `DeltaScanCommon` / `DeltaScanTask` messages still exist — only
-the *dispatch* is generic.
+the _dispatch_ is generic.
 
 **Alternative (and the original decision here).** Give each contrib a
 first-class oneof variant, e.g. `DeltaScan delta_scan = 118`.
@@ -116,7 +116,7 @@ original analysis missed:
 The costs cited for the envelope are real but small: dispatch is a
 string suffix compare (once per scan operator, not per batch) plus a
 `decode` the typed path also pays, and the payload's schema is still
-fully described in `operator.proto` — only the *binding* from `type_url`
+fully described in `operator.proto` — only the _binding_ from `type_url`
 to message is out-of-band, and it lives in exactly two places
 (`DeltaContribScan.TypeUrl` on the JVM, `DELTA_SCAN_TYPE_NAME` in
 `delta_scan.rs`).
@@ -159,7 +159,7 @@ the contrib's module, `getMethod` for each entry point, cached in a
 rejected in review of #4952. The objection that drove the original
 decision — "a trait in core would create a compile-time dependency on
 the contrib" — is simply not true of a `ServiceLoader` SPI: the trait
-lives in core, the *implementation* lives in the contrib, and the
+lives in core, the _implementation_ lives in the contrib, and the
 dependency arrow points contrib → core, which is the correct direction.
 Nothing has to be in the same JAR. Concretely the SPI is better on every
 axis that mattered:
@@ -168,7 +168,7 @@ axis that mattered:
   being re-derived by `getMethod` at runtime, where a signature change
   in the contrib degrades to a silent "not present".
 - **No per-entry-point plumbing.** The bridge needed a cached binding,
-  an invoke, and an exception funnel *per method*; the SPI needs none.
+  an invoke, and an exception funnel _per method_; the SPI needs none.
 - **Core names no format.** The bridge hard-coded Delta class-name
   strings in core; the trait mentions no contrib at all, which is what
   lets Lance (#4633) reuse the same SPI.
@@ -190,7 +190,7 @@ show up in hot paths. Driver-side lookups fire once per query plan;
 executor-side ones fire per task. Per-task is hot enough to matter, and
 the cache pattern is cheap.
 
-This still applies to the reflection the contrib does into *delta-spark*
+This still applies to the reflection the contrib does into _delta-spark_
 (`DeltaReflection`, which avoids a compile-time delta-spark dependency)
 and to the S3A credential bridge — we resolve
 `S3AUtils.createAWSCredentialProviderList` once and reuse the

@@ -144,18 +144,18 @@ incl. CDF) and `META-INF/services/org.apache.spark.sql.comet.PlanDataInjector`
 
 ## What the `comet-spark` JAR looks like
 
-| File or class                                         | Default build                                    | `-Pcontrib-delta` build |
-| ----------------------------------------------------- | ------------------------------------------------ | ----------------------- |
-| `org.apache.comet.rules.CometScanRule`                | yes                                              | yes                     |
-| `org.apache.comet.rules.CometScanContrib`             | yes (SPI; empty registry at runtime)             | yes                     |
-| `META-INF/services/…CometScanContrib`                 | absent                                           | present                 |
-| `META-INF/services/…PlanDataInjector`                 | absent                                           | present                 |
-| `org.apache.comet.contrib.delta.DeltaScanRuleContrib` | absent                                           | present                 |
-| `org.apache.comet.contrib.delta.DeltaScanRule`        | absent                                           | present                 |
-| `org.apache.comet.contrib.delta.CometDeltaNativeScan` | absent                                           | present                 |
-| `org.apache.spark.sql.comet.CometDeltaNativeScanExec` | absent                                           | present                 |
-| `org.apache.spark.sql.comet.CometDeltaCdfScanExec`    | absent                                           | present                 |
-| `org.apache.spark.sql.comet.DeltaPlanDataInjector`    | absent                                           | present                 |
+| File or class                                         | Default build                        | `-Pcontrib-delta` build |
+| ----------------------------------------------------- | ------------------------------------ | ----------------------- |
+| `org.apache.comet.rules.CometScanRule`                | yes                                  | yes                     |
+| `org.apache.comet.rules.CometScanContrib`             | yes (SPI; empty registry at runtime) | yes                     |
+| `META-INF/services/…CometScanContrib`                 | absent                               | present                 |
+| `META-INF/services/…PlanDataInjector`                 | absent                               | present                 |
+| `org.apache.comet.contrib.delta.DeltaScanRuleContrib` | absent                               | present                 |
+| `org.apache.comet.contrib.delta.DeltaScanRule`        | absent                               | present                 |
+| `org.apache.comet.contrib.delta.CometDeltaNativeScan` | absent                               | present                 |
+| `org.apache.spark.sql.comet.CometDeltaNativeScanExec` | absent                               | present                 |
+| `org.apache.spark.sql.comet.CometDeltaCdfScanExec`    | absent                               | present                 |
+| `org.apache.spark.sql.comet.DeltaPlanDataInjector`    | absent                               | present                 |
 
 A `default` consumer is therefore entirely free of Delta classes. Running
 the default JAR against a Delta workload simply means core's `CometScanContrib`
